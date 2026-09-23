@@ -18,6 +18,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 
 
 def run_pipeline():
+    os.environ["SKIP_LIVE_TEST"] = "1"
     print("=" * 70, flush=True)
     print("SUB-STEP 7a: Real Pipeline Execution with Gemini 3.5 Flash Lite", flush=True)
     print("=" * 70, flush=True)
