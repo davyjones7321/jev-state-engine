@@ -47,7 +47,6 @@ class Workspace:
         )
 
     def run_read_tool(self, cmd: str, args: Optional[List[str]] = None) -> str:
-        """Executes read-only CLI commands in worktree_dir and returns stdout or stderr."""
         full_cmd = [cmd] + (args or [])
         res = subprocess.run(
             full_cmd,

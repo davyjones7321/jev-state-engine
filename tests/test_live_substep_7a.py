@@ -10,5 +10,6 @@ def test_live_pipeline_execution():
 
     report = run_substep_7a.run_pipeline()
     assert report is not None
-    assert "diff_generated" in report
-    assert "gate_status" in report
+    assert report.get("committed") is True
+    assert report.get("gate_status") == "passed"
+    assert "Executes read-only CLI commands in worktree_dir and returns stdout or stderr." in report.get("diff_generated", "")

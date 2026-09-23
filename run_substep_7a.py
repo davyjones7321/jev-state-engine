@@ -34,8 +34,16 @@ def run_pipeline():
         raise ValueError("GOOGLE_API_KEY not found in .env or environment")
     os.environ["GOOGLE_API_KEY"] = google_api_key
 
-    # 2. Ensure git baseline is clean and committed
+    # 2. Ensure git baseline is clean and committed without target docstring
     print("[1/5] Ensuring clean baseline commit in git...", flush=True)
+    workspace_file = Path("src/jev/workspace.py")
+    if workspace_file.exists():
+        ws_content = workspace_file.read_text(encoding="utf-8")
+        target_doc = '    def run_read_tool(self, cmd: str, args: Optional[List[str]] = None) -> str:\n        """Executes read-only CLI commands in worktree_dir and returns stdout or stderr."""\n'
+        clean_target = '    def run_read_tool(self, cmd: str, args: Optional[List[str]] = None) -> str:\n'
+        if target_doc in ws_content:
+            workspace_file.write_text(ws_content.replace(target_doc, clean_target), encoding="utf-8")
+
     subprocess.run(["git", "add", "-A"], cwd=Path.cwd(), check=True)
     status_check = subprocess.run(
         ["git", "status", "--porcelain"],
