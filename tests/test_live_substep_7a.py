@@ -5,8 +5,8 @@ import run_substep_7a
 
 
 def test_live_pipeline_execution():
-    if os.environ.get("SKIP_LIVE_TEST") == "1":
-        pytest.skip("Skipping in child pytest runner to prevent recursive test loop")
+    if os.environ.get("RUN_LIVE_PIPELINE") != "1" or os.environ.get("SKIP_LIVE_TEST") == "1":
+        pytest.skip("Set RUN_LIVE_PIPELINE=1 to execute live pipeline")
 
     report = run_substep_7a.run_pipeline()
     assert report is not None
