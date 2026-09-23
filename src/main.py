@@ -52,7 +52,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     env_file = (repo_dir / ".env") if (repo_dir / ".env").exists() else (Path.cwd() / ".env" if (Path.cwd() / ".env").exists() else None)
     gatekeeper = Gatekeeper(env_file=env_file)
 
-    # Wire Gemini LLM (gemini-3.5-flash) via langchain-google-genai
+    # Wire Gemini LLM (gemini-3.5-flash-lite) via langchain-google-genai
     google_api_key = os.environ.get("GOOGLE_API_KEY")
     if not google_api_key and env_file and env_file.exists():
         parsed_env = dotenv_values(env_file)
@@ -65,7 +65,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             from langchain_google_genai import ChatGoogleGenerativeAI
 
             llm = ChatGoogleGenerativeAI(
-                model="gemini-3.5-flash",
+                model="gemini-3.5-flash-lite",
                 google_api_key=google_api_key,
             )
         except Exception as e:

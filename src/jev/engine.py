@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
@@ -476,7 +477,17 @@ def node_implement(
         turn = 0
         while turn < max_turns and not submitted:
             turn += 1
-            response = bound_llm.invoke(messages)
+            response = None
+            for api_attempt in range(5):
+                try:
+                    response = bound_llm.invoke(messages)
+                    break
+                except Exception as e:
+                    if api_attempt == 4:
+                        raise
+                    sleep_time = 25 if ("429" in str(e) or "RESOURCE_EXHAUSTED" in str(e)) else (5 * (api_attempt + 1))
+                    time.sleep(sleep_time)
+
             messages.append(response)
 
             tool_calls = getattr(response, "tool_calls", None)
@@ -518,7 +529,13 @@ def node_implement(
                 else:
                     result = f"Unknown tool: {name}. Available tools: stage_file_mutation, submit_subgoal."
 
-                messages.append(ToolMessage(content=str(result), tool_call_id=str(call_id or f"call_{turn}")))
+                messages.append(
+                    ToolMessage(
+                        content=str(result),
+                        name=name,
+                        tool_call_id=str(call_id or f"call_{turn}"),
+                    )
+                )
 
             if submitted:
                 break
