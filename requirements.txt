@@ -1,0 +1,5 @@
+pydantic
+pytest
+httpx
+python-dotenv
+langgraph
