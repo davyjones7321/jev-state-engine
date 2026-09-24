@@ -1,7 +1,59 @@
+# Environment and secrets
+.env
+.env.*
+*.env
 /.env
+
+# Architecture and design documentation (do not push)
+ARCHITECTURE.md
+architecture.md
+
+# Python cache and bytecode
 __pycache__/
 *.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Testing and coverage
 .pytest_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+
+# Databases and checkpoints
 checkpoints.db*
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Logs and deadlock reports
+*.log
 escalation.log
-substep_7a_report*.json
+
+# Substep test reports and run artifacts
+substep_*_report*.json
+substep_*.json
+*_report.json
+run_substep_*.py
+scratch/
+
+# IDE and OS artifacts
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

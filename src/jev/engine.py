@@ -1,4 +1,5 @@
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -18,8 +19,10 @@ from langgraph.checkpoint.base import (
     CheckpointTuple,
 )
 from langgraph.graph import END, START, StateGraph
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from jev.models import State, Subgoal
+
 
 
 class SqliteSaver(BaseCheckpointSaver):
@@ -316,6 +319,23 @@ class SqliteSaver(BaseCheckpointSaver):
             cur.executemany(query, params)
 
 
+def _extract_content_text(content: Any) -> str:
+    """Normalize message content to a string, handling lists of text blocks if present."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and "text" in item:
+                parts.append(str(item["text"]))
+            else:
+                parts.append(str(item))
+        return "\n".join(parts)
+    return str(content or "")
+
+
 def node_investigate(
     state: State,
     workspace: Optional[Any] = None,
@@ -325,59 +345,559 @@ def node_investigate(
     if "trajectory" not in state or state["trajectory"] is None:
         state["trajectory"] = []
 
-    notes = ""
-    if workspace is not None and hasattr(workspace, "run_read_tool"):
-        git_status = workspace.run_read_tool("git", ["status", "--porcelain"])
-        notes = f"Workspace status:\n{git_status}"
-    else:
-        notes = "No workspace read tool bound."
+    # If no LLM is provided, maintain backwards compatibility with static fallback
+    if llm is None:
+        notes = ""
+        if workspace is not None and hasattr(workspace, "run_read_tool"):
+            git_status = workspace.run_read_tool("git", ["status", "--porcelain"])
+            notes = f"Workspace status:\n{git_status}"
+        else:
+            notes = "No workspace read tool bound."
+        state["last_feedback"] = notes
+        state["investigation_notes"] = notes
+        state["trajectory"].append({"node": "investigate", "notes": notes})
+        return state
 
-    if llm is not None:
-        pass
+    finished = False
+    investigation_summary = ""
+    executed_tools: List[Dict[str, Any]] = []
 
-    state["last_feedback"] = notes
-    state["trajectory"].append({"node": "investigate", "notes": notes})
+    # Bind strictly READ-ONLY tools (State 1 constraint)
+    @tool
+    def list_dir(path: str = ".") -> str:
+        """List files and subdirectories at the given path relative to repository root.
+
+        Args:
+            path: Directory path to list, defaults to "." (repository root).
+        """
+        if hasattr(workspace, "list_dir"):
+            try:
+                return str(workspace.list_dir(path))
+            except Exception as e:
+                return f"Error listing directory {path}: {e}"
+
+        worktree = getattr(workspace, "worktree_dir", getattr(workspace, "repo_dir", Path.cwd()))
+        base = Path(worktree) if worktree else Path.cwd()
+        target = (base / (path or ".")).resolve()
+        try:
+            target.relative_to(base.resolve())
+        except ValueError:
+            return f"Error: Access denied for path outside workspace: {path}"
+
+        if not target.exists():
+            return f"Directory not found: {path}"
+        if not target.is_dir():
+            return f"Not a directory: {path}"
+
+        ignore_names = {".git", "__pycache__", ".pytest_cache", ".venv", "venv", ".mypy_cache"}
+        entries = []
+        for child in sorted(target.iterdir()):
+            if child.name in ignore_names:
+                continue
+            entries.append(f"{child.name}/" if child.is_dir() else child.name)
+        return "\n".join(entries) if entries else "(empty directory)"
+
+    @tool
+    def grep(query: str, path: Optional[str] = None) -> str:
+        """Search for string patterns or regex matches across files in the workspace.
+
+        Args:
+            query: String or regex pattern to search for.
+            path: Optional subdirectory or file path to limit the search.
+        """
+        if not query:
+            return "Error: query parameter is required for grep."
+
+        worktree = getattr(workspace, "worktree_dir", getattr(workspace, "repo_dir", Path.cwd()))
+        base = Path(worktree).resolve() if worktree else Path.cwd().resolve()
+        safe_rel_path = None
+        search_target = base
+
+        if path:
+            target = (base / path).resolve() if not Path(path).is_absolute() else Path(path).resolve()
+            try:
+                safe_rel_path = target.relative_to(base).as_posix()
+            except ValueError:
+                return f"Error: Access denied for path outside workspace: {path}"
+            search_target = target
+
+        if hasattr(workspace, "grep"):
+            try:
+                return str(workspace.grep(query, path))
+            except Exception as e:
+                return f"Error running grep: {e}"
+
+        if workspace is not None and hasattr(workspace, "run_read_tool"):
+            args = ["grep", "-n", "-I", "--untracked", query]
+            if safe_rel_path:
+                args.extend(["--", safe_rel_path])
+            try:
+                res = workspace.run_read_tool("git", args)
+                if "fatal: not a git repository" not in res and "Command not found" not in res:
+                    return res.strip() if res.strip() else "No matches found."
+            except Exception:
+                pass
+
+        # Python regex search fallback
+        import re
+        if not search_target.exists():
+            return f"Path not found: {path}"
+
+        try:
+            pattern = re.compile(query, re.IGNORECASE)
+        except Exception:
+            pattern = re.compile(re.escape(query))
+
+        ignore_dirs = {".git", "__pycache__", ".pytest_cache", ".venv", "venv", ".mypy_cache"}
+        target_files = [search_target] if search_target.is_file() else [
+            p for p in search_target.rglob("*")
+            if p.is_file() and not any(part in ignore_dirs for part in p.parts)
+        ]
+        matches = []
+        for f in target_files:
+            try:
+                rel = f.relative_to(base)
+                lines = f.read_text(encoding="utf-8", errors="replace").splitlines()
+                for idx, line in enumerate(lines, 1):
+                    if pattern.search(line):
+                        matches.append(f"{rel}:{idx}:{line}")
+                        if len(matches) >= 50:
+                            break
+            except Exception:
+                continue
+            if len(matches) >= 50:
+                break
+        return "\n".join(matches) if matches else "No matches found."
+
+    @tool
+    def read_file(path: str) -> str:
+        """Read the full content of a file in the workspace. Backed by workspace.run_read_tool().
+
+        Args:
+            path: Relative path to the file from repository root.
+        """
+        if not path:
+            return "Error: path is required for read_file."
+
+        worktree = getattr(workspace, "worktree_dir", getattr(workspace, "repo_dir", None))
+        if worktree:
+            base = Path(worktree).resolve()
+            target = (base / path).resolve() if not Path(path).is_absolute() else Path(path).resolve()
+            try:
+                target.relative_to(base)
+            except ValueError:
+                return f"Error: Access denied for path outside workspace: {path}"
+
+        if workspace is not None and hasattr(workspace, "run_read_tool"):
+            try:
+                output = workspace.run_read_tool("cat", [path])
+                if output is not None and "Command not found: cat" not in output:
+                    return output
+            except Exception:
+                pass
+
+        if worktree:
+            if target.exists():
+                if target.is_dir():
+                    return f"Error: {path} is a directory, not a file. Use list_dir instead."
+                try:
+                    return target.read_text(encoding="utf-8", errors="replace")
+                except Exception as e:
+                    return f"Error reading file {path}: {e}"
+            return f"File not found: {path}"
+        return f"Workspace unavailable; could not read {path}"
+
+    @tool
+    def finish_investigation(summary: str = "") -> str:
+        """Signal that investigation is complete and provide a comprehensive summary of findings to inform planning.
+
+        Args:
+            summary: Comprehensive summary of code patterns, architecture, relevant files, and implementation findings.
+        """
+        nonlocal finished, investigation_summary
+        finished = True
+        investigation_summary = summary
+        return "Investigation finished."
+
+    # Bind strictly READ-ONLY tools (no write tools)
+    tools = [list_dir, grep, read_file, finish_investigation]
+
+    ticket = state.get("ticket", "")
+    prompt_lines = [
+        f"Task Ticket: {ticket}",
+        "",
+        "Instructions:",
+        "1. You have read-only access to investigate the codebase using the available tools: `list_dir`, `grep`, and `read_file`.",
+        "2. Explore the file structure, find relevant files, and understand existing patterns and architecture.",
+        "3. When you have gathered enough context to plan the implementation, call `finish_investigation` with a comprehensive summary of your findings.",
+    ]
+    prompt_text = "\n".join(prompt_lines)
+
+    messages: List[Any] = [HumanMessage(content=prompt_text)]
+    bound_llm = llm.bind_tools(tools)
+
+    max_turns = 10
+    turn = 0
+    while turn < max_turns and not finished:
+        turn += 1
+        response = None
+        for api_attempt in range(5):
+            try:
+                response = bound_llm.invoke(messages)
+                break
+            except Exception as e:
+                if api_attempt == 4:
+                    raise
+                sleep_time = 25 if ("429" in str(e) or "RESOURCE_EXHAUSTED" in str(e)) else (5 * (api_attempt + 1))
+                time.sleep(sleep_time)
+
+        messages.append(response)
+
+        tool_calls = getattr(response, "tool_calls", None)
+        if not tool_calls and isinstance(response, dict):
+            tool_calls = response.get("tool_calls")
+
+        if not tool_calls:
+            if not investigation_summary:
+                investigation_summary = _extract_content_text(getattr(response, "content", "")).strip()
+            break
+
+        for tool_call in tool_calls:
+            name = tool_call.get("name") if isinstance(tool_call, dict) else getattr(tool_call, "name", None)
+            args = tool_call.get("args") if isinstance(tool_call, dict) else getattr(tool_call, "args", {})
+            call_id = tool_call.get("id") if isinstance(tool_call, dict) else getattr(tool_call, "id", f"call_{turn}")
+
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    args = {}
+
+            executed_tools.append({"name": name, "args": args})
+
+            if name == "finish_investigation":
+                finished = True
+                extracted = (
+                    args.get("summary")
+                    or args.get("notes")
+                    or args.get("investigation_notes")
+                    or args.get("findings")
+                    or args.get("result")
+                    or args.get("analysis")
+                    or args.get("summary_text")
+                    or ""
+                )
+                if extracted:
+                    investigation_summary = _extract_content_text(extracted)
+                else:
+                    investigation_summary = _extract_content_text(getattr(response, "content", "")).strip()
+                result = "Investigation finished."
+            elif name == "read_file":
+                actual_path = args.get("path") or args.get("file_path") or args.get("filename") or ""
+                result = read_file.invoke({"path": actual_path}) if hasattr(read_file, "invoke") else read_file(actual_path)
+            elif name == "list_dir":
+                actual_path = args.get("path") or args.get("directory") or args.get("dir_path") or "."
+                result = list_dir.invoke({"path": actual_path}) if hasattr(list_dir, "invoke") else list_dir(actual_path)
+            elif name == "grep":
+                actual_query = args.get("query") or args.get("pattern") or args.get("search_term") or ""
+                actual_path = args.get("path") or args.get("directory") or args.get("file_path")
+                call_args = {"query": actual_query}
+                if actual_path:
+                    call_args["path"] = actual_path
+                result = grep.invoke(call_args) if hasattr(grep, "invoke") else grep(actual_query, actual_path)
+            else:
+                result = f"Error: Tool '{name}' is not permitted in investigation state. Only read-only tools (list_dir, grep, read_file, finish_investigation) are available."
+
+            messages.append(
+                ToolMessage(
+                    content=str(result),
+                    name=name,
+                    tool_call_id=str(call_id or f"call_{turn}"),
+                )
+            )
+
+        if finished:
+            break
+
+    if not investigation_summary:
+        for msg in reversed(messages):
+            if isinstance(msg, AIMessage):
+                text = _extract_content_text(getattr(msg, "content", "")).strip()
+                if text:
+                    investigation_summary = text
+                    break
+        if not investigation_summary:
+            investigation_summary = f"Investigation concluded after reaching maximum turns ({max_turns})."
+
+    state["investigation_notes"] = investigation_summary
+    state["last_feedback"] = investigation_summary
+
+    traj_entry: Dict[str, Any] = {
+        "node": "investigate",
+        "notes": investigation_summary,
+    }
+    if executed_tools:
+        traj_entry["tool_calls"] = executed_tools
+    state["trajectory"].append(traj_entry)
     return state
+
+
+class PlanSubgoalModel(BaseModel):
+    """Strict schema for validating LLM-generated Subgoal outputs."""
+
+    model_config = ConfigDict(strict=True)
+
+    description: str = Field(..., min_length=1)
+    scope: List[str] = Field(..., min_length=1)
+    expects_tests: bool = True
+
+    @field_validator("scope")
+    @classmethod
+    def validate_scope_items(cls, v: List[str]) -> List[str]:
+        if not v:
+            raise ValueError("Subgoal scope must not be empty.")
+        cleaned_list: List[str] = []
+        for item in v:
+            if not isinstance(item, str) or not item.strip():
+                raise ValueError("Scope items must be non-empty strings.")
+            cleaned_item = item.strip().replace("\\", "/")
+            path_obj = Path(cleaned_item)
+            is_abs = (
+                path_obj.is_absolute()
+                or bool(path_obj.drive)
+                or cleaned_item.startswith("/")
+                or cleaned_item.startswith("\\")
+            )
+            if is_abs or ".." in path_obj.parts:
+                raise ValueError(f"Scope item '{item}' must be a relative path within the repository.")
+            if cleaned_item not in cleaned_list:
+                cleaned_list.append(cleaned_item)
+        return cleaned_list
+
+    @field_validator("description")
+    @classmethod
+    def validate_description_not_blank(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("Subgoal description must be non-empty.")
+        return v.strip()
+
+
+def _clean_json_text(text: str) -> str:
+    cleaned = text.strip()
+
+    # 1. Look specifically for a ```json ... ``` code fence (case-insensitive)
+    match_json = re.search(r"```json\s*([\s\S]*?)\s*```", cleaned, re.IGNORECASE)
+    if match_json:
+        return match_json.group(1).strip()
+
+    # 2. Look for any generic code fence ``` ... ```
+    match_generic = re.search(r"```\s*([\s\S]*?)\s*```", cleaned)
+    if match_generic:
+        return match_generic.group(1).strip()
+
+    # 3. Check for raw array bracket [ ... ] if root is not an object dict { ... }
+    start_bracket = cleaned.find("[")
+    end_bracket = cleaned.rfind("]")
+    if start_bracket != -1 and end_bracket != -1 and end_bracket > start_bracket:
+        start_brace = cleaned.find("{")
+        if start_brace == -1 or start_brace > start_bracket:
+            return cleaned[start_bracket : end_bracket + 1].strip()
+
+    return cleaned
+
+
+def _parse_and_validate_plan(raw_text: str) -> List[Subgoal]:
+    """Parse raw LLM output as JSON and validate strictly against Subgoal schema."""
+    cleaned = _clean_json_text(raw_text)
+    data = json.loads(cleaned)
+    if not isinstance(data, list):
+        raise ValueError(f"Plan output must be a JSON array of Subgoal objects, got {type(data).__name__}")
+    if len(data) == 0:
+        raise ValueError("Plan output must contain at least one subgoal, got empty array")
+
+    subgoals: List[Subgoal] = []
+    for idx, item in enumerate(data):
+        if not isinstance(item, dict):
+            raise ValueError(f"Subgoal at index {idx} must be a JSON object, got {type(item).__name__}")
+        validated = PlanSubgoalModel.model_validate(item)
+        subgoals.append(
+            Subgoal(
+                description=validated.description,
+                scope=validated.scope,
+                expects_tests=validated.expects_tests,
+            )
+        )
+    return subgoals
 
 
 def node_plan(
     state: State,
     workspace: Optional[Any] = None,
     llm: Optional[Any] = None,
+    gatekeeper: Optional[Any] = None,
 ) -> State:
-    """State 2: PLANNING (Generates structured Subgoals with declared scope)."""
+    """State 2: PLANNING (Generates structured Subgoals with declared scope).
+
+    We use standard prompt instructions + manual JSON parsing with Pydantic validation
+    (PlanSubgoalModel) rather than provider-bound .with_structured_output().
+    Rationale:
+    1. Complete provider agnosticism: Works identically across any LangChain BaseChatModel
+       (Gemini, OpenAI, Claude, local models) and scripted/mock test models without requiring
+       vendor-specific tool-calling or JSON-mode schema compilation.
+    2. Strict Rule 0 enforcement: Direct visibility into JSONDecodeError and pydantic.ValidationError
+       allows exact error messages to be reflected back in the retry prompt context.
+    3. Deterministic failure boundaries: Guarantees zero silent coercions, hard stop on retry failure.
+    """
     if "trajectory" not in state or state["trajectory"] is None:
         state["trajectory"] = []
 
-    plan_queue = state.get("plan_queue")
-    if not plan_queue:
-        ticket = state.get("ticket", "Default task")
-        # Default plan: single subgoal based on ticket
-        plan_queue = [
-            Subgoal(
-                description=ticket,
-                scope=[],
-                expects_tests=True,
-            )
-        ]
-        state["plan_queue"] = plan_queue
-    else:
-        normalized_queue: List[Subgoal] = []
-        for item in plan_queue:
-            if isinstance(item, dict):
-                normalized_queue.append(Subgoal(**item))
-            elif isinstance(item, Subgoal):
-                normalized_queue.append(item)
-        state["plan_queue"] = normalized_queue
+    # llm=None backwards compatibility branch (matching 7a/7b pattern)
+    if llm is None:
+        plan_queue = state.get("plan_queue")
+        if not plan_queue:
+            ticket = state.get("ticket", "Default task")
+            plan_queue = [
+                Subgoal(
+                    description=ticket,
+                    scope=[],
+                    expects_tests=True,
+                )
+            ]
+            state["plan_queue"] = plan_queue
+        else:
+            normalized_queue: List[Subgoal] = []
+            for item in plan_queue:
+                if isinstance(item, dict):
+                    normalized_queue.append(Subgoal(**item))
+                elif isinstance(item, Subgoal):
+                    normalized_queue.append(item)
+            state["plan_queue"] = normalized_queue
 
+        state["current_subgoal"] = None
+        state["last_feedback"] = None
+        state["gate_status"] = None
+        state["trajectory"].append({
+            "node": "plan",
+            "subgoals": [
+                sg.model_dump() if hasattr(sg, "model_dump") else dict(sg)
+                for sg in state["plan_queue"]
+            ],
+        })
+        return state
+
+    ticket = state.get("ticket", "")
+    investigation_notes = state.get("investigation_notes", "")
+
+    prompt_lines = [
+        "You are the Planning module of the Jev State Engine.",
+        "Your role is to create a deterministic, structured execution plan broken down into atomic Subgoals.",
+        "",
+        f"Ticket Description:\n{ticket}",
+    ]
+    if investigation_notes:
+        prompt_lines.append(f"\nInvestigation Notes:\n{investigation_notes}")
+    else:
+        prompt_lines.append("\nInvestigation Notes: None")
+
+    prompt_lines.extend([
+        "",
+        "Instructions:",
+        "1. Break down the task into an ordered sequence of atomic Subgoals.",
+        "2. For each Subgoal, specify:",
+        "   - 'description': Clear, concise explanation of the atomic change.",
+        "   - 'scope': Non-empty list of exact file paths to touch or create. No placeholder or empty scopes allowed.",
+        "   - 'expects_tests': Boolean (true/false) indicating whether tests are expected to pass/run for this step.",
+        "3. Output format:",
+        "   Return ONLY a valid JSON array of Subgoal objects. Do NOT include markdown commentary or explanations outside the JSON array.",
+        "   Example:",
+        '   [{"description": "Add feature", "scope": ["src/feature.py"], "expects_tests": true}]',
+    ])
+    prompt_text = "\n".join(prompt_lines)
+    messages: List[Any] = [HumanMessage(content=prompt_text)]
+
+    subgoals: Optional[List[Subgoal]] = None
+    last_error: Optional[str] = None
+    retries_used = 0
+
+    for attempt in range(2):
+        # API call with retry backoff for rate limiting
+        response = None
+        for api_attempt in range(5):
+            try:
+                response = llm.invoke(messages)
+                break
+            except Exception as e:
+                if api_attempt == 4:
+                    state["plan_queue"] = []
+                    state["current_subgoal"] = None
+                    state["gate_status"] = "planning_failed"
+                    state["status"] = "escalated"
+                    state["last_feedback"] = f"Planning API failure after 5 retries: {e}"
+                    state["trajectory"].append({
+                        "node": "plan",
+                        "error_type": "api_failure",
+                        "error": f"API failure after 5 retries: {e}",
+                        "subgoals": [],
+                    })
+                    if gatekeeper is not None and hasattr(gatekeeper, "escalate_deadlock"):
+                        gatekeeper.escalate_deadlock(
+                            trajectory=state["trajectory"],
+                            triggering_tier="planning",
+                        )
+                    return state
+                sleep_time = 25 if ("429" in str(e) or "RESOURCE_EXHAUSTED" in str(e)) else (5 * (api_attempt + 1))
+                time.sleep(sleep_time)
+
+        raw_content = _extract_content_text(getattr(response, "content", response))
+
+        try:
+            subgoals = _parse_and_validate_plan(raw_content)
+            break
+        except Exception as exc:
+            last_error = str(exc)
+            if attempt == 0:
+                retries_used = 1
+                messages.append(response if isinstance(response, AIMessage) else AIMessage(content=raw_content))
+                retry_prompt = (
+                    f"your previous output failed validation because: {last_error}, please retry. "
+                    "Return ONLY a valid JSON array of Subgoal objects matching the required schema: "
+                    "description (non-empty string), scope (non-empty list of file paths), expects_tests (boolean)."
+                )
+                messages.append(HumanMessage(content=retry_prompt))
+
+    if subgoals is not None:
+        state["plan_queue"] = subgoals
+        state["current_subgoal"] = None
+        state["last_feedback"] = None
+        state["gate_status"] = None
+        traj_entry: Dict[str, Any] = {
+            "node": "plan",
+            "subgoals": [sg.model_dump() for sg in subgoals],
+        }
+        if retries_used > 0:
+            traj_entry["retries"] = retries_used
+        state["trajectory"].append(traj_entry)
+        return state
+
+    # Hard failure: planning failed after retry
+    state["plan_queue"] = []
+    state["current_subgoal"] = None
+    state["gate_status"] = "planning_failed"
+    state["status"] = "escalated"
+    state["last_feedback"] = f"Planning failed after retry: {last_error}"
     state["trajectory"].append({
         "node": "plan",
-        "subgoals": [
-            sg.model_dump() if hasattr(sg, "model_dump") else dict(sg)
-            for sg in state["plan_queue"]
-        ],
+        "error_type": "validation_failure",
+        "error": f"Planning validation failed: {last_error}",
+        "subgoals": [],
     })
+    if gatekeeper is not None and hasattr(gatekeeper, "escalate_deadlock"):
+        gatekeeper.escalate_deadlock(
+            trajectory=state["trajectory"],
+            triggering_tier="planning",
+        )
     return state
+
 
 
 def node_implement(
@@ -687,6 +1207,13 @@ def node_escalate(
     return state
 
 
+def route_plan(state: State) -> str:
+    """Evaluates whether planning succeeded or failed to determine next node."""
+    if state.get("gate_status") == "planning_failed":
+        return "escalate"
+    return "implement"
+
+
 def route_gate(state: State) -> str:
     """Evaluates strike counters and plan queue to determine the next graph node."""
     if (
@@ -729,7 +1256,7 @@ class JevEngine:
         return node_investigate(state, workspace=self.workspace, llm=self.llm)
 
     def _node_plan(self, state: State) -> State:
-        return node_plan(state, workspace=self.workspace, llm=self.llm)
+        return node_plan(state, workspace=self.workspace, llm=self.llm, gatekeeper=self.gatekeeper)
 
     def _node_implement(self, state: State) -> State:
         return node_implement(state, workspace=self.workspace, llm=self.llm)
@@ -742,6 +1269,9 @@ class JevEngine:
 
     def _node_escalate(self, state: State) -> State:
         return node_escalate(state, gatekeeper=self.gatekeeper)
+
+    def _route_after_plan(self, state: State) -> str:
+        return route_plan(state)
 
     def _route_after_gate(self, state: State) -> str:
         return route_gate(state)
@@ -763,8 +1293,17 @@ class JevEngine:
 
         builder.add_edge(START, "investigate")
         builder.add_edge("investigate", "plan")
-        builder.add_edge("plan", "implement")
+
+        builder.add_conditional_edges(
+            "plan",
+            self._route_after_plan,
+            {
+                "implement": "implement",
+                "escalate": "escalate",
+            },
+        )
         builder.add_edge("implement", "gate")
+
 
         builder.add_conditional_edges(
             "gate",

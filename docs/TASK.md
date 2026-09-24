@@ -76,3 +76,7 @@
   - Verify a Jev rejection increments only `semantic_strike_count`.
   - Verify a successful commit resets both counters.
   - Verify escalation fires independently at 3 strikes on either counter.
+
+## Follow-up Cleanup Tasks
+- `[ ]` **Centralize Path Containment Security Check**:
+  Consolidate the four separate hand-written path containment checks (`read_file`, `Workspace.run_read_tool`, `grep`, and `PlanSubgoalModel.validate_scope_items`) into a single canonical helper (e.g. `Workspace.validate_path_containment(path, base) -> Path`) with unified symlink resolution, `..` traversal blocking, and absolute path confinement, preventing future sprawl.

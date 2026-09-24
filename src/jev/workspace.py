@@ -1,4 +1,5 @@
 import ast
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -48,14 +49,52 @@ class Workspace:
 
     def run_read_tool(self, cmd: str, args: Optional[List[str]] = None) -> str:
         """Executes read-only CLI commands in worktree_dir and returns stdout or stderr."""
-        full_cmd = [cmd] + (args or [])
-        res = subprocess.run(
-            full_cmd,
-            cwd=self.worktree_dir,
-            capture_output=True,
-            text=True,
-        )
-        return res.stdout if res.returncode == 0 else res.stderr
+        args_list = args or []
+        full_cmd = [cmd] + args_list
+        if cmd == "cat" and not shutil.which("cat"):
+            if args_list:
+                target = Path(args_list[0])
+                if not target.is_absolute():
+                    target = self.worktree_dir / target
+                try:
+                    target.resolve().relative_to(self.worktree_dir.resolve())
+                except ValueError:
+                    return f"cat: {args_list[0]}: Access denied outside workspace"
+                if target.is_dir():
+                    return f"cat: {args_list[0]}: Is a directory"
+                if target.exists() and target.is_file():
+                    try:
+                        return target.read_text(encoding="utf-8", errors="replace")
+                    except Exception as e:
+                        return str(e)
+                return f"cat: {args_list[0]}: No such file or directory"
+            return ""
+        try:
+            res = subprocess.run(
+                full_cmd,
+                cwd=self.worktree_dir,
+                capture_output=True,
+                text=True,
+            )
+            return res.stdout if res.returncode == 0 else res.stderr
+        except FileNotFoundError:
+            if cmd == "cat" and args_list:
+                target = Path(args_list[0])
+                if not target.is_absolute():
+                    target = self.worktree_dir / target
+                try:
+                    target.resolve().relative_to(self.worktree_dir.resolve())
+                except ValueError:
+                    return f"cat: {args_list[0]}: Access denied outside workspace"
+                if target.is_dir():
+                    return f"cat: {args_list[0]}: Is a directory"
+                if target.exists() and target.is_file():
+                    try:
+                        return target.read_text(encoding="utf-8", errors="replace")
+                    except Exception as e:
+                        return str(e)
+                return f"cat: {args_list[0]}: No such file or directory"
+            return f"Command not found: {cmd}"
 
     def stage_file_mutation(self, path: Union[str, Path], content: str) -> None:
         p = Path(path)
