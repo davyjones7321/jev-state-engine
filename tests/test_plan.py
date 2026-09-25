@@ -778,6 +778,151 @@ def test_node_plan_alien_extension_rejected_when_notes_specify_different_languag
     assert "extension" in result["trajectory"][0]["error"].lower() or "does not exist" in result["trajectory"][0]["error"].lower()
 
 
+# 28. Existing non-candidate file (README.md) rejected for ticket modifying existing function, retries with candidate list feedback
+def test_node_plan_rejects_existing_non_candidate_file_for_existing_function_ticket(tmp_path):
+    # Setup repository with both real candidates and real README.md
+    readme_file = tmp_path / "README.md"
+    readme_file.write_text("# Project Docs\nSome documentation.", encoding="utf-8")
+
+    auth_file = tmp_path / "src" / "lib" / "auth.ts"
+    auth_file.parent.mkdir(parents=True, exist_ok=True)
+    auth_file.write_text("export function createSession() {}", encoding="utf-8")
+
+    booking_file = tmp_path / "src" / "lib" / "booking.ts"
+    booking_file.write_text("export function getBooking() {}", encoding="utf-8")
+
+    payment_file = tmp_path / "src" / "lib" / "payment.ts"
+    payment_file.write_text("export function getPaymentProvider() {}", encoding="utf-8")
+
+    class TestWorkspace:
+        def __init__(self, root):
+            self.worktree_dir = root
+            self.repo_dir = root
+
+    ws = TestWorkspace(tmp_path)
+
+    # Attempt 0: LLM lazily proposes README.md (exists on disk, but not a candidate)
+    readme_plan = [
+        {
+            "description": "Add docstring to existing function",
+            "scope": ["README.md"],
+            "expects_tests": True,
+        }
+    ]
+    # Attempt 1: LLM corrects scope to valid candidate src/lib/auth.ts
+    grounded_plan = [
+        {
+            "description": "Add docstring to createSession",
+            "scope": ["src/lib/auth.ts"],
+            "expects_tests": True,
+        }
+    ]
+    fake_llm = ScriptedChatModel([json.dumps(readme_plan), json.dumps(grounded_plan)])
+    state: State = {
+        "ticket": "Add a docstring to one existing function in this project",
+        "investigation_notes": (
+            "Found undocumented functions: createSession/getSession/destroySession in src/lib/auth.ts, "
+            "getPaymentProvider in src/lib/payment.ts, and others in src/lib/booking.ts."
+        ),
+        "trajectory": [],
+    }
+
+    result = node_plan(state, workspace=ws, llm=fake_llm)
+
+    assert len(fake_llm.invocations) == 2
+    retry_invocation = fake_llm.invocations[1]
+    human_messages = [m for m in retry_invocation if isinstance(m, HumanMessage)]
+    retry_msg = human_messages[-1].content.lower()
+
+    # Assert retry message specifically instructed that scope must reference one of the candidate files
+    assert "scope must reference one of the files investigation identified" in retry_msg or "target functionality" in retry_msg
+
+    # Plan queue is populated with the grounded candidate file after retry
+    assert result.get("gate_status") != "planning_failed"
+    assert len(result["plan_queue"]) == 1
+    assert result["plan_queue"][0].scope == ["src/lib/auth.ts"]
+
+
+# 29. Correctly grounded plan matching investigation candidate passes on first try
+def test_node_plan_accepts_valid_candidate_on_first_try(tmp_path):
+    auth_file = tmp_path / "src" / "lib" / "auth.ts"
+    auth_file.parent.mkdir(parents=True, exist_ok=True)
+    auth_file.write_text("export function createSession() {}", encoding="utf-8")
+
+    class TestWorkspace:
+        def __init__(self, root):
+            self.worktree_dir = root
+            self.repo_dir = root
+
+    ws = TestWorkspace(tmp_path)
+    grounded_plan = [
+        {
+            "description": "Add docstring to createSession",
+            "scope": ["src/lib/auth.ts"],
+            "expects_tests": True,
+        }
+    ]
+    fake_llm = ScriptedChatModel([json.dumps(grounded_plan)])
+    state: State = {
+        "ticket": "Add a docstring to one existing function in this project",
+        "investigation_notes": (
+            "Found undocumented functions: createSession in src/lib/auth.ts, "
+            "getPaymentProvider in src/lib/payment.ts."
+        ),
+        "trajectory": [],
+    }
+
+    result = node_plan(state, workspace=ws, llm=fake_llm)
+
+    # Must pass cleanly on attempt 0 (no retries, no false positives)
+    assert len(fake_llm.invocations) == 1
+    assert result.get("gate_status") != "planning_failed"
+    assert len(result["plan_queue"]) == 1
+    assert result["plan_queue"][0].scope == ["src/lib/auth.ts"]
+
+
+# 30. Proposing non-candidate file on both attempts escalates as planning_failed
+def test_node_plan_rejects_non_candidate_both_attempts_and_escalates(tmp_path):
+    readme_file = tmp_path / "README.md"
+    readme_file.write_text("# Project Docs", encoding="utf-8")
+
+    class TestWorkspace:
+        def __init__(self, root):
+            self.worktree_dir = root
+            self.repo_dir = root
+
+    ws = TestWorkspace(tmp_path)
+    readme_plan = [
+        {
+            "description": "Add docstring to existing function",
+            "scope": ["README.md"],
+            "expects_tests": True,
+        }
+    ]
+    fake_llm = ScriptedChatModel([json.dumps(readme_plan), json.dumps(readme_plan)])
+    mock_gk = MagicMock()
+    state: State = {
+        "ticket": "Add a docstring to one existing function in this project",
+        "investigation_notes": "Found undocumented functions: createSession in src/lib/auth.ts",
+        "trajectory": [],
+    }
+
+    result = node_plan(state, workspace=ws, llm=fake_llm, gatekeeper=mock_gk)
+
+    assert len(fake_llm.invocations) == 2
+    assert result.get("gate_status") == "planning_failed"
+    assert result.get("status") == "escalated"
+    assert result.get("plan_queue") == []
+    assert len(result["trajectory"]) == 1
+    assert result["trajectory"][0]["error_type"] == "validation_failure"
+    assert "target functionality" in result["trajectory"][0]["error"].lower() or "candidate" in result["trajectory"][0]["error"].lower() or "scope must reference" in result["trajectory"][0]["error"].lower()
+    mock_gk.escalate_deadlock.assert_called_once_with(
+        trajectory=result["trajectory"],
+        triggering_tier="planning",
+    )
+
+
+
 
 
 

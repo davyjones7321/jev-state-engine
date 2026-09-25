@@ -730,6 +730,85 @@ def _parse_and_validate_plan(raw_text: str) -> List[Subgoal]:
     return subgoals
 
 
+def _extract_candidate_files(
+    investigation_notes: str,
+    base_dir: Optional[Path] = None,
+) -> List[str]:
+    """Extract candidate source files identified during investigation."""
+    if not investigation_notes:
+        return []
+
+    candidates: List[str] = []
+    non_source_extensions = {
+        "md", "txt", "json", "yaml", "yml", "toml", "lock", "csv",
+        "png", "jpg", "jpeg", "svg", "gif", "ico", "gitignore", "env",
+    }
+
+    # 1. Look for explicit candidate sections if present (e.g. "Candidate Files:", "Relevant Files:")
+    candidate_section_match = re.search(
+        r"(?:candidate|relevant|target)\s+files?[:\n](.*?)(?:\n\s*\n|\Z)",
+        investigation_notes,
+        re.IGNORECASE | re.DOTALL,
+    )
+    section_text = candidate_section_match.group(1) if candidate_section_match else ""
+
+    # Path pattern:
+    # A) relative paths with directory separators: e.g. src/lib/auth.ts
+    # B) single filenames with recognized code extensions: e.g. auth.ts, core.py
+    path_pattern = re.compile(
+        r"(?:[a-zA-Z0-9_\-\.]+[/\\])+[a-zA-Z0-9_\-\.]+\.[a-zA-Z0-9_-]+"
+        r"|\b[a-zA-Z0-9_\-]+\.(?:ts|tsx|js|jsx|py|go|rs|java|c|cpp|h|hpp|rb|php|cs|swift|kt|pyi)\b"
+    )
+
+    text_to_search = section_text if section_text.strip() else investigation_notes
+    matches = path_pattern.findall(text_to_search)
+
+    for m in matches:
+        cleaned = m.strip().replace("\\", "/").rstrip(".,:;)>]'\"")
+        if not cleaned:
+            continue
+        p = Path(cleaned)
+        ext = p.suffix.lower().lstrip(".")
+        if ext in non_source_extensions:
+            continue
+
+        if cleaned not in candidates:
+            candidates.append(cleaned)
+
+    return candidates
+
+
+def _matches_candidate(scope_path: str, candidates: List[str], base_dir: Optional[Path] = None) -> bool:
+    """Check if a scope path matches any candidate file identified during investigation."""
+    cleaned = scope_path.strip().replace("\\", "/")
+    p = Path(cleaned)
+    p_name = p.name.lower()
+
+    for c in candidates:
+        c_cleaned = c.strip().replace("\\", "/")
+        c_p = Path(c_cleaned)
+        c_name = c_p.name.lower()
+
+        # Exact match
+        if cleaned == c_cleaned:
+            return True
+        # Resolved path match
+        if base_dir is not None:
+            try:
+                if (base_dir / cleaned).resolve() == (base_dir / c_cleaned).resolve():
+                    return True
+            except Exception:
+                pass
+        # Relative path suffix match (e.g. "auth.ts" matches "src/lib/auth.ts")
+        if cleaned.endswith(c_cleaned) or c_cleaned.endswith(cleaned):
+            return True
+        # Filename match (e.g. auth.ts matches auth.ts)
+        if p_name == c_name:
+            return True
+
+    return False
+
+
 def _validate_plan_grounding(
     subgoals: List[Subgoal],
     workspace: Optional[Any],
@@ -743,6 +822,8 @@ def _validate_plan_grounding(
     # Determine if ticket specifically targets existing code
     targets_existing = bool(
         re.search(r"\b(existing|undocumented|current)\b", ticket_lower)
+    ) or bool(
+        re.search(r"\badd\s+to\b", ticket_lower)
     )
 
     # Determine if ticket requests creating new files or implementing new features
@@ -757,13 +838,23 @@ def _validate_plan_grounding(
         if raw_base is not None:
             base_dir = Path(raw_base).resolve()
 
+    # Extract candidate files identified during investigation
+    candidate_files = _extract_candidate_files(investigation_notes, base_dir)
+
     # Extract all file extensions mentioned in investigation_notes (e.g. .ts, .py, .go, .rs, .js)
     notes_extensions = set(re.findall(r"\.([a-zA-Z0-9_-]+)\b", notes_lower))
+
+    non_source_extensions = {
+        "md", "txt", "json", "yaml", "yml", "toml", "lock", "csv",
+        "png", "jpg", "jpeg", "svg", "gif", "ico", "gitignore", "env",
+    }
 
     for subgoal in subgoals:
         subgoal_desc_lower = subgoal.description.lower()
         subgoal_targets_existing = targets_existing or bool(
             re.search(r"\b(existing|undocumented|current)\b", subgoal_desc_lower)
+        ) or bool(
+            re.search(r"\badd\s+to\b", subgoal_desc_lower)
         )
 
         for scope_item in subgoal.scope:
@@ -773,6 +864,12 @@ def _validate_plan_grounding(
             file_stem = path_obj.stem.lower()
             ext = path_obj.suffix.lower().lstrip(".")
 
+            # Check if file path, filename, or meaningful stem is explicitly present in notes or ticket
+            stem_in_notes = len(file_stem) >= 3 and bool(re.search(r"\b" + re.escape(file_stem) + r"\b", notes_lower))
+            stem_in_ticket = len(file_stem) >= 3 and bool(re.search(r"\b" + re.escape(file_stem) + r"\b", ticket_lower))
+            in_notes = (cleaned_path.lower() in notes_lower) or (file_name in notes_lower) or stem_in_notes
+            in_ticket = (cleaned_path.lower() in ticket_lower) or (file_name in ticket_lower) or stem_in_ticket
+
             # 1. Check if the file exists on disk in the workspace
             exists_on_disk = False
             if base_dir is not None:
@@ -781,6 +878,28 @@ def _validate_plan_grounding(
                     exists_on_disk = full_target.exists() and (full_target.is_file() or full_target.is_dir())
                 except Exception:
                     exists_on_disk = False
+
+            # Tightened candidate check for tickets/subgoals targeting existing functionality
+            if subgoal_targets_existing:
+                # When investigation notes identified specific candidate files, scope MUST match one of them
+                if candidate_files:
+                    if not _matches_candidate(cleaned_path, candidate_files, base_dir) and not in_ticket:
+                        if not exists_on_disk:
+                            raise ValueError(
+                                f"Scope file '{scope_item}' does not exist in repository and was not found during investigation for ticket modifying existing code: "
+                                f"scope must reference one of the files investigation identified as containing the target functionality: {sorted(candidate_files)}"
+                            )
+                        else:
+                            raise ValueError(
+                                f"Scope file '{scope_item}' is invalid: for tickets targeting existing functionality, "
+                                f"scope must reference one of the files investigation identified as containing the target functionality: {sorted(candidate_files)}"
+                            )
+
+                # Non-source files (README.md, config files) cannot satisfy tickets targeting existing functions
+                if ext in non_source_extensions and not in_ticket:
+                    raise ValueError(
+                        f"Scope file '{scope_item}' is a non-source file ({ext}) and cannot satisfy a ticket targeting existing functions or code."
+                    )
 
             if exists_on_disk:
                 continue
@@ -903,6 +1022,7 @@ def node_plan(
         "   - 'expects_tests': Boolean (true/false) indicating whether tests are expected to pass/run for this step.",
         "3. GROUNDING REQUIREMENTS (CRITICAL):",
         "   - If modifying, extending, or documenting existing code, every file path in 'scope' MUST be grounded strictly in the files discovered in 'Investigation Notes' or explicitly named in the 'Ticket Description'.",
+        "   - When Investigation Notes identify candidate files containing relevant or undocumented functions, you MUST select only from those candidate files. Do NOT target documentation (e.g. README.md), configuration files, or non-source files for tickets modifying or documenting existing functions.",
         "   - Do NOT invent, hallucinate, or guess file paths.",
         "   - Do NOT assume any default project language or file extensions (e.g. do NOT assume Python 'src/main.py' if the repository is TypeScript, Go, Rust, or JavaScript). Use the actual language and paths discovered in Investigation Notes.",
         "   - If the ticket explicitly requests creating brand new files not previously existing, those new paths must be consistent with the directory structure established in Investigation Notes.",
