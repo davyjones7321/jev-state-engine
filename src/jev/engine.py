@@ -730,6 +730,100 @@ def _parse_and_validate_plan(raw_text: str) -> List[Subgoal]:
     return subgoals
 
 
+def _validate_plan_grounding(
+    subgoals: List[Subgoal],
+    workspace: Optional[Any],
+    ticket: str,
+    investigation_notes: str,
+) -> None:
+    """Validate that subgoal scopes are grounded in the repository or investigation notes."""
+    ticket_lower = ticket.lower()
+    notes_lower = (investigation_notes or "").lower()
+
+    # Determine if ticket specifically targets existing code
+    targets_existing = bool(
+        re.search(r"\b(existing|undocumented|current)\b", ticket_lower)
+    )
+
+    # Determine if ticket requests creating new files or implementing new features
+    creates_new = bool(
+        re.search(r"\b(create|new\s+file|scaffold|implement|build|generate|add)\b", ticket_lower)
+    )
+
+    # Resolve workspace root directory if available
+    base_dir: Optional[Path] = None
+    if workspace is not None:
+        raw_base = getattr(workspace, "worktree_dir", None) or getattr(workspace, "repo_dir", None)
+        if raw_base is not None:
+            base_dir = Path(raw_base).resolve()
+
+    # Extract all file extensions mentioned in investigation_notes (e.g. .ts, .py, .go, .rs, .js)
+    notes_extensions = set(re.findall(r"\.([a-zA-Z0-9_-]+)\b", notes_lower))
+
+    for subgoal in subgoals:
+        subgoal_desc_lower = subgoal.description.lower()
+        subgoal_targets_existing = targets_existing or bool(
+            re.search(r"\b(existing|undocumented|current)\b", subgoal_desc_lower)
+        )
+
+        for scope_item in subgoal.scope:
+            cleaned_path = scope_item.strip().replace("\\", "/")
+            path_obj = Path(cleaned_path)
+            file_name = path_obj.name.lower()
+            file_stem = path_obj.stem.lower()
+            ext = path_obj.suffix.lower().lstrip(".")
+
+            # 1. Check if the file exists on disk in the workspace
+            exists_on_disk = False
+            if base_dir is not None:
+                try:
+                    full_target = (base_dir / cleaned_path).resolve()
+                    exists_on_disk = full_target.exists() and (full_target.is_file() or full_target.is_dir())
+                except Exception:
+                    exists_on_disk = False
+
+            if exists_on_disk:
+                continue
+
+            # 2. Check if file path, filename, or meaningful stem is explicitly present in notes or ticket
+            stem_in_notes = len(file_stem) >= 3 and bool(re.search(r"\b" + re.escape(file_stem) + r"\b", notes_lower))
+            stem_in_ticket = len(file_stem) >= 3 and bool(re.search(r"\b" + re.escape(file_stem) + r"\b", ticket_lower))
+            in_notes = (cleaned_path.lower() in notes_lower) or (file_name in notes_lower) or stem_in_notes
+            in_ticket = (cleaned_path.lower() in ticket_lower) or (file_name in ticket_lower) or stem_in_ticket
+
+            if in_notes or in_ticket:
+                continue
+
+            # 3. If file does not exist on disk, and is not in notes, and not in ticket:
+            # Case A: Ticket or subgoal explicitly targets existing code/functions
+            if subgoal_targets_existing:
+                raise ValueError(
+                    f"Scope file '{scope_item}' does not exist in repository and was not found during investigation for ticket modifying existing code."
+                )
+
+            # Case B: Investigation notes found specific files, but the proposed file has an alien extension
+            # that was never found during investigation (e.g. .py proposed for a .ts repo)
+            if notes_extensions and ext and (ext not in notes_extensions):
+                # Check if the extension exists on disk in workspace
+                ext_exists_in_workspace = False
+                if base_dir is not None:
+                    try:
+                        ext_exists_in_workspace = any(base_dir.glob(f"*.{ext}")) or any(base_dir.glob(f"*/*.{ext}"))
+                    except Exception:
+                        pass
+                if not ext_exists_in_workspace:
+                    raise ValueError(
+                        f"Scope file '{scope_item}' has file extension '.{ext}' which does not exist in the repository and was not found during investigation."
+                    )
+
+            # Case C: If investigation notes exist and ticket does NOT request creating new files,
+            # touching uninvestigated non-existent files is ungrounded
+            if notes_lower.strip() and not creates_new:
+                raise ValueError(
+                    f"Scope file '{scope_item}' does not exist in repository and was not identified in investigation notes."
+                )
+
+
 def node_plan(
     state: State,
     workspace: Optional[Any] = None,
@@ -807,10 +901,15 @@ def node_plan(
         "   - 'description': Clear, concise explanation of the atomic change.",
         "   - 'scope': Non-empty list of exact file paths to touch or create. No placeholder or empty scopes allowed.",
         "   - 'expects_tests': Boolean (true/false) indicating whether tests are expected to pass/run for this step.",
-        "3. Output format:",
+        "3. GROUNDING REQUIREMENTS (CRITICAL):",
+        "   - If modifying, extending, or documenting existing code, every file path in 'scope' MUST be grounded strictly in the files discovered in 'Investigation Notes' or explicitly named in the 'Ticket Description'.",
+        "   - Do NOT invent, hallucinate, or guess file paths.",
+        "   - Do NOT assume any default project language or file extensions (e.g. do NOT assume Python 'src/main.py' if the repository is TypeScript, Go, Rust, or JavaScript). Use the actual language and paths discovered in Investigation Notes.",
+        "   - If the ticket explicitly requests creating brand new files not previously existing, those new paths must be consistent with the directory structure established in Investigation Notes.",
+        "4. Output format:",
         "   Return ONLY a valid JSON array of Subgoal objects. Do NOT include markdown commentary or explanations outside the JSON array.",
-        "   Example:",
-        '   [{"description": "Add feature", "scope": ["src/feature.py"], "expects_tests": true}]',
+        "   Schema illustration:",
+        '   [{"description": "Atomic change description", "scope": ["relative/path/to/target/file"], "expects_tests": true}]',
     ])
     prompt_text = "\n".join(prompt_lines)
     messages: List[Any] = [HumanMessage(content=prompt_text)]
@@ -851,9 +950,12 @@ def node_plan(
         raw_content = _extract_content_text(getattr(response, "content", response))
 
         try:
-            subgoals = _parse_and_validate_plan(raw_content)
+            parsed_subgoals = _parse_and_validate_plan(raw_content)
+            _validate_plan_grounding(parsed_subgoals, workspace, ticket, investigation_notes)
+            subgoals = parsed_subgoals
             break
         except Exception as exc:
+            subgoals = None
             last_error = str(exc)
             if attempt == 0:
                 retries_used = 1

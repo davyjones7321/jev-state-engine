@@ -661,6 +661,124 @@ def test_node_plan_api_failure_writes_escalation_log_with_real_gatekeeper(tmp_pa
     assert traj_entry["subgoals"] == []
 
 
+# 25. Ungrounded scope on ticket modifying existing code fails validation and retries with feedback
+def test_node_plan_ungrounded_scope_fails_validation_and_retries_successfully(tmp_path):
+    # Setup a repo with real TypeScript file
+    auth_file = tmp_path / "src" / "lib" / "auth.ts"
+    auth_file.parent.mkdir(parents=True, exist_ok=True)
+    auth_file.write_text("export function createSession() {}", encoding="utf-8")
+
+    class TestWorkspace:
+        def __init__(self, root):
+            self.worktree_dir = root
+            self.repo_dir = root
+
+    ws = TestWorkspace(tmp_path)
+    hallucinated_plan = [
+        {
+            "description": "Add docstring to existing function",
+            "scope": ["src/main.py"],
+            "expects_tests": True,
+        }
+    ]
+    grounded_plan = [
+        {
+            "description": "Add docstring to createSession",
+            "scope": ["src/lib/auth.ts"],
+            "expects_tests": True,
+        }
+    ]
+    fake_llm = ScriptedChatModel([json.dumps(hallucinated_plan), json.dumps(grounded_plan)])
+    state: State = {
+        "ticket": "Add a docstring to one existing function in this project",
+        "investigation_notes": "Found undocumented functions: createSession in src/lib/auth.ts",
+        "trajectory": [],
+    }
+
+    result = node_plan(state, workspace=ws, llm=fake_llm)
+
+    assert len(fake_llm.invocations) == 2
+    # Verify retry prompt contains grounding validation error
+    retry_invocation = fake_llm.invocations[1]
+    human_messages = [m for m in retry_invocation if isinstance(m, HumanMessage)]
+    retry_msg = human_messages[-1].content
+    assert "does not exist in repository" in retry_msg.lower() or "not found during investigation" in retry_msg.lower()
+
+    # Plan queue is grounded after retry
+    assert result.get("gate_status") != "planning_failed"
+    assert len(result["plan_queue"]) == 1
+    assert result["plan_queue"][0].scope == ["src/lib/auth.ts"]
+
+
+# 26. Ungrounded scope on both attempts escalates as planning_failed
+def test_node_plan_ungrounded_scope_fails_both_attempts_and_escalates(tmp_path):
+    class TestWorkspace:
+        def __init__(self, root):
+            self.worktree_dir = root
+            self.repo_dir = root
+
+    ws = TestWorkspace(tmp_path)
+    hallucinated_plan = [
+        {
+            "description": "Add docstring to existing function",
+            "scope": ["src/main.py"],
+            "expects_tests": True,
+        }
+    ]
+    fake_llm = ScriptedChatModel([json.dumps(hallucinated_plan), json.dumps(hallucinated_plan)])
+    mock_gk = MagicMock()
+    state: State = {
+        "ticket": "Add a docstring to one existing function in this project",
+        "investigation_notes": "Found undocumented functions: createSession in src/lib/auth.ts",
+        "trajectory": [],
+    }
+
+    result = node_plan(state, workspace=ws, llm=fake_llm, gatekeeper=mock_gk)
+
+    assert len(fake_llm.invocations) == 2
+    assert result.get("gate_status") == "planning_failed"
+    assert result.get("status") == "escalated"
+    assert result.get("plan_queue") == []
+    assert len(result["trajectory"]) == 1
+    assert result["trajectory"][0]["error_type"] == "validation_failure"
+    assert "does not exist in repository" in result["trajectory"][0]["error"].lower()
+    mock_gk.escalate_deadlock.assert_called_once_with(
+        trajectory=result["trajectory"],
+        triggering_tier="planning",
+    )
+
+
+# 27. Alien file extension not present in investigation notes or repo triggers validation failure
+def test_node_plan_alien_extension_rejected_when_notes_specify_different_language(tmp_path):
+    class TestWorkspace:
+        def __init__(self, root):
+            self.worktree_dir = root
+            self.repo_dir = root
+
+    ws = TestWorkspace(tmp_path)
+    alien_plan = [
+        {
+            "description": "Add python script",
+            "scope": ["src/script.py"],
+            "expects_tests": True,
+        }
+    ]
+    fake_llm = ScriptedChatModel([json.dumps(alien_plan), json.dumps(alien_plan)])
+    state: State = {
+        "ticket": "Update payment processor",
+        "investigation_notes": "Discovered TypeScript code in src/lib/payment.ts and src/lib/auth.ts",
+        "trajectory": [],
+    }
+
+    result = node_plan(state, workspace=ws, llm=fake_llm)
+
+    assert len(fake_llm.invocations) == 2
+    assert result.get("gate_status") == "planning_failed"
+    assert result.get("status") == "escalated"
+    assert "extension" in result["trajectory"][0]["error"].lower() or "does not exist" in result["trajectory"][0]["error"].lower()
+
+
+
 
 
 
