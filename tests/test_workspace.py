@@ -227,3 +227,19 @@ def test_run_mechanical_checks_allows_no_tests_when_not_expected(git_repo):
     assert result.passed is True
     assert result.failed_check is None
     assert "untested" in result.detail.lower()
+
+
+# 13. test_get_cumulative_diff_captures_committed_subgoals
+def test_get_cumulative_diff_captures_committed_subgoals(git_repo):
+    """When a subgoal is committed, get_staged_diff is empty, but get_cumulative_diff returns the committed diff."""
+    ws = Workspace(repo_dir=git_repo)
+    ws.stage_file_mutation("doc.py", "# New docstring\ndef hello(): pass\n")
+    ws.commit_subgoal("Added hello function")
+
+    # Staged diff is empty because the commit already occurred
+    assert ws.get_staged_diff().strip() == ""
+
+    # Cumulative diff captures the diff from base_commit to HEAD
+    cumulative = ws.get_cumulative_diff()
+    assert "doc.py" in cumulative
+    assert "+# New docstring" in cumulative

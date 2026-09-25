@@ -465,3 +465,61 @@ def test_route_gate_branches():
     }
     assert route_gate(state_retry) == "implement"
 
+
+# 15. Test node_verify uses cumulative diff and context for untested pass
+def test_node_verify_uses_cumulative_diff_and_untested_context():
+    ws = MagicMock()
+    ws.run_tests.return_value = TestOutcome.NO_TESTS_COLLECTED
+    ws.get_cumulative_diff.return_value = "diff --git a/doc.ts b/doc.ts\n+/** docstring */"
+    ws.get_staged_diff.return_value = ""
+
+    gk = FakeGatekeeper(verify_verdict=ValidationVerdict(valid=True, probability=0.98))
+
+    state = {
+        "ticket": "Add docstring to func",
+        "trajectory": [
+            {
+                "node": "plan",
+                "subgoals": [
+                    {"description": "Add docstring", "scope": ["doc.ts"], "expects_tests": False}
+                ],
+            }
+        ],
+    }
+
+    res = node_verify(state, workspace=ws, gatekeeper=gk)
+
+    assert res["status"] == "completed"
+    assert res["gate_status"] == "verified"
+    gk.verify_ticket.assert_called_once()
+    args, kwargs = gk.verify_ticket.call_args
+    ticket_arg, diff_arg, test_out_arg = args
+    assert ticket_arg == "Add docstring to func"
+    assert diff_arg == "diff --git a/doc.ts b/doc.ts\n+/** docstring */"
+    assert "Untested pass" in test_out_arg
+
+
+# 16. Test node_verify escalation on failure
+def test_node_verify_failure_escalates():
+    ws = MagicMock()
+    ws.run_tests.return_value = TestOutcome.PASSED
+    ws.get_cumulative_diff.return_value = ""
+    ws.get_staged_diff.return_value = ""
+
+    gk = FakeGatekeeper(
+        verify_verdict=ValidationVerdict(valid=False, probability=0.1, reason="Incomplete diff")
+    )
+
+    state = {
+        "ticket": "Fix issue",
+        "trajectory": [],
+    }
+
+    res = node_verify(state, workspace=ws, gatekeeper=gk)
+
+    assert res["status"] == "verification_failed"
+    assert res["gate_status"] == "verification_failed"
+    assert res["last_feedback"] == "Incomplete diff"
+    gk.escalate_deadlock.assert_called_once()
+    assert gk.escalate_deadlock.call_args[1]["triggering_tier"] == "verification"
+

@@ -1391,26 +1391,56 @@ def node_verify(
         outcome = workspace.run_tests()
         test_output = getattr(outcome, "value", str(outcome))
 
-    final_diff = workspace.get_staged_diff() if workspace and hasattr(workspace, "get_staged_diff") else ""
+    # Determine if any subgoals expected automated tests
+    any_expects_tests = False
+    for step in state.get("trajectory", []):
+        subgoals = step.get("subgoals", [])
+        if isinstance(subgoals, list):
+            for sg in subgoals:
+                if isinstance(sg, dict) and sg.get("expects_tests", True):
+                    any_expects_tests = True
+                elif hasattr(sg, "expects_tests") and getattr(sg, "expects_tests", True):
+                    any_expects_tests = True
+
+    if not any_expects_tests and test_output == "NO_TESTS_COLLECTED":
+        test_output = "NO_TESTS_COLLECTED (Untested pass: ticket does not require automated tests)"
+
+    final_diff = ""
+    if workspace is not None:
+        if hasattr(workspace, "get_cumulative_diff"):
+            final_diff = workspace.get_cumulative_diff()
+        elif hasattr(workspace, "get_staged_diff"):
+            final_diff = workspace.get_staged_diff()
+
+    if not final_diff and workspace is not None and hasattr(workspace, "get_staged_diff"):
+        final_diff = workspace.get_staged_diff()
+
     ticket = state.get("ticket", "")
 
+    verdict = None
     if gatekeeper is not None and hasattr(gatekeeper, "verify_ticket"):
         verdict = gatekeeper.verify_ticket(ticket, final_diff, test_output)
         if verdict.valid:
             state["gate_status"] = "verified"
             state["status"] = "completed"
+            state["last_feedback"] = ""
         else:
             state["gate_status"] = "verification_failed"
             state["status"] = "verification_failed"
+            state["last_feedback"] = verdict.reason or "Verification rejected by Gatekeeper."
     else:
         state["gate_status"] = "verified"
         state["status"] = "completed"
 
-    state["trajectory"].append({
+    verify_entry: Dict[str, Any] = {
         "node": "verify",
         "gate_status": state.get("gate_status"),
         "status": state.get("status"),
-    })
+    }
+    if verdict is not None and getattr(verdict, "reason", None):
+        verify_entry["reason"] = verdict.reason
+
+    state["trajectory"].append(verify_entry)
 
     if state.get("gate_status") == "verification_failed" and gatekeeper is not None and hasattr(gatekeeper, "escalate_deadlock"):
         gatekeeper.escalate_deadlock(

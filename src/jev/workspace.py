@@ -37,6 +37,13 @@ class Workspace:
         self.worktree_dir = (
             Path(worktree_dir).resolve() if worktree_dir else self.repo_dir
         )
+        self.base_commit: Optional[str] = self._get_head_commit()
+
+    def _get_head_commit(self) -> Optional[str]:
+        res = self._run_git(["rev-parse", "HEAD"])
+        if res.returncode == 0 and res.stdout.strip():
+            return res.stdout.strip()
+        return None
 
     def _run_git(self, args: List[str], check: bool = False) -> subprocess.CompletedProcess:
         return subprocess.run(
@@ -116,6 +123,14 @@ class Workspace:
         if res.returncode != 0:
             res = self._run_git(["diff", "--cached"])
         return res.stdout
+
+    def get_cumulative_diff(self) -> str:
+        """Returns the full cumulative diff since workspace initialization (both committed and uncommitted)."""
+        if self.base_commit:
+            res = self._run_git(["diff", self.base_commit])
+            if res.returncode == 0 and res.stdout.strip():
+                return res.stdout
+        return self.get_staged_diff()
 
     def commit_subgoal(self, message: str = "Subgoal committed") -> None:
         self._run_git(["add", "-A"])
