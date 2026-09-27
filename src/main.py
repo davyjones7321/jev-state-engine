@@ -49,7 +49,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # Wire Dependency Injection
     workspace = Workspace(repo_dir=repo_dir)
-    env_file = (repo_dir / ".env") if (repo_dir / ".env").exists() else (Path.cwd() / ".env" if (Path.cwd() / ".env").exists() else None)
+    engine_env = Path.cwd() / ".env"
+    if not engine_env.exists():
+        engine_env = Path(__file__).resolve().parent.parent / ".env"
+    env_file = engine_env if engine_env.exists() else ((repo_dir / ".env") if (repo_dir / ".env").exists() else None)
     gatekeeper = Gatekeeper(env_file=env_file)
 
     # Wire Gemini LLM (gemini-3.5-flash-lite) via langchain-google-genai

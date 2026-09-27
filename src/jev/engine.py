@@ -3,6 +3,7 @@ import re
 import sqlite3
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
@@ -1147,6 +1148,17 @@ def node_implement(
     elif isinstance(current_subgoal, Subgoal):
         subgoal = current_subgoal
 
+    if workspace is not None and hasattr(workspace, "create_subgoal_worktree") and subgoal is not None:
+        if not state.get("current_worktree_path"):
+            subgoal_desc = getattr(subgoal, "description", "") or "subgoal"
+            clean_desc = re.sub(r"[^a-zA-Z0-9_-]", "_", subgoal_desc)[:20].strip("_") or "subgoal"
+            subgoal_id = f"{clean_desc}_{uuid.uuid4().hex[:6]}"
+            wt_path = workspace.create_subgoal_worktree(subgoal_id)
+            state["current_worktree_path"] = str(wt_path)
+            state["current_worktree_branch"] = f"jev-subgoal-{subgoal_id}"
+        elif hasattr(workspace, "worktree_dir") and state.get("current_worktree_path"):
+            workspace.worktree_dir = Path(state["current_worktree_path"])
+
     executed_tools: List[Dict[str, Any]] = []
 
     if llm is not None and subgoal is not None and workspace is not None:
@@ -1333,7 +1345,15 @@ def node_gate(
     mech_result = workspace.run_mechanical_checks(subgoal)
 
     if not mech_result.passed:
-        workspace.rollback_subgoal()
+        if state.get("current_worktree_path") and hasattr(workspace, "discard_subgoal_worktree"):
+            workspace.discard_subgoal_worktree(
+                state.get("current_worktree_path"),
+                state.get("current_worktree_branch"),
+            )
+        elif hasattr(workspace, "rollback_subgoal"):
+            workspace.rollback_subgoal()
+        state["current_worktree_path"] = None
+        state["current_worktree_branch"] = None
         current_mech_strikes = state.get("mechanical_strike_count", 0) + 1
         state["mechanical_strike_count"] = current_mech_strikes
         state["gate_status"] = "mechanical_failure"
@@ -1356,14 +1376,47 @@ def node_gate(
     )
 
     if verdict.valid:
-        workspace.commit_subgoal()
+        if state.get("current_worktree_path") and hasattr(workspace, "merge_subgoal_worktree"):
+            try:
+                workspace.merge_subgoal_worktree(
+                    state.get("current_worktree_path"),
+                    state.get("current_worktree_branch"),
+                )
+            except Exception as e:
+                state["gate_status"] = "merge_failed"
+                state["status"] = "escalated"
+                state["last_feedback"] = f"Worktree merge failed: {e}"
+                state["trajectory"].append({
+                    "node": "gate",
+                    "error_type": "merge_failure",
+                    "error": str(e),
+                    "gate_status": "merge_failed",
+                })
+                if gatekeeper is not None and hasattr(gatekeeper, "escalate_deadlock"):
+                    gatekeeper.escalate_deadlock(
+                        trajectory=state.get("trajectory", []),
+                        triggering_tier="merge",
+                    )
+                return state
+        elif hasattr(workspace, "commit_subgoal"):
+            workspace.commit_subgoal()
+        state["current_worktree_path"] = None
+        state["current_worktree_branch"] = None
         state["mechanical_strike_count"] = 0
         state["semantic_strike_count"] = 0
         state["gate_status"] = "passed"
         state["last_feedback"] = ""
         return state
     else:
-        workspace.rollback_subgoal()
+        if state.get("current_worktree_path") and hasattr(workspace, "discard_subgoal_worktree"):
+            workspace.discard_subgoal_worktree(
+                state.get("current_worktree_path"),
+                state.get("current_worktree_branch"),
+            )
+        elif hasattr(workspace, "rollback_subgoal"):
+            workspace.rollback_subgoal()
+        state["current_worktree_path"] = None
+        state["current_worktree_branch"] = None
         current_sem_strikes = state.get("semantic_strike_count", 0) + 1
         state["semantic_strike_count"] = current_sem_strikes
         state["gate_status"] = "semantic_failure"
@@ -1471,6 +1524,8 @@ def route_gate(state: State) -> str:
     if (
         state.get("mechanical_strike_count", 0) >= 3
         or state.get("semantic_strike_count", 0) >= 3
+        or state.get("gate_status") == "merge_failed"
+        or state.get("status") == "escalated"
     ):
         return "escalate"
     if state.get("gate_status") == "passed":

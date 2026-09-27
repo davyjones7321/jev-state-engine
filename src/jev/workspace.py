@@ -1,5 +1,7 @@
 import ast
+import os
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -49,6 +51,15 @@ class Workspace:
         return subprocess.run(
             ["git"] + args,
             cwd=self.worktree_dir,
+            capture_output=True,
+            text=True,
+            check=check,
+        )
+
+    def _run_repo_git(self, args: List[str], check: bool = False) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git"] + args,
+            cwd=self.repo_dir,
             capture_output=True,
             text=True,
             check=check,
@@ -139,6 +150,112 @@ class Workspace:
     def rollback_subgoal(self) -> None:
         self._run_git(["reset", "--hard", "HEAD"])
         self._run_git(["clean", "-fd"])
+
+    @staticmethod
+    def _force_rmtree(path: Path) -> None:
+        def on_error(func, p, exc_info):
+            try:
+                os.chmod(p, stat.S_IWRITE)
+                func(p)
+            except Exception:
+                pass
+        if path.exists():
+            shutil.rmtree(path, onerror=on_error)
+
+    def create_subgoal_worktree(self, subgoal_id: str) -> Path:
+        """Creates an isolated git worktree for a subgoal."""
+        worktree_base = self.repo_dir / ".jev-worktrees"
+        worktree_base.mkdir(parents=True, exist_ok=True)
+
+        exclude_file = self.repo_dir / ".git" / "info" / "exclude"
+        if exclude_file.exists():
+            try:
+                content = exclude_file.read_text(encoding="utf-8")
+                if ".jev-worktrees" not in content:
+                    exclude_file.write_text(content.rstrip() + "\n.jev-worktrees/\n", encoding="utf-8")
+            except Exception:
+                pass
+
+        worktree_path = (worktree_base / f"subgoal-{subgoal_id}").resolve()
+        branch_name = f"jev-subgoal-{subgoal_id}"
+
+        # Clean up if prior branch or worktree directory exists
+        if worktree_path.exists():
+            self._run_repo_git(["worktree", "remove", "--force", str(worktree_path)])
+            if worktree_path.exists():
+                self._force_rmtree(worktree_path)
+
+        self._run_repo_git(["branch", "-D", branch_name])
+
+        res = self._run_repo_git(["worktree", "add", "-b", branch_name, str(worktree_path), "HEAD"])
+        if res.returncode != 0:
+            raise RuntimeError(f"Failed to create worktree: {res.stderr or res.stdout}")
+
+        self.worktree_dir = worktree_path
+        self.current_worktree_path = worktree_path
+        self.current_worktree_branch = branch_name
+        return worktree_path
+
+    def merge_subgoal_worktree(
+        self,
+        worktree_path: Optional[Union[str, Path]] = None,
+        branch_name: Optional[str] = None,
+    ) -> None:
+        """Merges changes from the subgoal worktree into the main repo branch and cleans up."""
+        wt_path = Path(worktree_path).resolve() if worktree_path else getattr(self, "current_worktree_path", None)
+        br_name = branch_name or getattr(self, "current_worktree_branch", None)
+
+        if wt_path and wt_path.exists():
+            subprocess.run(["git", "add", "-A"], cwd=wt_path, capture_output=True, text=True)
+            diff_check = subprocess.run(["git", "diff", "--cached"], cwd=wt_path, capture_output=True, text=True)
+            if diff_check.stdout.strip():
+                commit_msg = f"Subgoal committed ({br_name})" if br_name else "Subgoal committed"
+                subprocess.run(["git", "commit", "-m", commit_msg], cwd=wt_path, capture_output=True, text=True)
+
+        self.worktree_dir = self.repo_dir
+
+        if br_name:
+            merge_res = self._run_repo_git(["merge", "--ff-only", br_name])
+            if merge_res.returncode != 0:
+                self._run_repo_git(["merge", "--abort"])
+                raise RuntimeError(
+                    f"Failed to fast-forward merge subgoal branch {br_name}: {merge_res.stderr or merge_res.stdout}"
+                )
+
+        if wt_path:
+            self._run_repo_git(["worktree", "remove", "--force", str(wt_path)])
+            if wt_path.exists():
+                self._force_rmtree(wt_path)
+            self._run_repo_git(["worktree", "prune"])
+
+        if br_name:
+            self._run_repo_git(["branch", "-D", br_name])
+
+        self.current_worktree_path = None
+        self.current_worktree_branch = None
+
+    def discard_subgoal_worktree(
+        self,
+        worktree_path: Optional[Union[str, Path]] = None,
+        branch_name: Optional[str] = None,
+    ) -> None:
+        """Discards the subgoal worktree and deletes its branch without modifying main repo."""
+        wt_path = Path(worktree_path).resolve() if worktree_path else getattr(self, "current_worktree_path", None)
+        br_name = branch_name or getattr(self, "current_worktree_branch", None)
+
+        self.worktree_dir = self.repo_dir
+
+        if wt_path:
+            self._run_repo_git(["worktree", "remove", "--force", str(wt_path)])
+            if wt_path.exists():
+                self._force_rmtree(wt_path)
+            self._run_repo_git(["worktree", "prune"])
+
+        if br_name:
+            self._run_repo_git(["branch", "-D", br_name])
+
+        self.current_worktree_path = None
+        self.current_worktree_branch = None
 
     def check_build(
         self,
