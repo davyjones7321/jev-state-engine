@@ -1306,6 +1306,45 @@ def node_implement(
     return state
 
 
+def _is_active_worktree(state: State, workspace: Optional[Any]) -> bool:
+    wt_path = state.get("current_worktree_path")
+    if isinstance(wt_path, (str, Path)) and str(wt_path).strip():
+        return True
+    ws_path = getattr(workspace, "current_worktree_path", None) if workspace else None
+    if isinstance(ws_path, (str, Path)) and str(ws_path).strip():
+        return True
+    if (
+        workspace is not None
+        and hasattr(workspace, "worktree_dir")
+        and hasattr(workspace, "repo_dir")
+        and isinstance(workspace.worktree_dir, Path)
+        and isinstance(workspace.repo_dir, Path)
+        and workspace.worktree_dir != workspace.repo_dir
+    ):
+        return True
+    return False
+
+
+def _get_active_worktree_info(state: State, workspace: Optional[Any]) -> tuple[Optional[str], Optional[str]]:
+    wt_path = state.get("current_worktree_path")
+    if not isinstance(wt_path, (str, Path)):
+        wt_path = getattr(workspace, "current_worktree_path", None) if workspace else None
+    if not isinstance(wt_path, (str, Path)):
+        resolved_path = None
+    else:
+        resolved_path = str(wt_path)
+
+    wt_branch = state.get("current_worktree_branch")
+    if not isinstance(wt_branch, str):
+        wt_branch = getattr(workspace, "current_worktree_branch", None) if workspace else None
+    if not isinstance(wt_branch, str):
+        resolved_branch = None
+    else:
+        resolved_branch = str(wt_branch)
+
+    return resolved_path, resolved_branch
+
+
 def node_gate(
     state: State,
     workspace: Optional[Any] = None,
@@ -1345,13 +1384,17 @@ def node_gate(
     mech_result = workspace.run_mechanical_checks(subgoal)
 
     if not mech_result.passed:
-        if state.get("current_worktree_path") and hasattr(workspace, "discard_subgoal_worktree"):
+        is_wt = _is_active_worktree(state, workspace)
+        wt_path, wt_branch = _get_active_worktree_info(state, workspace)
+        if is_wt and hasattr(workspace, "discard_subgoal_worktree"):
             workspace.discard_subgoal_worktree(
-                state.get("current_worktree_path"),
-                state.get("current_worktree_branch"),
+                wt_path,
+                wt_branch,
             )
         elif hasattr(workspace, "rollback_subgoal"):
             workspace.rollback_subgoal()
+        if hasattr(workspace, "repo_dir") and isinstance(workspace.repo_dir, Path):
+            workspace.worktree_dir = workspace.repo_dir
         state["current_worktree_path"] = None
         state["current_worktree_branch"] = None
         current_mech_strikes = state.get("mechanical_strike_count", 0) + 1
@@ -1376,11 +1419,15 @@ def node_gate(
     )
 
     if verdict.valid:
-        if state.get("current_worktree_path") and hasattr(workspace, "merge_subgoal_worktree"):
+        wt_path = state.get("current_worktree_path")
+        wt_branch = state.get("current_worktree_branch")
+        is_worktree_active = _is_active_worktree(state, workspace)
+
+        if wt_path and hasattr(workspace, "merge_subgoal_worktree"):
             try:
                 workspace.merge_subgoal_worktree(
-                    state.get("current_worktree_path"),
-                    state.get("current_worktree_branch"),
+                    wt_path,
+                    wt_branch,
                 )
             except Exception as e:
                 state["gate_status"] = "merge_failed"
@@ -1398,8 +1445,35 @@ def node_gate(
                         triggering_tier="merge",
                     )
                 return state
+        elif is_worktree_active:
+            # An active worktree was created, but worktree state is missing from state or merge method missing!
+            # Fail loudly and escalate instead of committing quietly on the worktree branch.
+            active_wt_path, active_wt_branch = _get_active_worktree_info(state, workspace)
+            if hasattr(workspace, "discard_subgoal_worktree"):
+                workspace.discard_subgoal_worktree(active_wt_path, active_wt_branch)
+            if hasattr(workspace, "repo_dir") and isinstance(workspace.repo_dir, Path):
+                workspace.worktree_dir = workspace.repo_dir
+            state["current_worktree_path"] = None
+            state["current_worktree_branch"] = None
+            state["gate_status"] = "merge_failed"
+            state["status"] = "escalated"
+            err_msg = "Worktree was created but worktree state was missing or invalid at gate time."
+            state["last_feedback"] = err_msg
+            state["trajectory"].append({
+                "node": "gate",
+                "error_type": "worktree_state_missing",
+                "error": err_msg,
+                "gate_status": "merge_failed",
+            })
+            if gatekeeper is not None and hasattr(gatekeeper, "escalate_deadlock"):
+                gatekeeper.escalate_deadlock(
+                    trajectory=state.get("trajectory", []),
+                    triggering_tier="worktree",
+                )
+            return state
         elif hasattr(workspace, "commit_subgoal"):
             workspace.commit_subgoal()
+
         state["current_worktree_path"] = None
         state["current_worktree_branch"] = None
         state["mechanical_strike_count"] = 0
@@ -1408,13 +1482,17 @@ def node_gate(
         state["last_feedback"] = ""
         return state
     else:
-        if state.get("current_worktree_path") and hasattr(workspace, "discard_subgoal_worktree"):
+        is_wt = _is_active_worktree(state, workspace)
+        wt_path, wt_branch = _get_active_worktree_info(state, workspace)
+        if is_wt and hasattr(workspace, "discard_subgoal_worktree"):
             workspace.discard_subgoal_worktree(
-                state.get("current_worktree_path"),
-                state.get("current_worktree_branch"),
+                wt_path,
+                wt_branch,
             )
         elif hasattr(workspace, "rollback_subgoal"):
             workspace.rollback_subgoal()
+        if hasattr(workspace, "repo_dir") and isinstance(workspace.repo_dir, Path):
+            workspace.worktree_dir = workspace.repo_dir
         state["current_worktree_path"] = None
         state["current_worktree_branch"] = None
         current_sem_strikes = state.get("semantic_strike_count", 0) + 1
@@ -1438,6 +1516,10 @@ def node_verify(
     """State 4: VERIFICATION (Executes full test suite and final ticket verification)."""
     if "trajectory" not in state or state["trajectory"] is None:
         state["trajectory"] = []
+
+    # Ensure workspace points to the main repository (workspace.repo_dir) for all verification checks
+    if workspace is not None and hasattr(workspace, "repo_dir") and isinstance(workspace.repo_dir, Path):
+        workspace.worktree_dir = workspace.repo_dir
 
     test_output = ""
     if workspace is not None and hasattr(workspace, "run_tests"):
@@ -1505,10 +1587,20 @@ def node_verify(
 
 def node_escalate(
     state: State,
+    workspace: Optional[Any] = None,
     gatekeeper: Optional[Any] = None,
 ) -> State:
     """Escalation termination node for HITL review."""
     state["status"] = "escalated"
+    if workspace is not None:
+        is_wt = _is_active_worktree(state, workspace)
+        wt_path, wt_branch = _get_active_worktree_info(state, workspace)
+        if is_wt and hasattr(workspace, "discard_subgoal_worktree"):
+            workspace.discard_subgoal_worktree(wt_path, wt_branch)
+        if hasattr(workspace, "repo_dir") and isinstance(workspace.repo_dir, Path):
+            workspace.worktree_dir = workspace.repo_dir
+    state["current_worktree_path"] = None
+    state["current_worktree_branch"] = None
     return state
 
 
@@ -1575,7 +1667,7 @@ class JevEngine:
         return node_verify(state, workspace=self.workspace, gatekeeper=self.gatekeeper)
 
     def _node_escalate(self, state: State) -> State:
-        return node_escalate(state, gatekeeper=self.gatekeeper)
+        return node_escalate(state, workspace=self.workspace, gatekeeper=self.gatekeeper)
 
     def _route_after_plan(self, state: State) -> str:
         return route_plan(state)

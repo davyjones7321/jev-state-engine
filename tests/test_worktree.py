@@ -3,13 +3,15 @@ from pathlib import Path
 from unittest.mock import MagicMock
 import pytest
 
+from langchain_core.messages import AIMessage
+
 from jev.models import (
     MechanicalCheckResult,
     Subgoal,
     ValidationVerdict,
 )
 from jev.workspace import Workspace
-from jev.engine import node_gate, node_implement, route_gate
+from jev.engine import JevEngine, node_gate, node_implement, route_gate
 
 
 @pytest.fixture
@@ -284,6 +286,213 @@ def test_non_fast_forward_merge_escalates_cleanly_in_node_gate(git_repo):
     assert gk.escalate_deadlock.call_args[1]["triggering_tier"] == "merge"
     assert res["trajectory"][-1]["error_type"] == "merge_failure"
 
-    # route_gate routes merge_failed to escalate
     assert route_gate(res) == "escalate"
+
+
+class ScriptedChatModel:
+    """Fake/Scripted LLM for compiled graph integration tests."""
+
+    def __init__(self, responses=None):
+        if isinstance(responses, list):
+            self.responses = responses
+        else:
+            self.responses = list(responses or [])
+
+    def bind_tools(self, tools, **kwargs):
+        bound = ScriptedChatModel(responses=self.responses)
+        return bound
+
+    def invoke(self, messages, **kwargs):
+        if not self.responses:
+            return AIMessage(content="No more scripted responses.")
+        return self.responses.pop(0)
+
+
+class FakeGatekeeper:
+    """Fake Gatekeeper for compiled graph integration tests."""
+
+    def __init__(self, verdict=None, verify_verdict=None):
+        self.verdict = verdict or ValidationVerdict(valid=True, probability=0.95)
+        self.verify_verdict = verify_verdict or ValidationVerdict(valid=True, probability=0.99)
+        self.validate_subgoal = MagicMock(side_effect=self._validate_subgoal)
+        self.verify_ticket = MagicMock(side_effect=self._verify_ticket)
+        self.escalate_deadlock = MagicMock()
+
+    def _validate_subgoal(self, subgoal, diff, mechanical_detail=""):
+        return self.verdict
+
+    def _verify_ticket(self, ticket, final_diff, test_output):
+        return self.verify_verdict
+
+
+# 11. Full JevEngine.execute graph integration: passed gate merges to main and cleans up worktree
+def test_engine_execute_worktree_lifecycle_passed_gate(tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    subprocess.run(["git", "init", "-b", "master"], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo_dir, check=True, capture_output=True)
+
+    foo_file = repo_dir / "foo.py"
+    foo_file.write_text("def foo():\n    return 42\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "Initial commit"], cwd=repo_dir, check=True, capture_output=True)
+
+    ws = Workspace(repo_dir=repo_dir)
+
+    responses = [
+        # 1. Investigate
+        AIMessage(content="", tool_calls=[{"name": "finish_investigation", "args": {"summary": "foo.py contains function foo."}, "id": "call_inv"}]),
+        # 2. Plan
+        AIMessage(content='[{"description": "Add docstring to foo.py", "scope": ["foo.py"], "expects_tests": false}]'),
+        # 3. Implement
+        AIMessage(content="", tool_calls=[
+            {"name": "stage_file_mutation", "args": {"path": "foo.py", "content": "def foo():\n    \"\"\"A docstring\"\"\"\n    return 42\n"}, "id": "call_stage"},
+            {"name": "submit_subgoal", "args": {"notes": "Added docstring"}, "id": "call_sub"}
+        ]),
+    ]
+    llm = ScriptedChatModel(responses)
+    gk = FakeGatekeeper(
+        verdict=ValidationVerdict(valid=True, probability=0.99),
+        verify_verdict=ValidationVerdict(valid=True, probability=0.99),
+    )
+
+    db_path = tmp_path / "checkpoints.db"
+    engine = JevEngine(workspace=ws, gatekeeper=gk, llm=llm, db_path=str(db_path))
+    final_state = engine.execute(ticket="Add docstring to foo.py", thread_id="run_pass")
+
+    assert final_state["status"] == "completed"
+
+    # 1. The change MUST be on main in the repo directory
+    content_on_main = (repo_dir / "foo.py").read_text(encoding="utf-8")
+    assert "A docstring" in content_on_main
+
+    # 2. git worktree list MUST show only the main repo
+    wt_list = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=repo_dir, capture_output=True, text=True).stdout
+    assert ".jev-worktrees" not in wt_list
+
+    # 3. No jev-subgoal-* branch remains
+    br_list = subprocess.run(["git", "branch", "--list", "jev-subgoal-*"], cwd=repo_dir, capture_output=True, text=True).stdout
+    assert br_list.strip() == ""
+
+
+# 12. Full JevEngine.execute graph integration: failed gate discards worktree and creates fresh one on retry
+def test_engine_execute_worktree_failed_gate_and_retry(tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    subprocess.run(["git", "init", "-b", "master"], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo_dir, check=True, capture_output=True)
+
+    foo_file = repo_dir / "foo.py"
+    foo_file.write_text("def foo():\n    return 42\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "Initial commit"], cwd=repo_dir, check=True, capture_output=True)
+
+    ws = Workspace(repo_dir=repo_dir)
+
+    responses = [
+        # Investigate
+        AIMessage(content="", tool_calls=[{"name": "finish_investigation", "args": {"summary": "foo.py exists"}, "id": "call_inv"}]),
+        # Plan
+        AIMessage(content='[{"description": "Add docstring to foo.py", "scope": ["foo.py"], "expects_tests": false}]'),
+        # Implement attempt 1 (fails gate)
+        AIMessage(content="", tool_calls=[
+            {"name": "stage_file_mutation", "args": {"path": "foo.py", "content": "def foo():\n    # bad\n    return 42\n"}, "id": "call_stage1"},
+            {"name": "submit_subgoal", "args": {"notes": "Bad attempt"}, "id": "call_sub1"}
+        ]),
+        # Implement attempt 2 (succeeds)
+        AIMessage(content="", tool_calls=[
+            {"name": "stage_file_mutation", "args": {"path": "foo.py", "content": "def foo():\n    \"\"\"Good docstring\"\"\"\n    return 42\n"}, "id": "call_stage2"},
+            {"name": "submit_subgoal", "args": {"notes": "Good attempt"}, "id": "call_sub2"}
+        ]),
+    ]
+    llm = ScriptedChatModel(responses)
+
+    gate_verdicts = [
+        ValidationVerdict(valid=False, probability=0.1, reason="Bad attempt"),
+        ValidationVerdict(valid=True, probability=0.99),
+    ]
+    gk = FakeGatekeeper(
+        verify_verdict=ValidationVerdict(valid=True, probability=0.99)
+    )
+    gk.validate_subgoal = MagicMock(side_effect=lambda sg, diff, mechanical_detail="": gate_verdicts.pop(0))
+
+    db_path = tmp_path / "checkpoints.db"
+    engine = JevEngine(workspace=ws, gatekeeper=gk, llm=llm, db_path=str(db_path))
+    final_state = engine.execute(ticket="Add docstring to foo.py", thread_id="run_retry")
+
+    assert final_state["status"] == "completed"
+
+    # The change on main is the good one, not the bad one
+    content_on_main = (repo_dir / "foo.py").read_text(encoding="utf-8")
+    assert "Good docstring" in content_on_main
+    assert "# bad" not in content_on_main
+
+    # Worktrees cleaned up
+    wt_list = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=repo_dir, capture_output=True, text=True).stdout
+    assert ".jev-worktrees" not in wt_list
+    br_list = subprocess.run(["git", "branch", "--list", "jev-subgoal-*"], cwd=repo_dir, capture_output=True, text=True).stdout
+    assert br_list.strip() == ""
+
+
+# 13. Full JevEngine.execute graph integration: 3 strikes escalation discards worktree and cleans up
+def test_engine_execute_worktree_escalation_cleans_up(tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    subprocess.run(["git", "init", "-b", "master"], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo_dir, check=True, capture_output=True)
+
+    foo_file = repo_dir / "foo.py"
+    foo_file.write_text("def foo():\n    return 42\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "Initial commit"], cwd=repo_dir, check=True, capture_output=True)
+
+    ws = Workspace(repo_dir=repo_dir)
+
+    responses = [
+        # Investigate
+        AIMessage(content="", tool_calls=[{"name": "finish_investigation", "args": {"summary": "foo.py exists"}, "id": "call_inv"}]),
+        # Plan
+        AIMessage(content='[{"description": "Add docstring to foo.py", "scope": ["foo.py"], "expects_tests": false}]'),
+        # Implement attempt 1
+        AIMessage(content="", tool_calls=[
+            {"name": "stage_file_mutation", "args": {"path": "foo.py", "content": "# attempt 1\n"}, "id": "call_s1"},
+            {"name": "submit_subgoal", "args": {"notes": "a1"}, "id": "call_sub1"}
+        ]),
+        # Implement attempt 2
+        AIMessage(content="", tool_calls=[
+            {"name": "stage_file_mutation", "args": {"path": "foo.py", "content": "# attempt 2\n"}, "id": "call_s2"},
+            {"name": "submit_subgoal", "args": {"notes": "a2"}, "id": "call_sub2"}
+        ]),
+        # Implement attempt 3
+        AIMessage(content="", tool_calls=[
+            {"name": "stage_file_mutation", "args": {"path": "foo.py", "content": "# attempt 3\n"}, "id": "call_s3"},
+            {"name": "submit_subgoal", "args": {"notes": "a3"}, "id": "call_sub3"}
+        ]),
+    ]
+    llm = ScriptedChatModel(responses)
+
+    gk = FakeGatekeeper(
+        verdict=ValidationVerdict(valid=False, probability=0.1, reason="Persistent rejection")
+    )
+
+    db_path = tmp_path / "checkpoints.db"
+    engine = JevEngine(workspace=ws, gatekeeper=gk, llm=llm, db_path=str(db_path))
+    final_state = engine.execute(ticket="Add docstring to foo.py", thread_id="run_esc")
+
+    assert final_state["status"] == "escalated"
+    assert final_state["gate_status"] == "semantic_failure"
+
+    # Main repo was never modified
+    content_on_main = (repo_dir / "foo.py").read_text(encoding="utf-8")
+    assert content_on_main == "def foo():\n    return 42\n"
+
+    # Worktrees cleaned up on escalation
+    wt_list = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=repo_dir, capture_output=True, text=True).stdout
+    assert ".jev-worktrees" not in wt_list
+    br_list = subprocess.run(["git", "branch", "--list", "jev-subgoal-*"], cwd=repo_dir, capture_output=True, text=True).stdout
+    assert br_list.strip() == ""
+
 

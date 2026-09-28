@@ -39,3 +39,6 @@ class State(TypedDict, total=False):
     gate_status: Optional[str]
     last_feedback: Optional[str]
     status: Optional[str]
+    investigation_notes: Optional[str]
+    current_worktree_path: Optional[str]
+    current_worktree_branch: Optional[str]
