@@ -944,6 +944,7 @@ def _validate_plan_grounding(
                 )
 
 
+
 def node_plan(
     state: State,
     workspace: Optional[Any] = None,
@@ -1020,17 +1021,21 @@ def node_plan(
         "2. For each Subgoal, specify:",
         "   - 'description': Clear, concise explanation of the atomic change.",
         "   - 'scope': Non-empty list of exact file paths to touch or create. No placeholder or empty scopes allowed.",
-        "   - 'expects_tests': Boolean (true/false) indicating whether tests are expected to pass/run for this step.",
+        "   - 'expects_tests': Boolean (true/false) indicating whether automated tests are expected to pass/run for this step.",
         "3. GROUNDING REQUIREMENTS (CRITICAL):",
         "   - If modifying, extending, or documenting existing code, every file path in 'scope' MUST be grounded strictly in the files discovered in 'Investigation Notes' or explicitly named in the 'Ticket Description'.",
         "   - When Investigation Notes identify candidate files containing relevant or undocumented functions, you MUST select only from those candidate files. Do NOT target documentation (e.g. README.md), configuration files, or non-source files for tickets modifying or documenting existing functions.",
         "   - Do NOT invent, hallucinate, or guess file paths.",
         "   - Do NOT assume any default project language or file extensions (e.g. do NOT assume Python 'src/main.py' if the repository is TypeScript, Go, Rust, or JavaScript). Use the actual language and paths discovered in Investigation Notes.",
         "   - If the ticket explicitly requests creating brand new files not previously existing, those new paths must be consistent with the directory structure established in Investigation Notes.",
-        "4. Output format:",
+        "4. 'expects_tests' CRITERIA (CRITICAL):",
+        "   - Set 'expects_tests': false for subgoals that only add or update docstrings, comments, JSDoc/TypeDoc, documentation, type annotations, or code formatting.",
+        "   - Set 'expects_tests': false if the ticket does not request writing automated tests and the repository has no existing test suite for the files in scope.",
+        "   - Set 'expects_tests': true ONLY when automated tests exist or are being written/modified to verify functional code logic.",
+        "5. Output format:",
         "   Return ONLY a valid JSON array of Subgoal objects. Do NOT include markdown commentary or explanations outside the JSON array.",
         "   Schema illustration:",
-        '   [{"description": "Atomic change description", "scope": ["relative/path/to/target/file"], "expects_tests": true}]',
+        '   [{"description": "Atomic change description", "scope": ["relative/path/to/target/file"], "expects_tests": false}]',
     ])
     prompt_text = "\n".join(prompt_lines)
     messages: List[Any] = [HumanMessage(content=prompt_text)]

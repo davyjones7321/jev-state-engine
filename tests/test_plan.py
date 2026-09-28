@@ -922,6 +922,122 @@ def test_node_plan_rejects_non_candidate_both_attempts_and_escalates(tmp_path):
     )
 
 
+# ==============================================================================
+# expects_tests validation tests for docstring and documentation subgoals
+# ==============================================================================
+
+def test_node_plan_prompt_includes_expects_tests_criteria(tmp_path):
+    """Asserts that node_plan's prompt includes explicit expects_tests criteria for docstrings and non-testable subgoals."""
+    class TestWorkspace:
+        def __init__(self, root):
+            self.worktree_dir = root
+            self.repo_dir = root
+
+    ws = TestWorkspace(tmp_path)
+    auth_file = tmp_path / "src" / "lib" / "auth.ts"
+    auth_file.parent.mkdir(parents=True, exist_ok=True)
+    auth_file.write_text("export function login() {}\n", encoding="utf-8")
+
+    doc_plan = [
+        {
+            "description": "Add a JSDoc docstring to the getSession function in src/lib/auth.ts",
+            "scope": ["src/lib/auth.ts"],
+            "expects_tests": False,
+        }
+    ]
+    fake_llm = ScriptedChatModel([json.dumps(doc_plan)])
+    state: State = {
+        "ticket": "Add a docstring to one existing function in this project",
+        "investigation_notes": "Candidate file: src/lib/auth.ts",
+        "trajectory": [],
+    }
+
+    result = node_plan(state, workspace=ws, llm=fake_llm)
+
+    assert len(fake_llm.invocations) == 1
+    prompt_content = fake_llm.invocations[0][-1].content
+    # Assert explicit criteria instructing the LLM when to set false vs true
+    assert "expects_tests" in prompt_content
+    assert "docstrings" in prompt_content.lower() or "comments" in prompt_content.lower()
+    assert "false" in prompt_content.lower()
+    assert result.get("gate_status") is None
+    assert len(result.get("plan_queue", [])) == 1
+    assert result["plan_queue"][0].expects_tests is False
+
+
+def test_node_plan_accepts_expects_tests_false_for_docstring_subgoal(tmp_path):
+    """Asserts that node_plan cleanly populates plan_queue with expects_tests=False."""
+    class TestWorkspace:
+        def __init__(self, root):
+            self.worktree_dir = root
+            self.repo_dir = root
+
+    ws = TestWorkspace(tmp_path)
+    auth_file = tmp_path / "src" / "lib" / "auth.ts"
+    auth_file.parent.mkdir(parents=True, exist_ok=True)
+    auth_file.write_text("export function login() {}\n", encoding="utf-8")
+
+    doc_plan = [
+        {
+            "description": "Add JSDoc documentation to login in src/lib/auth.ts",
+            "scope": ["src/lib/auth.ts"],
+            "expects_tests": False,
+        }
+    ]
+    fake_llm = ScriptedChatModel([json.dumps(doc_plan)])
+    state: State = {
+        "ticket": "Add a docstring to one existing function in this project",
+        "investigation_notes": "Found candidate: src/lib/auth.ts",
+        "trajectory": [],
+    }
+
+    result = node_plan(state, workspace=ws, llm=fake_llm)
+
+    assert result.get("gate_status") is None
+    assert len(result.get("plan_queue", [])) == 1
+    assert result["plan_queue"][0].expects_tests is False
+    assert result["plan_queue"][0].scope == ["src/lib/auth.ts"]
+
+
+def test_node_plan_accepts_expects_tests_true_when_tests_in_scope(tmp_path):
+    """Asserts that expects_tests=True is accepted when test files are in scope."""
+    class TestWorkspace:
+        def __init__(self, root):
+            self.worktree_dir = root
+            self.repo_dir = root
+
+    ws = TestWorkspace(tmp_path)
+    auth_file = tmp_path / "src" / "lib" / "auth.ts"
+    auth_file.parent.mkdir(parents=True, exist_ok=True)
+    auth_file.write_text("export function login() {}\n", encoding="utf-8")
+
+    test_file = tmp_path / "tests" / "test_auth.ts"
+    test_file.parent.mkdir(parents=True, exist_ok=True)
+    test_file.write_text("test('login', () => {});\n", encoding="utf-8")
+
+    plan_with_test = [
+        {
+            "description": "Add getSession function and unit test",
+            "scope": ["src/lib/auth.ts", "tests/test_auth.ts"],
+            "expects_tests": True,
+        }
+    ]
+    fake_llm = ScriptedChatModel([json.dumps(plan_with_test)])
+    mock_gk = MagicMock()
+    state: State = {
+        "ticket": "Add getSession function and unit test",
+        "investigation_notes": "Target files: src/lib/auth.ts and tests/test_auth.ts",
+        "trajectory": [],
+    }
+
+    result = node_plan(state, workspace=ws, llm=fake_llm, gatekeeper=mock_gk)
+
+    assert result.get("gate_status") is None
+    assert len(result.get("plan_queue", [])) == 1
+    assert result["plan_queue"][0].expects_tests is True
+
+
+
 
 
 
