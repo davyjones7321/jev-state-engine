@@ -1,5 +1,6 @@
+import shutil
 import subprocess
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -385,3 +386,186 @@ def test_docs_only_diff_allows_markdown_documentation_files(git_repo):
     assert res.passed is True
     assert res.failed_check is None
     assert "docs-only" in res.detail.lower()
+
+
+# 21. test_run_tests_detects_package_json_yarn
+def test_run_tests_detects_package_json_yarn(git_repo):
+    """package.json with 'test' script and yarn.lock triggers yarn test."""
+    ws = Workspace(repo_dir=git_repo)
+    pkg = git_repo / "package.json"
+    pkg.write_text('{"scripts": {"test": "jest"}}', encoding="utf-8")
+    (git_repo / "yarn.lock").write_text("", encoding="utf-8")
+
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(args=["yarn", "test"], returncode=0, stdout="pass", stderr="")
+        outcome = ws.run_tests()
+        assert outcome == TestOutcome.PASSED
+        mock_run.assert_called_once()
+        args = mock_run.call_args[0][0]
+        assert args == ["yarn", "test"]
+        kwargs = mock_run.call_args[1]
+        assert kwargs.get("encoding") == "utf-8"
+        assert kwargs.get("errors") == "replace"
+
+
+# 22. test_run_tests_detects_package_json_pnpm
+def test_run_tests_detects_package_json_pnpm(git_repo):
+    """package.json with 'test' script and pnpm-lock.yaml triggers pnpm test."""
+    ws = Workspace(repo_dir=git_repo)
+    pkg = git_repo / "package.json"
+    pkg.write_text('{"scripts": {"test": "vitest"}}', encoding="utf-8")
+    (git_repo / "pnpm-lock.yaml").write_text("", encoding="utf-8")
+
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(args=["pnpm", "test"], returncode=0, stdout="pass", stderr="")
+        outcome = ws.run_tests()
+        assert outcome == TestOutcome.PASSED
+        mock_run.assert_called_once()
+        args = mock_run.call_args[0][0]
+        assert args == ["pnpm", "test"]
+
+
+# 23. test_run_tests_detects_package_json_npm
+def test_run_tests_detects_package_json_npm(git_repo):
+    """package.json with 'test' script and package-lock.json triggers npm test."""
+    ws = Workspace(repo_dir=git_repo)
+    pkg = git_repo / "package.json"
+    pkg.write_text('{"scripts": {"test": "mocha"}}', encoding="utf-8")
+    (git_repo / "package-lock.json").write_text("{}", encoding="utf-8")
+
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(args=["npm", "test"], returncode=0, stdout="pass", stderr="")
+        outcome = ws.run_tests()
+        assert outcome == TestOutcome.PASSED
+        mock_run.assert_called_once()
+        args = mock_run.call_args[0][0]
+        assert args == ["npm", "test"]
+
+
+# 24. test_run_tests_detects_go_mod
+def test_run_tests_detects_go_mod(git_repo):
+    """go.mod triggers go test ./..."""
+    ws = Workspace(repo_dir=git_repo)
+    (git_repo / "go.mod").write_text("module example.com/m\n", encoding="utf-8")
+
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(args=["go", "test", "./..."], returncode=0, stdout="ok", stderr="")
+        outcome = ws.run_tests()
+        assert outcome == TestOutcome.PASSED
+        mock_run.assert_called_once()
+        args = mock_run.call_args[0][0]
+        assert args == ["go", "test", "./..."]
+
+
+# 25. test_run_tests_detects_cargo_toml
+def test_run_tests_detects_cargo_toml(git_repo):
+    """Cargo.toml triggers cargo test."""
+    ws = Workspace(repo_dir=git_repo)
+    (git_repo / "Cargo.toml").write_text("[package]\nname = \"foo\"\n", encoding="utf-8")
+
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(args=["cargo", "test"], returncode=0, stdout="ok", stderr="")
+        outcome = ws.run_tests()
+        assert outcome == TestOutcome.PASSED
+        mock_run.assert_called_once()
+        args = mock_run.call_args[0][0]
+        assert args == ["cargo", "test"]
+
+
+# 26. test_run_tests_detects_pom_xml
+def test_run_tests_detects_pom_xml(git_repo):
+    """pom.xml triggers mvn test."""
+    ws = Workspace(repo_dir=git_repo)
+    (git_repo / "pom.xml").write_text("<project></project>", encoding="utf-8")
+
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(args=["mvn", "test"], returncode=0, stdout="ok", stderr="")
+        outcome = ws.run_tests()
+        assert outcome == TestOutcome.PASSED
+        mock_run.assert_called_once()
+        args = mock_run.call_args[0][0]
+        assert args[1] == "test"
+        assert "mvn" in args[0]
+
+
+# 27. test_run_tests_detects_build_gradle
+def test_run_tests_detects_build_gradle(git_repo):
+    """build.gradle triggers gradle test."""
+    ws = Workspace(repo_dir=git_repo)
+    (git_repo / "build.gradle").write_text("// gradle", encoding="utf-8")
+
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(args=["gradle", "test"], returncode=0, stdout="ok", stderr="")
+        outcome = ws.run_tests()
+        assert outcome == TestOutcome.PASSED
+        mock_run.assert_called_once()
+        args = mock_run.call_args[0][0]
+        assert args[1] == "test"
+        assert "gradle" in args[0]
+
+
+# 28. test_run_tests_detects_pytest_signals
+def test_run_tests_detects_pytest_signals(git_repo):
+    """pytest.ini triggers pytest -q."""
+    ws = Workspace(repo_dir=git_repo)
+    (git_repo / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(args=["pytest", "-q"], returncode=0, stdout="ok", stderr="")
+        outcome = ws.run_tests()
+        assert outcome == TestOutcome.PASSED
+        mock_run.assert_called_once()
+        args = mock_run.call_args[0][0]
+        assert "pytest" in args
+        assert "-q" in args
+
+
+# 29. test_run_tests_iac_no_test_framework_when_tool_missing
+def test_run_tests_iac_no_test_framework_when_tool_missing(git_repo):
+    """Terraform files without terraform binary installed return TestOutcome.NO_TEST_FRAMEWORK."""
+    ws = Workspace(repo_dir=git_repo)
+    (git_repo / "main.tf").write_text("resource \"null_resource\" \"x\" {}", encoding="utf-8")
+
+    with patch("shutil.which", return_value=None):
+        outcome = ws.run_tests()
+        assert outcome == TestOutcome.NO_TEST_FRAMEWORK
+
+
+# 30. test_run_tests_fallback_no_tests_collected
+def test_run_tests_fallback_no_tests_collected(git_repo):
+    """Workspace with no recognized test signals returns TestOutcome.NO_TESTS_COLLECTED."""
+    ws = Workspace(repo_dir=git_repo)
+    outcome = ws.run_tests()
+    assert outcome == TestOutcome.NO_TESTS_COLLECTED
+
+
+# 31. test_mechanical_checks_no_test_framework_untested_pass
+def test_mechanical_checks_no_test_framework_untested_pass(git_repo):
+    """NO_TEST_FRAMEWORK always yields an Untested Pass even when expects_tests=True."""
+    ws = Workspace(repo_dir=git_repo)
+    ws.stage_file_mutation("main.tf", "resource \"null_resource\" \"x\" {}\n")
+    ws.commit_subgoal("Init")
+
+    ws.stage_file_mutation("main.tf", "resource \"null_resource\" \"x\" { triggers = {} }\n")
+    ws.run_tests = MagicMock(return_value=TestOutcome.NO_TEST_FRAMEWORK)
+
+    subgoal = Subgoal(scope=["main.tf"], expects_tests=True)
+    res = ws.run_mechanical_checks(subgoal)
+
+    assert res.passed is True
+    assert res.failed_check is None
+    assert "Untested pass: NO_TEST_FRAMEWORK." in res.detail
+
+
+# 32. test_workspace_subprocess_emoji_utf8_encoding_safety
+def test_workspace_subprocess_emoji_utf8_encoding_safety(git_repo):
+    """Worktree mutation with unicode emojis does not trigger UnicodeDecodeError on git diff/status."""
+    ws = Workspace(repo_dir=git_repo)
+    emoji_content = "def hello():\n    # 🚀 Rocket launch! 🎉 Celebrations!\n    return '🌟'\n"
+    ws.stage_file_mutation("src/rocket.py", emoji_content)
+
+    diff = ws.get_staged_diff()
+    assert "🚀" in diff
+    assert "🎉" in diff
+    assert "🌟" in diff
+

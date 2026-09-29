@@ -274,4 +274,45 @@ def test_escalate_deadlock_dumps_valid_json(tmp_path):
     assert len(content["trajectory"]) == 2
 
 
+# 32. test_validate_subgoal_sends_investigation_notes_in_payload
+def test_validate_subgoal_sends_investigation_notes_in_payload():
+    """Assert Gatekeeper.validate_subgoal includes investigation_notes in the state payload."""
+    gk = Gatekeeper(api_url="https://api.typesafe.ai/v1/systemone", api_key="test_key")
+    subgoal = Subgoal(description="Add auth function", scope=["src/auth.ts"], expects_tests=False)
+    mock_resp = httpx.Response(200, json={"valid": {"value": True, "probability": 0.95}})
+
+    with patch.object(gk.client, "post", return_value=mock_resp) as mock_post:
+        verdict = gk.validate_subgoal(
+            subgoal,
+            diff="diff --git a/src/auth.ts b/src/auth.ts\n+login() {}",
+            investigation_notes="Project uses Next.js App Router in src/app.",
+        )
+        assert mock_post.call_count == 1
+        payload = mock_post.call_args.kwargs.get("json", {})
+        assert "state" in payload
+        assert payload["state"].get("investigation_notes") == "Project uses Next.js App Router in src/app."
+        assert verdict.valid is True
+
+
+# 33. test_verify_ticket_sends_investigation_notes_in_payload
+def test_verify_ticket_sends_investigation_notes_in_payload():
+    """Assert Gatekeeper.verify_ticket includes investigation_notes in the state payload."""
+    gk = Gatekeeper(api_url="https://api.typesafe.ai/v1/systemone", api_key="test_key")
+    mock_resp = httpx.Response(200, json={"answers": {"valid": {"noul": 0.98}}})
+
+    with patch.object(gk.client, "post", return_value=mock_resp) as mock_post:
+        verdict = gk.verify_ticket(
+            ticket="Add auth",
+            final_diff="+login() {}",
+            test_output="PASSED",
+            investigation_notes="Project uses Next.js App Router in src/app.",
+        )
+        assert mock_post.call_count == 1
+        payload = mock_post.call_args.kwargs.get("json", {})
+        assert "state" in payload
+        assert payload["state"].get("investigation_notes") == "Project uses Next.js App Router in src/app."
+        assert verdict.valid is True
+
+
+
 

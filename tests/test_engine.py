@@ -523,3 +523,54 @@ def test_node_verify_failure_escalates():
     gk.escalate_deadlock.assert_called_once()
     assert gk.escalate_deadlock.call_args[1]["triggering_tier"] == "verification"
 
+
+# 17. Test node_verify catches unexpected exceptions and escalates
+def test_node_verify_catches_exception_and_escalates():
+    """Assert unexpected exception in node_verify (e.g. UnicodeDecodeError) is caught, recorded in feedback and trajectory, and escalated."""
+    ws = MagicMock()
+    ws.run_tests.side_effect = UnicodeDecodeError("cp1252", b"\xff", 0, 1, "invalid start byte")
+
+    gk = MagicMock()
+    state = {
+        "ticket": "Fix issue",
+        "trajectory": [],
+    }
+
+    res = node_verify(state, workspace=ws, gatekeeper=gk)
+
+    assert res["status"] == "escalated"
+    assert res["gate_status"] == "verification_failed"
+    assert "Verification error:" in res["last_feedback"]
+    assert "UnicodeDecodeError" in res["last_feedback"] or "invalid start byte" in res["last_feedback"]
+    assert len(res["trajectory"]) == 1
+    assert res["trajectory"][0]["error_type"] == "verification_exception"
+    gk.escalate_deadlock.assert_called_once()
+    assert gk.escalate_deadlock.call_args[1]["triggering_tier"] == "verification"
+
+
+# 18. Test node_verify forwards investigation_notes to gatekeeper.verify_ticket
+def test_node_verify_passes_investigation_notes_to_gatekeeper():
+    """Assert node_verify forwards state['investigation_notes'] to gatekeeper.verify_ticket."""
+    ws = MagicMock()
+    ws.run_tests.return_value = TestOutcome.PASSED
+    ws.get_cumulative_diff.return_value = "+x = 1\n"
+    ws.get_staged_diff.return_value = "+x = 1\n"
+
+    gk = MagicMock()
+    gk.verify_ticket.return_value = ValidationVerdict(valid=True, probability=0.98)
+
+    state = {
+        "ticket": "Fix issue",
+        "investigation_notes": "Architecture notes for ticket",
+        "trajectory": [],
+    }
+
+    res = node_verify(state, workspace=ws, gatekeeper=gk)
+
+    assert res["status"] == "completed"
+    assert res["gate_status"] == "verified"
+    gk.verify_ticket.assert_called_once()
+    _, kwargs = gk.verify_ticket.call_args
+    assert kwargs.get("investigation_notes") == "Architecture notes for ticket"
+
+

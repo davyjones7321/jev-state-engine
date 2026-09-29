@@ -633,4 +633,78 @@ def test_node_investigate_grep_git_backed_passes_safe_relative_posix_path(tmp_pa
     assert git_args == ["grep", "-n", "-I", "--untracked", "needle", "--", "subdir"]
 
 
+# 22. node_investigate records investigated_directories from list_dir and read_file
+def test_node_investigate_records_investigated_directories(tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    app_dir = repo_dir / "src" / "app"
+    app_dir.mkdir(parents=True)
+    (app_dir / "page.tsx").write_text("export default function Page() {}", encoding="utf-8")
+    comp_dir = repo_dir / "src" / "components"
+    comp_dir.mkdir(parents=True)
+    (comp_dir / "Header.tsx").write_text("export function Header() {}", encoding="utf-8")
+
+    class RealWS:
+        def __init__(self, root):
+            self.worktree_dir = root
+            self.repo_dir = root
+
+    ws = RealWS(repo_dir)
+    state: State = {"ticket": "Explore Next.js structure", "trajectory": []}
+
+    turn_1 = AIMessage(
+        content="List app dir",
+        tool_calls=[{"name": "list_dir", "args": {"path": "src/app"}, "id": "c1"}],
+    )
+    turn_2 = AIMessage(
+        content="Read header component",
+        tool_calls=[{"name": "read_file", "args": {"path": "src/components/Header.tsx"}, "id": "c2"}],
+    )
+    turn_3 = AIMessage(
+        content="Finish",
+        tool_calls=[{"name": "finish_investigation", "args": {"summary": "Explored App router"}, "id": "c3"}],
+    )
+    fake_llm = ScriptedChatModel(responses=[turn_1, turn_2, turn_3])
+
+    result = node_investigate(state, workspace=ws, llm=fake_llm)
+
+    assert "investigated_directories" in result
+    inv_dirs = result["investigated_directories"]
+    assert "src/app" in inv_dirs
+    assert "src/components" in inv_dirs
+    assert result["investigation_incomplete"] is False
+
+
+# 23. node_investigate sets investigation_incomplete=True when turn cap (20) reached
+def test_node_investigate_sets_investigation_incomplete_on_turn_cap(tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    (repo_dir / "test.txt").write_text("content", encoding="utf-8")
+
+    class RealWS:
+        def __init__(self, root):
+            self.worktree_dir = root
+            self.repo_dir = root
+
+    ws = RealWS(repo_dir)
+    state: State = {"ticket": "Turn cap test", "trajectory": []}
+
+    # 20 consecutive read_file calls without calling finish_investigation
+    responses = [
+        AIMessage(
+            content=f"Turn {i}",
+            tool_calls=[{"name": "read_file", "args": {"path": "test.txt"}, "id": f"c_{i}"}],
+        )
+        for i in range(20)
+    ]
+    fake_llm = ScriptedChatModel(responses=responses)
+
+    result = node_investigate(state, workspace=ws, llm=fake_llm)
+
+    assert len(fake_llm.invocations) == 20
+    assert result.get("investigation_incomplete") is True
+    assert result.get("investigation_notes") is not None
+
+
+
 

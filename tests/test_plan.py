@@ -1037,6 +1037,114 @@ def test_node_plan_accepts_expects_tests_true_when_tests_in_scope(tmp_path):
     assert result["plan_queue"][0].expects_tests is True
 
 
+# 24. node_plan rejects new files in uninvestigated parent directory structure
+def test_node_plan_rejects_new_file_in_uninvestigated_directory(tmp_path):
+    class TestWorkspace:
+        def __init__(self, root):
+            self.worktree_dir = root
+            self.repo_dir = root
+
+    ws = TestWorkspace(tmp_path)
+    # Propose file in uninvestigated 'src/pages/admin' when only 'src/app' and 'src/components' were investigated
+    bad_plan = [
+        {
+            "description": "Create admin dashboard page",
+            "scope": ["src/pages/admin/dashboard.tsx"],
+            "expects_tests": False,
+        }
+    ]
+    # Valid plan for retry
+    good_plan = [
+        {
+            "description": "Create admin dashboard page",
+            "scope": ["src/app/admin/dashboard/page.tsx"],
+            "expects_tests": False,
+        }
+    ]
+    fake_llm = ScriptedChatModel([json.dumps(bad_plan), json.dumps(good_plan)])
+    mock_gk = MagicMock()
+    state: State = {
+        "ticket": "Implement admin dashboard",
+        "investigated_directories": ["src/app", "src/components"],
+        "investigation_notes": "Discovered Next.js App Router in src/app with src/app/page.tsx.",
+        "trajectory": [],
+    }
+
+    result = node_plan(state, workspace=ws, llm=fake_llm, gatekeeper=mock_gk)
+
+    assert len(fake_llm.invocations) == 2
+    retry_prompt = fake_llm.invocations[1][-1].content
+    assert "src/pages/admin" in retry_prompt
+    assert "this repository does not use a src/pages/admin directory structure" in retry_prompt
+    assert result.get("gate_status") is None
+    assert len(result["plan_queue"]) == 1
+    assert result["plan_queue"][0].scope == ["src/app/admin/dashboard/page.tsx"]
+
+
+# 25. node_plan accepts new files in investigated directory structure
+def test_node_plan_accepts_new_file_in_investigated_directory(tmp_path):
+    class TestWorkspace:
+        def __init__(self, root):
+            self.worktree_dir = root
+            self.repo_dir = root
+
+    ws = TestWorkspace(tmp_path)
+    plan = [
+        {
+            "description": "Create new header component",
+            "scope": ["src/components/NewHeader.tsx"],
+            "expects_tests": False,
+        }
+    ]
+    fake_llm = ScriptedChatModel([json.dumps(plan)])
+    state: State = {
+        "ticket": "Add NewHeader component",
+        "investigated_directories": ["src/app", "src/components"],
+        "investigation_notes": "Components located in src/components with Header.tsx.",
+        "trajectory": [],
+    }
+
+    result = node_plan(state, workspace=ws, llm=fake_llm)
+
+    assert len(fake_llm.invocations) == 1
+    assert result.get("gate_status") is None
+    assert len(result["plan_queue"]) == 1
+    assert result["plan_queue"][0].scope == ["src/components/NewHeader.tsx"]
+
+
+# 26. node_plan includes warning when investigation_incomplete is True
+def test_node_plan_includes_warning_when_investigation_incomplete(tmp_path):
+    class TestWorkspace:
+        def __init__(self, root):
+            self.worktree_dir = root
+            self.repo_dir = root
+
+    ws = TestWorkspace(tmp_path)
+    plan = [
+        {
+            "description": "Add feature",
+            "scope": ["src/app/page.tsx"],
+            "expects_tests": False,
+        }
+    ]
+    fake_llm = ScriptedChatModel([json.dumps(plan)])
+    state: State = {
+        "ticket": "Implement feature in src/app/page.tsx",
+        "investigated_directories": ["src/app"],
+        "investigation_incomplete": True,
+        "investigation_notes": "Discovered files in src/app with src/app/page.tsx.",
+        "trajectory": [],
+    }
+
+    node_plan(state, workspace=ws, llm=fake_llm)
+
+    assert len(fake_llm.invocations) == 1
+    prompt_text = fake_llm.invocations[0][0].content
+    assert "WARNING: Investigation hit its maximum turn cap" in prompt_text
+
+
+
+
 
 
 

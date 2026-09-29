@@ -245,3 +245,21 @@ def test_interleaved_strikes_do_not_cross_contaminate(base_state):
         trajectory=state.get("trajectory", []),
         triggering_tier="mechanical"
     )
+
+
+# 21. test_node_gate_passes_investigation_notes_to_gatekeeper
+def test_node_gate_passes_investigation_notes_to_gatekeeper(base_state):
+    """Assert node_gate forwards state['investigation_notes'] to gatekeeper.validate_subgoal."""
+    workspace = FakeWorkspace()
+    mock_gk = MagicMock()
+    mock_gk.validate_subgoal.return_value = ValidationVerdict(valid=True, probability=0.99)
+    state = dict(base_state)
+    state["investigation_notes"] = "Discovered Next.js App Router in src/app"
+
+    res = node_gate(state, workspace=workspace, gatekeeper=mock_gk)
+
+    assert res["gate_status"] == "passed"
+    mock_gk.validate_subgoal.assert_called_once()
+    _, kwargs = mock_gk.validate_subgoal.call_args
+    assert kwargs.get("investigation_notes") == "Discovered Next.js App Router in src/app"
+

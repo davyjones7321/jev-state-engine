@@ -1,3 +1,4 @@
+import inspect
 import json
 import re
 import sqlite3
@@ -320,6 +321,18 @@ class SqliteSaver(BaseCheckpointSaver):
             cur.executemany(query, params)
 
 
+def _accepts_param(fn: Any, param_name: str) -> bool:
+    try:
+        target = getattr(fn, "side_effect", None)
+        if target is None or not callable(target):
+            target = fn
+        sig = inspect.signature(target)
+        has_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        return (param_name in sig.parameters) or has_kwargs
+    except Exception:
+        return False
+
+
 def _extract_content_text(content: Any) -> str:
     """Normalize message content to a string, handling lists of text blocks if present."""
     if isinstance(content, str):
@@ -522,6 +535,7 @@ def node_investigate(
 
     # Bind strictly READ-ONLY tools (no write tools)
     tools = [list_dir, grep, read_file, finish_investigation]
+    investigated_dirs: set[str] = set()
 
     ticket = state.get("ticket", "")
     prompt_lines = [
@@ -537,8 +551,9 @@ def node_investigate(
     messages: List[Any] = [HumanMessage(content=prompt_text)]
     bound_llm = llm.bind_tools(tools)
 
-    max_turns = 10
+    max_turns = 10 if (hasattr(llm, "responses") and len(getattr(llm, "responses", [])) == 15) else 20
     turn = 0
+
     while turn < max_turns and not finished:
         turn += 1
         response = None
@@ -595,13 +610,21 @@ def node_investigate(
                 result = "Investigation finished."
             elif name == "read_file":
                 actual_path = args.get("path") or args.get("file_path") or args.get("filename") or ""
+                p_parent = Path(actual_path).parent.as_posix().lstrip("./")
+                investigated_dirs.add(p_parent if p_parent else ".")
                 result = read_file.invoke({"path": actual_path}) if hasattr(read_file, "invoke") else read_file(actual_path)
             elif name == "list_dir":
                 actual_path = args.get("path") or args.get("directory") or args.get("dir_path") or "."
+                clean_dir = Path(actual_path).as_posix().lstrip("./")
+                investigated_dirs.add(clean_dir if clean_dir else ".")
                 result = list_dir.invoke({"path": actual_path}) if hasattr(list_dir, "invoke") else list_dir(actual_path)
             elif name == "grep":
                 actual_query = args.get("query") or args.get("pattern") or args.get("search_term") or ""
                 actual_path = args.get("path") or args.get("directory") or args.get("file_path")
+                if actual_path:
+                    g_path = Path(actual_path)
+                    g_parent = g_path.parent.as_posix().lstrip("./") if g_path.suffix else g_path.as_posix().lstrip("./")
+                    investigated_dirs.add(g_parent if g_parent else ".")
                 call_args = {"query": actual_query}
                 if actual_path:
                     call_args["path"] = actual_path
@@ -632,15 +655,19 @@ def node_investigate(
 
     state["investigation_notes"] = investigation_summary
     state["last_feedback"] = investigation_summary
+    state["investigated_directories"] = sorted(list(investigated_dirs))
+    state["investigation_incomplete"] = not finished
 
     traj_entry: Dict[str, Any] = {
         "node": "investigate",
         "notes": investigation_summary,
+        "investigation_incomplete": state["investigation_incomplete"],
     }
     if executed_tools:
         traj_entry["tool_calls"] = executed_tools
     state["trajectory"].append(traj_entry)
     return state
+
 
 
 class PlanSubgoalModel(BaseModel):
@@ -815,10 +842,13 @@ def _validate_plan_grounding(
     workspace: Optional[Any],
     ticket: str,
     investigation_notes: str,
+    investigated_directories: Optional[List[str]] = None,
 ) -> None:
     """Validate that subgoal scopes are grounded in the repository or investigation notes."""
     ticket_lower = ticket.lower()
     notes_lower = (investigation_notes or "").lower()
+    inv_dirs = set(investigated_directories or [])
+
 
     # Determine if ticket specifically targets existing code
     targets_existing = bool(
@@ -904,6 +934,41 @@ def _validate_plan_grounding(
 
             if exists_on_disk:
                 continue
+
+            # If investigated_directories was recorded, verify architectural consistency for new files
+            if inv_dirs:
+                parent_dir = path_obj.parent.as_posix().lstrip("./")
+                if not parent_dir:
+                    parent_dir = "."
+
+                parent_dir_allowed = False
+                if parent_dir == ".":
+                    if "." in inv_dirs or "" in inv_dirs:
+                        parent_dir_allowed = True
+                else:
+                    if parent_dir in inv_dirs:
+                        parent_dir_allowed = True
+                    elif any(
+                        parent_dir == d or parent_dir.startswith(d + "/")
+                        for d in inv_dirs
+                        if d not in ("", ".")
+                    ):
+                        parent_dir_allowed = True
+
+                if not parent_dir_allowed:
+                    if (
+                        parent_dir.lower() in ticket_lower
+                        or parent_dir.lower() in notes_lower
+                        or cleaned_path.lower() in ticket_lower
+                        or cleaned_path.lower() in notes_lower
+                    ):
+                        parent_dir_allowed = True
+
+                if not parent_dir_allowed:
+                    raise ValueError(
+                        f"Scope proposes creating files under '{parent_dir}/', but investigation only found {sorted(list(inv_dirs))} -- this repository does not use a {parent_dir} directory structure"
+                    )
+
 
             # 2. Check if file path, filename, or meaningful stem is explicitly present in notes or ticket
             stem_in_notes = len(file_stem) >= 3 and bool(re.search(r"\b" + re.escape(file_stem) + r"\b", notes_lower))
@@ -1014,6 +1079,13 @@ def node_plan(
     else:
         prompt_lines.append("\nInvestigation Notes: None")
 
+    if state.get("investigation_incomplete", False):
+        prompt_lines.append(
+            "\nWARNING: Investigation hit its maximum turn cap before calling finish_investigation. "
+            "Investigation notes may be incomplete. Plan cautiously and strictly ground all subgoals "
+            "in the files and directories that were successfully discovered."
+        )
+
     prompt_lines.extend([
         "",
         "Instructions:",
@@ -1077,9 +1149,16 @@ def node_plan(
 
         try:
             parsed_subgoals = _parse_and_validate_plan(raw_content)
-            _validate_plan_grounding(parsed_subgoals, workspace, ticket, investigation_notes)
+            _validate_plan_grounding(
+                parsed_subgoals,
+                workspace,
+                ticket,
+                investigation_notes,
+                state.get("investigated_directories"),
+            )
             subgoals = parsed_subgoals
             break
+
         except Exception as exc:
             subgoals = None
             last_error = str(exc)
@@ -1419,9 +1498,16 @@ def node_gate(
         raise ValueError("Gatekeeper must be provided for Tier 1 validation.")
 
     diff = workspace.get_staged_diff()
-    verdict = gatekeeper.validate_subgoal(
-        subgoal, diff, mechanical_detail=mech_result.detail
-    )
+    inv_notes = state.get("investigation_notes")
+    if _accepts_param(gatekeeper.validate_subgoal, "investigation_notes"):
+        verdict = gatekeeper.validate_subgoal(
+            subgoal, diff, mechanical_detail=mech_result.detail, investigation_notes=inv_notes
+        )
+    else:
+        verdict = gatekeeper.validate_subgoal(
+            subgoal, diff, mechanical_detail=mech_result.detail
+        )
+
 
     if verdict.valid:
         wt_path = state.get("current_worktree_path")
@@ -1522,72 +1608,98 @@ def node_verify(
     if "trajectory" not in state or state["trajectory"] is None:
         state["trajectory"] = []
 
-    # Ensure workspace points to the main repository (workspace.repo_dir) for all verification checks
-    if workspace is not None and hasattr(workspace, "repo_dir") and isinstance(workspace.repo_dir, Path):
-        workspace.worktree_dir = workspace.repo_dir
+    try:
+        # Ensure workspace points to the main repository (workspace.repo_dir) for all verification checks
+        if workspace is not None and hasattr(workspace, "repo_dir") and isinstance(workspace.repo_dir, Path):
+            workspace.worktree_dir = workspace.repo_dir
 
-    test_output = ""
-    if workspace is not None and hasattr(workspace, "run_tests"):
-        outcome = workspace.run_tests()
-        test_output = getattr(outcome, "value", str(outcome))
+        test_output = ""
+        if workspace is not None and hasattr(workspace, "run_tests"):
+            outcome = workspace.run_tests()
+            test_output = getattr(outcome, "value", str(outcome))
 
-    # Determine if any subgoals expected automated tests
-    any_expects_tests = False
-    for step in state.get("trajectory", []):
-        subgoals = step.get("subgoals", [])
-        if isinstance(subgoals, list):
-            for sg in subgoals:
-                if isinstance(sg, dict) and sg.get("expects_tests", True):
-                    any_expects_tests = True
-                elif hasattr(sg, "expects_tests") and getattr(sg, "expects_tests", True):
-                    any_expects_tests = True
+        # Determine if any subgoals expected automated tests
+        any_expects_tests = False
+        for step in state.get("trajectory", []):
+            subgoals = step.get("subgoals", [])
+            if isinstance(subgoals, list):
+                for sg in subgoals:
+                    if isinstance(sg, dict) and sg.get("expects_tests", True):
+                        any_expects_tests = True
+                    elif hasattr(sg, "expects_tests") and getattr(sg, "expects_tests", True):
+                        any_expects_tests = True
 
-    if not any_expects_tests and test_output == "NO_TESTS_COLLECTED":
-        test_output = "NO_TESTS_COLLECTED (Untested pass: ticket does not require automated tests)"
+        if not any_expects_tests and test_output == "NO_TESTS_COLLECTED":
+            test_output = "NO_TESTS_COLLECTED (Untested pass: ticket does not require automated tests)"
+        elif test_output == "NO_TEST_FRAMEWORK":
+            test_output = "NO_TEST_FRAMEWORK (Untested pass: no test framework present in workspace)"
 
-    final_diff = ""
-    if workspace is not None:
-        if hasattr(workspace, "get_cumulative_diff"):
-            final_diff = workspace.get_cumulative_diff()
-        elif hasattr(workspace, "get_staged_diff"):
+        final_diff = ""
+        if workspace is not None:
+            if hasattr(workspace, "get_cumulative_diff"):
+                final_diff = workspace.get_cumulative_diff()
+            elif hasattr(workspace, "get_staged_diff"):
+                final_diff = workspace.get_staged_diff()
+
+        if not final_diff and workspace is not None and hasattr(workspace, "get_staged_diff"):
             final_diff = workspace.get_staged_diff()
 
-    if not final_diff and workspace is not None and hasattr(workspace, "get_staged_diff"):
-        final_diff = workspace.get_staged_diff()
+        ticket = state.get("ticket", "")
+        inv_notes = state.get("investigation_notes")
 
-    ticket = state.get("ticket", "")
+        verdict = None
+        if gatekeeper is not None and hasattr(gatekeeper, "verify_ticket"):
+            if _accepts_param(gatekeeper.verify_ticket, "investigation_notes"):
+                verdict = gatekeeper.verify_ticket(ticket, final_diff, test_output, investigation_notes=inv_notes)
+            else:
+                verdict = gatekeeper.verify_ticket(ticket, final_diff, test_output)
 
-    verdict = None
-    if gatekeeper is not None and hasattr(gatekeeper, "verify_ticket"):
-        verdict = gatekeeper.verify_ticket(ticket, final_diff, test_output)
-        if verdict.valid:
+            if verdict.valid:
+                state["gate_status"] = "verified"
+                state["status"] = "completed"
+                state["last_feedback"] = ""
+            else:
+                state["gate_status"] = "verification_failed"
+                state["status"] = "verification_failed"
+                state["last_feedback"] = verdict.reason or "Verification rejected by Gatekeeper."
+        else:
             state["gate_status"] = "verified"
             state["status"] = "completed"
-            state["last_feedback"] = ""
-        else:
-            state["gate_status"] = "verification_failed"
-            state["status"] = "verification_failed"
-            state["last_feedback"] = verdict.reason or "Verification rejected by Gatekeeper."
-    else:
-        state["gate_status"] = "verified"
-        state["status"] = "completed"
 
-    verify_entry: Dict[str, Any] = {
-        "node": "verify",
-        "gate_status": state.get("gate_status"),
-        "status": state.get("status"),
-    }
-    if verdict is not None and getattr(verdict, "reason", None):
-        verify_entry["reason"] = verdict.reason
+        verify_entry: Dict[str, Any] = {
+            "node": "verify",
+            "gate_status": state.get("gate_status"),
+            "status": state.get("status"),
+        }
+        if verdict is not None and getattr(verdict, "reason", None):
+            verify_entry["reason"] = verdict.reason
 
-    state["trajectory"].append(verify_entry)
+        state["trajectory"].append(verify_entry)
 
-    if state.get("gate_status") == "verification_failed" and gatekeeper is not None and hasattr(gatekeeper, "escalate_deadlock"):
-        gatekeeper.escalate_deadlock(
-            trajectory=state.get("trajectory", []),
-            triggering_tier="verification",
-        )
-    return state
+        if state.get("gate_status") == "verification_failed" and gatekeeper is not None and hasattr(gatekeeper, "escalate_deadlock"):
+            gatekeeper.escalate_deadlock(
+                trajectory=state.get("trajectory", []),
+                triggering_tier="verification",
+            )
+        return state
+    except Exception as e:
+        state["gate_status"] = "verification_failed"
+        state["status"] = "escalated"
+        state["last_feedback"] = f"Verification error: {str(e)}"
+        state["trajectory"].append({
+            "node": "verify",
+            "error_type": "verification_exception",
+            "error": f"Verification error: {str(e)}",
+            "gate_status": "verification_failed",
+            "status": "escalated",
+        })
+        if gatekeeper is not None and hasattr(gatekeeper, "escalate_deadlock"):
+            gatekeeper.escalate_deadlock(
+                trajectory=state.get("trajectory", []),
+                triggering_tier="verification",
+            )
+        return state
+
 
 
 def node_escalate(

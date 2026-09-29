@@ -9,6 +9,7 @@ class TestOutcome(str, Enum):
     PASSED = "PASSED"
     FAILED = "FAILED"
     NO_TESTS_COLLECTED = "NO_TESTS_COLLECTED"
+    NO_TEST_FRAMEWORK = "NO_TEST_FRAMEWORK"
 
 
 class Subgoal(BaseModel):
@@ -40,5 +41,8 @@ class State(TypedDict, total=False):
     last_feedback: Optional[str]
     status: Optional[str]
     investigation_notes: Optional[str]
+    investigated_directories: List[str]
+    investigation_incomplete: bool
     current_worktree_path: Optional[str]
     current_worktree_branch: Optional[str]
+

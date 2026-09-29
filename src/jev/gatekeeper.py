@@ -109,6 +109,7 @@ class Gatekeeper:
         subgoal: Subgoal,
         diff: str,
         mechanical_detail: str = "",
+        investigation_notes: Optional[str] = None,
     ) -> ValidationVerdict:
         """Tier 1 validation using Jev System One model."""
         state: Dict[str, Any] = {
@@ -116,6 +117,9 @@ class Gatekeeper:
             "scope": subgoal.scope,
             "diff": diff,
         }
+
+        if investigation_notes:
+            state["investigation_notes"] = investigation_notes
 
         if "untested" in mechanical_detail.lower():
             state["untested_pass"] = True
@@ -187,6 +191,7 @@ class Gatekeeper:
         ticket: str,
         final_diff: str,
         test_output: str,
+        investigation_notes: Optional[str] = None,
     ) -> ValidationVerdict:
         """Phase 4 final verification post to Jev."""
         state = {
@@ -194,6 +199,8 @@ class Gatekeeper:
             "final_diff": final_diff,
             "test_output": test_output,
         }
+        if investigation_notes:
+            state["investigation_notes"] = investigation_notes
         payload = {
             "model": "jev-latest",
             "state": state,
@@ -206,6 +213,7 @@ class Gatekeeper:
         }
         data = self._post_with_retry(payload)
         return self._parse_noul_verdict(data)
+
 
     def escalate_deadlock(
         self,

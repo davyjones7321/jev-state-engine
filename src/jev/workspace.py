@@ -1,4 +1,5 @@
 import ast
+import json
 import os
 import re
 import shutil
@@ -54,6 +55,8 @@ class Workspace:
             cwd=self.worktree_dir,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=check,
         )
 
@@ -63,6 +66,8 @@ class Workspace:
             cwd=self.repo_dir,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=check,
         )
 
@@ -94,8 +99,11 @@ class Workspace:
                 cwd=self.worktree_dir,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
             )
             return res.stdout if res.returncode == 0 else res.stderr
+
         except FileNotFoundError:
             if cmd == "cat" and args_list:
                 target = Path(args_list[0])
@@ -207,11 +215,12 @@ class Workspace:
         br_name = branch_name or getattr(self, "current_worktree_branch", None)
 
         if wt_path and wt_path.exists():
-            subprocess.run(["git", "add", "-A"], cwd=wt_path, capture_output=True, text=True)
-            diff_check = subprocess.run(["git", "diff", "--cached"], cwd=wt_path, capture_output=True, text=True)
+            subprocess.run(["git", "add", "-A"], cwd=wt_path, capture_output=True, text=True, encoding="utf-8", errors="replace")
+            diff_check = subprocess.run(["git", "diff", "--cached"], cwd=wt_path, capture_output=True, text=True, encoding="utf-8", errors="replace")
             if diff_check.stdout.strip():
                 commit_msg = f"Subgoal committed ({br_name})" if br_name else "Subgoal committed"
-                subprocess.run(["git", "commit", "-m", commit_msg], cwd=wt_path, capture_output=True, text=True)
+                subprocess.run(["git", "commit", "-m", commit_msg], cwd=wt_path, capture_output=True, text=True, encoding="utf-8", errors="replace")
+
 
         self.worktree_dir = self.repo_dir
 
@@ -353,18 +362,224 @@ class Workspace:
         return BuildCheckResult(passed=True, detail="")
 
     def run_tests(self) -> TestOutcome:
-        res = subprocess.run(
-            [sys.executable, "-m", "pytest"],
-            cwd=self.worktree_dir,
-            capture_output=True,
-            text=True,
+        wt = self.worktree_dir
+
+        # 1. package.json test script
+        pkg_json_path = wt / "package.json"
+        if pkg_json_path.exists():
+            try:
+                pkg_data = json.loads(pkg_json_path.read_text(encoding="utf-8", errors="replace"))
+                if isinstance(pkg_data, dict):
+                    scripts = pkg_data.get("scripts")
+                    if isinstance(scripts, dict) and "test" in scripts:
+                        if (wt / "yarn.lock").exists():
+                            cmd = ["yarn", "test"]
+                        elif (wt / "pnpm-lock.yaml").exists():
+                            cmd = ["pnpm", "test"]
+                        else:
+                            cmd = ["npm", "test"]
+                        res = subprocess.run(
+                            cmd,
+                            cwd=wt,
+                            capture_output=True,
+                            text=True,
+                            encoding="utf-8",
+                            errors="replace",
+                        )
+                        return TestOutcome.PASSED if res.returncode == 0 else TestOutcome.FAILED
+            except Exception:
+                pass
+
+        # 2. go.mod
+        if (wt / "go.mod").exists():
+            try:
+                res = subprocess.run(
+                    ["go", "test", "./..."],
+                    cwd=wt,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                return TestOutcome.PASSED if res.returncode == 0 else TestOutcome.FAILED
+            except Exception:
+                return TestOutcome.FAILED
+
+        # 3. Cargo.toml
+        if (wt / "Cargo.toml").exists():
+            try:
+                res = subprocess.run(
+                    ["cargo", "test"],
+                    cwd=wt,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                return TestOutcome.PASSED if res.returncode == 0 else TestOutcome.FAILED
+            except Exception:
+                return TestOutcome.FAILED
+
+        # 4. pom.xml
+        if (wt / "pom.xml").exists():
+            mvn_cmd = "mvn"
+            if (wt / "mvnw").exists():
+                mvn_cmd = "./mvnw"
+            elif (wt / "mvnw.cmd").exists():
+                mvn_cmd = str(wt / "mvnw.cmd")
+            try:
+                res = subprocess.run(
+                    [mvn_cmd, "test"],
+                    cwd=wt,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                return TestOutcome.PASSED if res.returncode == 0 else TestOutcome.FAILED
+            except Exception:
+                return TestOutcome.FAILED
+
+        # 5. build.gradle / build.gradle.kts
+        if (wt / "build.gradle").exists() or (wt / "build.gradle.kts").exists():
+            gradle_cmd = "gradle"
+            if (wt / "gradlew").exists():
+                gradle_cmd = "./gradlew"
+            elif (wt / "gradlew.bat").exists():
+                gradle_cmd = str(wt / "gradlew.bat")
+            try:
+                res = subprocess.run(
+                    [gradle_cmd, "test"],
+                    cwd=wt,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                return TestOutcome.PASSED if res.returncode == 0 else TestOutcome.FAILED
+            except Exception:
+                return TestOutcome.FAILED
+
+        # 6. pytest signals
+        has_pytest = False
+        if (wt / "pytest.ini").exists():
+            has_pytest = True
+        elif (wt / "pyproject.toml").exists():
+            try:
+                pyproj_text = (wt / "pyproject.toml").read_text(encoding="utf-8", errors="replace")
+                if "[tool.pytest" in pyproj_text:
+                    has_pytest = True
+            except Exception:
+                pass
+        if not has_pytest:
+            try:
+                has_pytest = (
+                    any(wt.glob("test_*.py"))
+                    or any(wt.glob("*_test.py"))
+                    or ((wt / "tests").is_dir() and (any((wt / "tests").glob("*.py")) or any((wt / "tests").rglob("*.py"))))
+                )
+            except Exception:
+                pass
+
+
+        if has_pytest:
+            res = subprocess.run(
+                [sys.executable, "-m", "pytest", "-q"],
+                cwd=wt,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            if res.returncode == 0:
+                return TestOutcome.PASSED
+            elif res.returncode == 5:
+                return TestOutcome.NO_TESTS_COLLECTED
+            else:
+                return TestOutcome.FAILED
+
+        # 7. IaC signals
+        # Terraform
+        has_tf = False
+        try:
+            has_tf = any(wt.glob("*.tf")) or any(p for p in wt.rglob("*.tf") if ".terraform" not in p.parts)
+        except Exception:
+            pass
+
+        if has_tf:
+            if shutil.which("terraform"):
+                try:
+                    res = subprocess.run(
+                        ["terraform", "validate"],
+                        cwd=wt,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                    )
+                    return TestOutcome.PASSED if res.returncode == 0 else TestOutcome.FAILED
+                except Exception:
+                    return TestOutcome.FAILED
+            return TestOutcome.NO_TEST_FRAMEWORK
+
+        # Ansible
+        has_ansible = (
+            (wt / "ansible.cfg").exists()
+            or (wt / "playbooks").is_dir()
+            or any(wt.glob("playbook*.yml"))
+            or any(wt.glob("playbook*.yaml"))
         )
-        if res.returncode == 0:
-            return TestOutcome.PASSED
-        elif res.returncode == 5:
-            return TestOutcome.NO_TESTS_COLLECTED
-        else:
-            return TestOutcome.FAILED
+        if has_ansible:
+            if shutil.which("ansible-lint"):
+                try:
+                    res = subprocess.run(
+                        ["ansible-lint"],
+                        cwd=wt,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                    )
+                    return TestOutcome.PASSED if res.returncode == 0 else TestOutcome.FAILED
+                except Exception:
+                    return TestOutcome.FAILED
+            elif shutil.which("ansible-playbook"):
+                playbooks = list(wt.glob("playbook*.yml")) + list(wt.glob("playbook*.yaml"))
+                pb_arg = str(playbooks[0]) if playbooks else "."
+                try:
+                    res = subprocess.run(
+                        ["ansible-playbook", "--syntax-check", pb_arg],
+                        cwd=wt,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                    )
+                    return TestOutcome.PASSED if res.returncode == 0 else TestOutcome.FAILED
+                except Exception:
+                    return TestOutcome.FAILED
+            return TestOutcome.NO_TEST_FRAMEWORK
+
+        # Helm
+        if (wt / "Chart.yaml").exists():
+            if shutil.which("helm"):
+                try:
+                    res = subprocess.run(
+                        ["helm", "lint", "."],
+                        cwd=wt,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                    )
+                    return TestOutcome.PASSED if res.returncode == 0 else TestOutcome.FAILED
+                except Exception:
+                    return TestOutcome.FAILED
+            return TestOutcome.NO_TEST_FRAMEWORK
+
+        # 8. Fallback
+        return TestOutcome.NO_TESTS_COLLECTED
+
 
     @staticmethod
     def _clean_diff_path(raw_path: str) -> str:
@@ -675,6 +890,8 @@ class Workspace:
                         failed_check="no_tests_collected",
                         detail="No tests collected when expects_tests is True and diff contains code changes.",
                     )
+        elif test_outcome == TestOutcome.NO_TEST_FRAMEWORK:
+            pass
 
         # 3. check_scope
         scope_res = self.check_scope(diff, subgoal.scope)
@@ -686,12 +903,16 @@ class Workspace:
             )
 
         untested_flag = (
-            "Untested pass: docs-only diff with NO_TESTS_COLLECTED."
-            if test_outcome == TestOutcome.NO_TESTS_COLLECTED and subgoal.expects_tests
+            "Untested pass: NO_TEST_FRAMEWORK."
+            if test_outcome == TestOutcome.NO_TEST_FRAMEWORK
             else (
-                "Untested pass: expects_tests=False with NO_TESTS_COLLECTED."
-                if test_outcome == TestOutcome.NO_TESTS_COLLECTED
-                else ""
+                "Untested pass: docs-only diff with NO_TESTS_COLLECTED."
+                if test_outcome == TestOutcome.NO_TESTS_COLLECTED and subgoal.expects_tests
+                else (
+                    "Untested pass: expects_tests=False with NO_TESTS_COLLECTED."
+                    if test_outcome == TestOutcome.NO_TESTS_COLLECTED
+                    else ""
+                )
             )
         )
         return MechanicalCheckResult(
@@ -699,3 +920,4 @@ class Workspace:
             failed_check=None,
             detail=untested_flag,
         )
+
