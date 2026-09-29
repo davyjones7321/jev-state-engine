@@ -1,5 +1,6 @@
 import ast
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -446,6 +447,207 @@ class Workspace:
             )
         return ScopeCheckResult(passed=True, out_of_scope=[], detail="")
 
+    @classmethod
+    def _parse_ts_js_comment_line(cls, line: str, in_block: bool) -> tuple[bool, bool]:
+        """Validates if a TypeScript/JavaScript line is exclusively a comment/doc and updates block state.
+
+        Returns (is_valid_comment, new_in_block).
+        """
+        s = line.strip()
+        if in_block:
+            if "*/" not in s:
+                return (True, True)
+            idx = s.find("*/")
+            remainder = s[idx + 2:].strip()
+            if not remainder:
+                return (True, False)
+            return cls._parse_ts_js_comment_line(remainder, in_block=False)
+        else:
+            if not s:
+                return (True, False)
+            if s.startswith("//"):
+                return (True, False)
+            if s.startswith("/*"):
+                idx = s.find("*/", 2)
+                if idx == -1:
+                    return (True, True)
+                remainder = s[idx + 2:].strip()
+                if not remainder:
+                    return (True, False)
+                return cls._parse_ts_js_comment_line(remainder, in_block=False)
+            if s.startswith("*/"):
+                remainder = s[2:].strip()
+                if not remainder:
+                    return (True, False)
+                return cls._parse_ts_js_comment_line(remainder, in_block=False)
+            if s == "*" or s.startswith("* ") or s.startswith("*\t") or s.startswith("*@"):
+                if "*/" in s:
+                    idx = s.find("*/")
+                    remainder = s[idx + 2:].strip()
+                    if not remainder:
+                        return (True, False)
+                    return cls._parse_ts_js_comment_line(remainder, in_block=False)
+                return (True, True)
+            return (False, False)
+
+    @classmethod
+    def _parse_python_comment_line(cls, line: str, in_docstring: Optional[str]) -> tuple[bool, Optional[str]]:
+        """Validates if a Python line is exclusively a comment/docstring and updates docstring state.
+
+        Returns (is_valid_comment, new_in_docstring).
+        """
+        s = line.strip()
+        if in_docstring is not None:
+            if in_docstring not in s:
+                return (True, in_docstring)
+            idx = s.find(in_docstring)
+            remainder = s[idx + 3:].strip()
+            if not remainder or remainder.startswith("#"):
+                return (True, None)
+            return (False, None)
+        else:
+            if not s:
+                return (True, None)
+            if s.startswith("#"):
+                return (True, None)
+            if s.startswith('"""'):
+                idx = s.find('"""', 3)
+                if idx == -1:
+                    return (True, '"""')
+                remainder = s[idx + 3:].strip()
+                if not remainder or remainder.startswith("#"):
+                    return (True, None)
+                return (False, None)
+            if s.startswith("'''"):
+                idx = s.find("'''", 3)
+                if idx == -1:
+                    return (True, "'''")
+                remainder = s[idx + 3:].strip()
+                if not remainder or remainder.startswith("#"):
+                    return (True, None)
+                return (False, None)
+            return (False, None)
+
+    @classmethod
+    def _is_docs_only_diff(cls, diff_str: str) -> bool:
+        """Fail-closed classifier that verifies if a staged git diff contains ONLY documentation or comment changes.
+
+        Rules:
+        1. Empty diff or whitespace only -> False.
+        2. Any file rename, deletion, copy, or mode change -> False (fail closed).
+        3. For each file touched:
+           - Markdown/text documentation files (.md, .txt, .rst, .adoc, etc.) -> all line changes permitted.
+           - TypeScript / JavaScript (.ts, .tsx, .js, .jsx, .mjs, .cjs) -> every added/removed line must be
+             pure whitespace, single-line comment (//), or JSDoc/block comment (/* ... */, /** ... */).
+             Any executable logic, statements, or signature changes outside comments -> False.
+           - Python (.py, .pyi) -> every added/removed line must be pure whitespace, single-line comment (#),
+             or triple-quoted docstring (''' or \"\"\"). Any statement outside comments/docstrings -> False.
+           - Any other file extension -> False (fail closed).
+        4. If even a single line of real executable logic is touched across any file -> False.
+        """
+        if not diff_str or not diff_str.strip():
+            return False
+
+        # Fail closed on file deletion, renaming, or mode changes
+        for line in diff_str.splitlines():
+            line_strip = line.strip()
+            if (
+                line_strip.startswith("deleted file mode ")
+                or line_strip.startswith("rename from ")
+                or line_strip.startswith("rename to ")
+                or line_strip.startswith("copy from ")
+                or line_strip.startswith("copy to ")
+            ):
+                return False
+
+        raw_blocks = diff_str.split("diff --git ")
+        file_blocks = [b for b in raw_blocks if b.strip()]
+        if not file_blocks:
+            return False
+
+        DOC_EXTS = {".md", ".markdown", ".mdown", ".mkdn", ".txt", ".rst", ".adoc", ".asciidoc"}
+        TS_JS_EXTS = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}
+        PY_EXTS = {".py", ".pyi"}
+
+        has_modifications = False
+
+        for block in file_blocks:
+            # Check for deleted file (+++ /dev/null)
+            if re.search(r"^\+\+\+\s+/dev/null", block, re.MULTILINE):
+                return False
+
+            match_plus = re.search(r"^\+\+\+\s+b/(.+)$", block, re.MULTILINE)
+            if match_plus:
+                target_path = match_plus.group(1).strip()
+            else:
+                first_line = block.splitlines()[0]
+                match_git = re.search(r"b/(.+)$", first_line)
+                if match_git:
+                    target_path = match_git.group(1).strip()
+                else:
+                    return False
+
+            target_path = cls._clean_diff_path(target_path)
+            ext = Path(target_path).suffix.lower()
+
+            if ext in DOC_EXTS:
+                for line in block.splitlines():
+                    if (line.startswith("+") and not line.startswith("+++")) or (line.startswith("-") and not line.startswith("---")):
+                        has_modifications = True
+                continue
+
+            if ext not in TS_JS_EXTS and ext not in PY_EXTS:
+                return False
+
+            in_block_add = False
+            in_block_rem = False
+            in_py_doc_add: Optional[str] = None
+            in_py_doc_rem: Optional[str] = None
+
+            for line in block.splitlines():
+                if line.startswith("@@"):
+                    in_block_add = False
+                    in_block_rem = False
+                    in_py_doc_add = None
+                    in_py_doc_rem = None
+                    continue
+
+                if line.startswith("+++") or line.startswith("---"):
+                    continue
+
+                if line.startswith(" "):
+                    content = line[1:]
+                    if ext in TS_JS_EXTS:
+                        _, in_block_add = cls._parse_ts_js_comment_line(content, in_block_add)
+                        _, in_block_rem = cls._parse_ts_js_comment_line(content, in_block_rem)
+                    elif ext in PY_EXTS:
+                        _, in_py_doc_add = cls._parse_python_comment_line(content, in_py_doc_add)
+                        _, in_py_doc_rem = cls._parse_python_comment_line(content, in_py_doc_rem)
+                elif line.startswith("+"):
+                    has_modifications = True
+                    content = line[1:]
+                    if ext in TS_JS_EXTS:
+                        is_valid, in_block_add = cls._parse_ts_js_comment_line(content, in_block_add)
+                        if not is_valid:
+                            return False
+                    elif ext in PY_EXTS:
+                        is_valid, in_py_doc_add = cls._parse_python_comment_line(content, in_py_doc_add)
+                        if not is_valid:
+                            return False
+                elif line.startswith("-"):
+                    has_modifications = True
+                    content = line[1:]
+                    if ext in TS_JS_EXTS:
+                        is_valid, in_block_rem = cls._parse_ts_js_comment_line(content, in_block_rem)
+                        if not is_valid:
+                            return False
+                    elif ext in PY_EXTS:
+                        is_valid, in_py_doc_rem = cls._parse_python_comment_line(content, in_py_doc_rem)
+                        if not is_valid:
+                            return False
+
+        return has_modifications
+
     def run_mechanical_checks(self, subgoal: Subgoal) -> MechanicalCheckResult:
         # 1. check_build
         build_res = self.check_build(subgoal.scope)
@@ -458,6 +660,7 @@ class Workspace:
 
         # 2. run_tests
         test_outcome = self.run_tests()
+        diff = self.get_staged_diff()
         if test_outcome == TestOutcome.FAILED:
             return MechanicalCheckResult(
                 passed=False,
@@ -466,14 +669,14 @@ class Workspace:
             )
         elif test_outcome == TestOutcome.NO_TESTS_COLLECTED:
             if subgoal.expects_tests:
-                return MechanicalCheckResult(
-                    passed=False,
-                    failed_check="no_tests_collected",
-                    detail="No tests collected when expects_tests is True.",
-                )
+                if not self._is_docs_only_diff(diff):
+                    return MechanicalCheckResult(
+                        passed=False,
+                        failed_check="no_tests_collected",
+                        detail="No tests collected when expects_tests is True and diff contains code changes.",
+                    )
 
         # 3. check_scope
-        diff = self.get_staged_diff()
         scope_res = self.check_scope(diff, subgoal.scope)
         if not scope_res.passed:
             return MechanicalCheckResult(
@@ -483,9 +686,13 @@ class Workspace:
             )
 
         untested_flag = (
-            "Untested pass: expects_tests=False with NO_TESTS_COLLECTED."
-            if test_outcome == TestOutcome.NO_TESTS_COLLECTED
-            else ""
+            "Untested pass: docs-only diff with NO_TESTS_COLLECTED."
+            if test_outcome == TestOutcome.NO_TESTS_COLLECTED and subgoal.expects_tests
+            else (
+                "Untested pass: expects_tests=False with NO_TESTS_COLLECTED."
+                if test_outcome == TestOutcome.NO_TESTS_COLLECTED
+                else ""
+            )
         )
         return MechanicalCheckResult(
             passed=True,

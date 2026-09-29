@@ -243,3 +243,145 @@ def test_get_cumulative_diff_captures_committed_subgoals(git_repo):
     cumulative = ws.get_cumulative_diff()
     assert "doc.py" in cumulative
     assert "+# New docstring" in cumulative
+
+
+# 14. test_docs_only_diff_allows_jsdoc_comments_in_typescript
+def test_docs_only_diff_allows_jsdoc_comments_in_typescript(git_repo):
+    """JSDoc comments added to a TypeScript file qualify for Untested Pass when expects_tests=True and NO_TESTS_COLLECTED."""
+    ws = Workspace(repo_dir=git_repo)
+    # Commit initial typescript file
+    ws.stage_file_mutation("src/lib/auth.ts", "export function getSession(id: string) {\n  return id;\n}\n")
+    ws.commit_subgoal("Initial commit")
+
+    # Stage pure JSDoc docstring addition
+    ws.stage_file_mutation(
+        "src/lib/auth.ts",
+        "/**\n * Returns the session for the given ID.\n * @param id The session identifier\n * @returns Session data\n */\nexport function getSession(id: string) {\n  return id;\n}\n"
+    )
+
+    ws.run_tests = MagicMock(return_value=TestOutcome.NO_TESTS_COLLECTED)
+    subgoal = Subgoal(scope=["src/lib/auth.ts"], expects_tests=True)
+    res = ws.run_mechanical_checks(subgoal)
+
+    assert res.passed is True
+    assert res.failed_check is None
+    assert "untested pass" in res.detail.lower()
+    assert "docs-only" in res.detail.lower()
+
+
+# 15. test_docs_only_diff_rejects_mixed_diff_with_code_and_comments
+def test_docs_only_diff_rejects_mixed_diff_with_code_and_comments(git_repo):
+    """Diff touching both JSDoc and executable logic fails closed when expects_tests=True and NO_TESTS_COLLECTED."""
+    ws = Workspace(repo_dir=git_repo)
+    ws.stage_file_mutation("src/lib/auth.ts", "export function getSession(id: string) {\n  return id;\n}\n")
+    ws.commit_subgoal("Initial commit")
+
+    # Stage JSDoc AND new executable statement (const timeout = 1000;)
+    ws.stage_file_mutation(
+        "src/lib/auth.ts",
+        "/**\n * Session helper\n */\nexport function getSession(id: string) {\n  const timeout = 1000;\n  return id;\n}\n"
+    )
+
+    ws.run_tests = MagicMock(return_value=TestOutcome.NO_TESTS_COLLECTED)
+    subgoal = Subgoal(scope=["src/lib/auth.ts"], expects_tests=True)
+    res = ws.run_mechanical_checks(subgoal)
+
+    assert res.passed is False
+    assert res.failed_check == "no_tests_collected"
+    assert "code changes" in res.detail.lower() or "not collected" in res.detail.lower()
+
+
+# 16. test_docs_only_diff_rejects_signature_change_next_to_jsdoc
+def test_docs_only_diff_rejects_signature_change_next_to_jsdoc(git_repo):
+    """Diff adding JSDoc while modifying a function signature/type annotation must fail closed."""
+    ws = Workspace(repo_dir=git_repo)
+    ws.stage_file_mutation("src/lib/auth.ts", "export function login(user: any) {\n  return true;\n}\n")
+    ws.commit_subgoal("Initial commit")
+
+    # Stage JSDoc addition alongside a signature type modification (any -> User)
+    ws.stage_file_mutation(
+        "src/lib/auth.ts",
+        "/**\n * Logs in the user.\n * @param user User payload\n */\nexport function login(user: User) {\n  return true;\n}\n"
+    )
+
+    ws.run_tests = MagicMock(return_value=TestOutcome.NO_TESTS_COLLECTED)
+    subgoal = Subgoal(scope=["src/lib/auth.ts"], expects_tests=True)
+    res = ws.run_mechanical_checks(subgoal)
+
+    assert res.passed is False
+    assert res.failed_check == "no_tests_collected"
+
+
+# 17. test_docs_only_diff_rejects_deleted_or_renamed_file
+def test_docs_only_diff_rejects_deleted_or_renamed_file(git_repo):
+    """File deletion or renaming fails closed and cannot claim a docs-only untested pass."""
+    ws = Workspace(repo_dir=git_repo)
+    ws.stage_file_mutation("docs.txt", "Some docs\n")
+    ws.commit_subgoal("Add docs.txt")
+
+    # Delete docs.txt
+    (ws.worktree_dir / "docs.txt").unlink()
+    diff = ws.get_staged_diff()
+    assert "deleted file mode" in diff or "--- a/docs.txt" in diff
+    assert ws._is_docs_only_diff(diff) is False
+
+
+# 18. test_docs_only_diff_allows_python_docstrings_and_comments
+def test_docs_only_diff_allows_python_docstrings_and_comments(git_repo):
+    """Python file with triple-quoted docstrings and single-line comments qualifies for Untested Pass."""
+    ws = Workspace(repo_dir=git_repo)
+    ws.stage_file_mutation("src/service.py", "def process():\n    pass\n")
+    ws.commit_subgoal("Initial commit")
+
+    # Stage docstring and comment additions
+    ws.stage_file_mutation(
+        "src/service.py",
+        'def process():\n    """Process the incoming task.\n\n    Returns None.\n    """\n    # Internal comment\n    pass\n'
+    )
+
+    ws.run_tests = MagicMock(return_value=TestOutcome.NO_TESTS_COLLECTED)
+    subgoal = Subgoal(scope=["src/service.py"], expects_tests=True)
+    res = ws.run_mechanical_checks(subgoal)
+
+    assert res.passed is True
+    assert res.failed_check is None
+    assert "docs-only" in res.detail.lower()
+
+
+# 19. test_docs_only_diff_rejects_python_mixed_diff
+def test_docs_only_diff_rejects_python_mixed_diff(git_repo):
+    """Python file with docstrings plus modified logic fails closed."""
+    ws = Workspace(repo_dir=git_repo)
+    ws.stage_file_mutation("src/service.py", "def process():\n    pass\n")
+    ws.commit_subgoal("Initial commit")
+
+    # Stage docstring + new logic (return 42 instead of pass)
+    ws.stage_file_mutation(
+        "src/service.py",
+        'def process():\n    """Process the incoming task."""\n    return 42\n'
+    )
+
+    ws.run_tests = MagicMock(return_value=TestOutcome.NO_TESTS_COLLECTED)
+    subgoal = Subgoal(scope=["src/service.py"], expects_tests=True)
+    res = ws.run_mechanical_checks(subgoal)
+
+    assert res.passed is False
+    assert res.failed_check == "no_tests_collected"
+
+
+# 20. test_docs_only_diff_allows_markdown_documentation_files
+def test_docs_only_diff_allows_markdown_documentation_files(git_repo):
+    """Markdown file modifications qualify for Untested Pass when expects_tests=True."""
+    ws = Workspace(repo_dir=git_repo)
+    ws.stage_file_mutation("README.md", "# Old Readme\n")
+    ws.commit_subgoal("Initial commit")
+
+    ws.stage_file_mutation("README.md", "# New Readme\nAdded project documentation.\n")
+
+    ws.run_tests = MagicMock(return_value=TestOutcome.NO_TESTS_COLLECTED)
+    subgoal = Subgoal(scope=["README.md"], expects_tests=True)
+    res = ws.run_mechanical_checks(subgoal)
+
+    assert res.passed is True
+    assert res.failed_check is None
+    assert "docs-only" in res.detail.lower()
