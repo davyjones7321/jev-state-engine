@@ -574,3 +574,29 @@ def test_node_verify_passes_investigation_notes_to_gatekeeper():
     assert kwargs.get("investigation_notes") == "Architecture notes for ticket"
 
 
+# 19. Test node_verify records probability in trajectory and feedback on rejection
+def test_node_verify_records_probability_in_trajectory_and_feedback():
+    """Assert node_verify logs confidence score in feedback and trajectory."""
+    ws = MagicMock()
+    ws.run_tests.return_value = TestOutcome.NO_TESTS_COLLECTED
+    ws.get_cumulative_diff.return_value = "+x = 1\n"
+    ws.get_staged_diff.return_value = "+x = 1\n"
+
+    gk = MagicMock()
+    gk.verify_ticket.return_value = ValidationVerdict(valid=False, probability=0.33, reason=None)
+
+    state = {
+        "ticket": "Add feature",
+        "trajectory": [],
+    }
+
+    res = node_verify(state, workspace=ws, gatekeeper=gk)
+
+    assert res["status"] == "verification_failed"
+    assert res["gate_status"] == "verification_failed"
+    assert "0.33" in res["last_feedback"]
+    assert len(res["trajectory"]) == 1
+    assert res["trajectory"][0]["probability"] == 0.33
+
+
+

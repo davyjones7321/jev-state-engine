@@ -1676,7 +1676,8 @@ def node_verify(
             else:
                 state["gate_status"] = "verification_failed"
                 state["status"] = "verification_failed"
-                state["last_feedback"] = verdict.reason or "Verification rejected by Gatekeeper."
+                prob_str = f" (confidence: {verdict.probability:.2f})" if hasattr(verdict, "probability") and isinstance(verdict.probability, (int, float)) else ""
+                state["last_feedback"] = verdict.reason or f"Verification rejected by Gatekeeper{prob_str}."
         else:
             state["gate_status"] = "verified"
             state["status"] = "completed"
@@ -1686,8 +1687,11 @@ def node_verify(
             "gate_status": state.get("gate_status"),
             "status": state.get("status"),
         }
-        if verdict is not None and getattr(verdict, "reason", None):
-            verify_entry["reason"] = verdict.reason
+        if verdict is not None:
+            if getattr(verdict, "probability", None) is not None:
+                verify_entry["probability"] = verdict.probability
+            if getattr(verdict, "reason", None):
+                verify_entry["reason"] = verdict.reason
 
         state["trajectory"].append(verify_entry)
 

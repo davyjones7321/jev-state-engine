@@ -314,5 +314,24 @@ def test_verify_ticket_sends_investigation_notes_in_payload():
         assert verdict.valid is True
 
 
+# 34. test_verify_ticket_instructions_clarifies_untested_pass
+def test_verify_ticket_instructions_clarifies_untested_pass():
+    """Assert Gatekeeper.verify_ticket includes untested pass guidance in question instructions."""
+    gk = Gatekeeper(api_url="https://api.typesafe.ai/v1/systemone", api_key="test_key")
+    mock_resp = httpx.Response(200, json={"answers": {"valid": {"noul": 0.90}}})
+
+    with patch.object(gk.client, "post", return_value=mock_resp) as mock_post:
+        gk.verify_ticket(
+            ticket="Create page",
+            final_diff="+page() {}",
+            test_output="NO_TESTS_COLLECTED (Untested pass)",
+        )
+        assert mock_post.call_count == 1
+        payload = mock_post.call_args.kwargs.get("json", {})
+        instructions = payload["questions"]["valid"]["instructions"]
+        assert "untested pass" in instructions.lower()
+
+
+
 
 

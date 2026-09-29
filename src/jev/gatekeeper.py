@@ -207,7 +207,11 @@ class Gatekeeper:
             "questions": {
                 "valid": {
                     "type": "noul",
-                    "instructions": "Does the final diff and test output completely resolve and verify the ticket?",
+                    "instructions": (
+                        "Does the final diff completely resolve the ticket, and does the test output "
+                        "satisfy verification requirements (allowing an untested pass if the ticket "
+                        "does not require automated tests)?"
+                    ),
                 }
             },
         }
