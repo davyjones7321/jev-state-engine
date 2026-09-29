@@ -1274,14 +1274,22 @@ def node_implement(
 
         tools = [stage_file_mutation, submit_subgoal]
 
-        prompt_lines = [
+        prompt_lines = []
+        if state.get("ticket"):
+            prompt_lines.append(f"Ticket: {state['ticket']}")
+        prompt_lines.extend([
             f"Current Subgoal: {subgoal.description}",
             f"Declared Scope: {json.dumps(subgoal.scope)}",
-        ]
+        ])
         if subgoal.expects_tests:
             prompt_lines.append("Note: This subgoal expects tests to verify its implementation.")
         else:
             prompt_lines.append("Note: This subgoal does not expect tests.")
+
+        if state.get("investigation_notes"):
+            prompt_lines.append(
+                f"Investigation Notes (Project Architecture & Conventions):\n{state['investigation_notes']}"
+            )
 
         if state.get("last_feedback"):
             prompt_lines.append(f"Previous attempt failed gate verification. Feedback:\n{state['last_feedback']}")
@@ -1302,9 +1310,10 @@ def node_implement(
 
         prompt_lines.append(
             "Instructions:\n"
-            "1. Stage all necessary code changes using the `stage_file_mutation` tool.\n"
+            "1. Strictly adhere to the project architecture, dependencies, styling conventions, and existing component patterns documented in the Investigation Notes. Do not introduce uninstalled libraries or conflicting layout structures (e.g. do not create redundant headers or navbars if layout.tsx or a global component already provides them).\n"
+            "2. Stage all necessary code changes using the `stage_file_mutation` tool.\n"
             "   Only mutate files within the declared scope.\n"
-            "2. When all changes are staged and you are done, call the `submit_subgoal` tool to submit your work for gate verification."
+            "3. When all changes are staged and you are done, call the `submit_subgoal` tool to submit your work for gate verification."
         )
         prompt_text = "\n\n".join(prompt_lines)
 
@@ -1589,7 +1598,13 @@ def node_gate(
         current_sem_strikes = state.get("semantic_strike_count", 0) + 1
         state["semantic_strike_count"] = current_sem_strikes
         state["gate_status"] = "semantic_failure"
-        state["last_feedback"] = verdict.reason or "Semantic validation rejected."
+        prob_str = f" (confidence: {verdict.probability:.2f})" if hasattr(verdict, "probability") and isinstance(verdict.probability, (int, float)) else ""
+        state["last_feedback"] = (
+            verdict.reason
+            or f"Semantic validation rejected by Gatekeeper{prob_str}. "
+               "Diff contradicted project conventions, exceeded declared scope, or failed to implement the required subgoal. "
+               "Ensure changes match the project architecture, dependencies, and styling in Investigation Notes."
+        )
 
         if current_sem_strikes >= 3 and hasattr(gatekeeper, "escalate_deadlock"):
             gatekeeper.escalate_deadlock(

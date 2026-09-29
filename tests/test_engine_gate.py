@@ -263,3 +263,20 @@ def test_node_gate_passes_investigation_notes_to_gatekeeper(base_state):
     _, kwargs = mock_gk.validate_subgoal.call_args
     assert kwargs.get("investigation_notes") == "Discovered Next.js App Router in src/app"
 
+
+# 22. test_node_gate_enriches_feedback_when_verdict_reason_none
+def test_node_gate_enriches_feedback_when_verdict_reason_none(base_state):
+    """When verdict.valid is False and verdict.reason is None, assert feedback includes confidence score and actionable advice."""
+    workspace = FakeWorkspace()
+    mock_gk = MagicMock()
+    mock_gk.validate_subgoal.return_value = ValidationVerdict(valid=False, probability=0.15, reason=None)
+    state = dict(base_state)
+    state["investigation_notes"] = "Dark mode Tailwind styling in src/app"
+
+    res = node_gate(state, workspace=workspace, gatekeeper=mock_gk)
+
+    assert res["gate_status"] == "semantic_failure"
+    assert "0.15" in res["last_feedback"]
+    assert "Investigation Notes" in res["last_feedback"]
+
+

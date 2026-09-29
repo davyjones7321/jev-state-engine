@@ -354,3 +354,70 @@ def test_node_implement_handles_dict_current_subgoal():
     assert len(ws.staged_mutations) == 1
     assert ws.staged_mutations[0]["path"] == "d.py"
     assert ws.staged_mutations[0]["content"] == "x = 42\n"
+
+
+# 10. Verify node_implement includes investigation_notes in prompt
+def test_node_implement_includes_investigation_notes_in_prompt():
+    ws = MockWorkspace()
+    subgoal = Subgoal(description="Add contact page", scope=["src/app/contact/page.tsx"], expects_tests=False)
+    state: State = {
+        "ticket": "Create contact page",
+        "investigation_notes": "Architecture: Next.js App Router in src/app, dark-mode slate/emerald, lucide-react icons.",
+        "current_subgoal": subgoal,
+        "trajectory": [],
+    }
+    turn_resp = AIMessage(
+        content="Submitting",
+        tool_calls=[{"name": "submit_subgoal", "args": {}, "id": "c1"}],
+    )
+    fake_llm = ScriptedChatModel(responses=[turn_resp])
+    node_implement(state, workspace=ws, llm=fake_llm)
+
+    assert len(fake_llm.invocations) == 1
+    prompt_text = fake_llm.invocations[0][0].content
+    assert "Investigation Notes (Project Architecture & Conventions):" in prompt_text
+    assert "Architecture: Next.js App Router in src/app, dark-mode slate/emerald, lucide-react icons." in prompt_text
+
+
+# 11. Verify node_implement includes ticket in prompt
+def test_node_implement_includes_ticket_in_prompt():
+    ws = MockWorkspace()
+    subgoal = Subgoal(description="Add contact page", scope=["src/app/contact/page.tsx"], expects_tests=False)
+    state: State = {
+        "ticket": "Create new Contact page for Smash Arena site",
+        "current_subgoal": subgoal,
+        "trajectory": [],
+    }
+    turn_resp = AIMessage(
+        content="Submitting",
+        tool_calls=[{"name": "submit_subgoal", "args": {}, "id": "c1"}],
+    )
+    fake_llm = ScriptedChatModel(responses=[turn_resp])
+    node_implement(state, workspace=ws, llm=fake_llm)
+
+    assert len(fake_llm.invocations) == 1
+    prompt_text = fake_llm.invocations[0][0].content
+    assert "Ticket: Create new Contact page for Smash Arena site" in prompt_text
+
+
+# 12. Verify node_implement prompt works cleanly when notes and ticket are omitted
+def test_node_implement_omitted_notes_and_ticket_safe():
+    ws = MockWorkspace()
+    subgoal = Subgoal(description="Simple task", scope=["foo.py"], expects_tests=False)
+    state: State = {
+        "current_subgoal": subgoal,
+        "trajectory": [],
+    }
+    turn_resp = AIMessage(
+        content="Submitting",
+        tool_calls=[{"name": "submit_subgoal", "args": {}, "id": "c1"}],
+    )
+    fake_llm = ScriptedChatModel(responses=[turn_resp])
+    res = node_implement(state, workspace=ws, llm=fake_llm)
+
+    assert len(fake_llm.invocations) == 1
+    prompt_text = fake_llm.invocations[0][0].content
+    assert "Current Subgoal: Simple task" in prompt_text
+    assert "Investigation Notes (Project Architecture & Conventions):" not in prompt_text
+    assert res.get("gate_status") is None
+
