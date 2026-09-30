@@ -22,6 +22,9 @@ class MechanicalCheckResult(BaseModel):
     passed: bool
     failed_check: Optional[str] = None  # "build" | "tests" | "no_tests_collected" | "scope"
     detail: str = ""
+    checks_run: List[str] = Field(default_factory=list)
+    checks: Dict[str, Any] = Field(default_factory=dict)
+    test_runner_outcome: Optional[Dict[str, Any]] = None
 
 
 class ValidationVerdict(BaseModel):

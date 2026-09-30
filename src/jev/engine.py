@@ -838,18 +838,16 @@ def _matches_candidate(scope_path: str, candidates: List[str], base_dir: Optiona
     return False
 
 
-def _validate_plan_grounding(
-    subgoals: List[Subgoal],
+def _check_single_subgoal_grounding(
+    subgoal: Subgoal,
     workspace: Optional[Any],
     ticket: str,
     investigation_notes: str,
     investigated_directories: Optional[List[str]] = None,
-) -> None:
-    """Validate that subgoal scopes are grounded in the repository or investigation notes."""
+) -> Dict[str, Any]:
     ticket_lower = ticket.lower()
     notes_lower = (investigation_notes or "").lower()
     inv_dirs = set(investigated_directories or [])
-
 
     # Determine if ticket specifically targets existing code
     targets_existing = bool(
@@ -881,133 +879,160 @@ def _validate_plan_grounding(
         "png", "jpg", "jpeg", "svg", "gif", "ico", "gitignore", "env",
     }
 
-    for subgoal in subgoals:
-        subgoal_desc_lower = subgoal.description.lower()
-        subgoal_targets_existing = targets_existing or bool(
-            re.search(r"\b(existing|undocumented|current)\b", subgoal_desc_lower)
-        ) or bool(
-            re.search(r"\badd\s+to\b", subgoal_desc_lower)
-        )
+    subgoal_desc_lower = subgoal.description.lower()
+    subgoal_targets_existing = targets_existing or bool(
+        re.search(r"\b(existing|undocumented|current)\b", subgoal_desc_lower)
+    ) or bool(
+        re.search(r"\badd\s+to\b", subgoal_desc_lower)
+    )
 
-        for scope_item in subgoal.scope:
-            cleaned_path = scope_item.strip().replace("\\", "/")
-            path_obj = Path(cleaned_path)
-            file_name = path_obj.name.lower()
-            file_stem = path_obj.stem.lower()
-            ext = path_obj.suffix.lower().lstrip(".")
+    for scope_item in subgoal.scope:
+        cleaned_path = scope_item.strip().replace("\\", "/")
+        path_obj = Path(cleaned_path)
+        file_name = path_obj.name.lower()
+        file_stem = path_obj.stem.lower()
+        ext = path_obj.suffix.lower().lstrip(".")
 
-            # Check if file path, filename, or meaningful stem is explicitly present in notes or ticket
-            stem_in_notes = len(file_stem) >= 3 and bool(re.search(r"\b" + re.escape(file_stem) + r"\b", notes_lower))
-            stem_in_ticket = len(file_stem) >= 3 and bool(re.search(r"\b" + re.escape(file_stem) + r"\b", ticket_lower))
-            in_notes = (cleaned_path.lower() in notes_lower) or (file_name in notes_lower) or stem_in_notes
-            in_ticket = (cleaned_path.lower() in ticket_lower) or (file_name in ticket_lower) or stem_in_ticket
+        # Check if file path, filename, or meaningful stem is explicitly present in notes or ticket
+        stem_in_notes = len(file_stem) >= 3 and bool(re.search(r"\b" + re.escape(file_stem) + r"\b", notes_lower))
+        stem_in_ticket = len(file_stem) >= 3 and bool(re.search(r"\b" + re.escape(file_stem) + r"\b", ticket_lower))
+        in_notes = (cleaned_path.lower() in notes_lower) or (file_name in notes_lower) or stem_in_notes
+        in_ticket = (cleaned_path.lower() in ticket_lower) or (file_name in ticket_lower) or stem_in_ticket
 
-            # 1. Check if the file exists on disk in the workspace
-            exists_on_disk = False
-            if base_dir is not None:
-                try:
-                    full_target = (base_dir / cleaned_path).resolve()
-                    exists_on_disk = full_target.exists() and (full_target.is_file() or full_target.is_dir())
-                except Exception:
-                    exists_on_disk = False
+        # 1. Check if the file exists on disk in the workspace
+        exists_on_disk = False
+        if base_dir is not None:
+            try:
+                full_target = (base_dir / cleaned_path).resolve()
+                exists_on_disk = full_target.exists() and (full_target.is_file() or full_target.is_dir())
+            except Exception:
+                exists_on_disk = False
 
-            # Tightened candidate check for tickets/subgoals targeting existing functionality
-            if subgoal_targets_existing:
-                # When investigation notes identified specific candidate files, scope MUST match one of them
-                if candidate_files:
-                    if not _matches_candidate(cleaned_path, candidate_files, base_dir) and not in_ticket:
-                        if not exists_on_disk:
-                            raise ValueError(
+        # Tightened candidate check for tickets/subgoals targeting existing functionality
+        if subgoal_targets_existing:
+            # When investigation notes identified specific candidate files, scope MUST match one of them
+            if candidate_files:
+                if not _matches_candidate(cleaned_path, candidate_files, base_dir) and not in_ticket:
+                    if not exists_on_disk:
+                        return {
+                            "status": "rejected",
+                            "reason": (
                                 f"Scope file '{scope_item}' does not exist in repository and was not found during investigation for ticket modifying existing code: "
                                 f"scope must reference one of the files investigation identified as containing the target functionality: {sorted(candidate_files)}"
-                            )
-                        else:
-                            raise ValueError(
+                            ),
+                        }
+                    else:
+                        return {
+                            "status": "rejected",
+                            "reason": (
                                 f"Scope file '{scope_item}' is invalid: for tickets targeting existing functionality, "
                                 f"scope must reference one of the files investigation identified as containing the target functionality: {sorted(candidate_files)}"
-                            )
+                            ),
+                        }
 
-                # Non-source files (README.md, config files) cannot satisfy tickets targeting existing functions
-                if ext in non_source_extensions and not in_ticket:
-                    raise ValueError(
-                        f"Scope file '{scope_item}' is a non-source file ({ext}) and cannot satisfy a ticket targeting existing functions or code."
-                    )
+            # Non-source files (README.md, config files) cannot satisfy tickets targeting existing functions
+            if ext in non_source_extensions and not in_ticket:
+                return {
+                    "status": "rejected",
+                    "reason": f"Scope file '{scope_item}' is a non-source file ({ext}) and cannot satisfy a ticket targeting existing functions or code.",
+                }
 
-            if exists_on_disk:
-                continue
+        if exists_on_disk:
+            continue
 
-            # If investigated_directories was recorded, verify architectural consistency for new files
-            if inv_dirs:
-                parent_dir = path_obj.parent.as_posix().lstrip("./")
-                if not parent_dir:
-                    parent_dir = "."
+        # If investigated_directories was recorded, verify architectural consistency for new files
+        if inv_dirs:
+            parent_dir = path_obj.parent.as_posix().lstrip("./")
+            if not parent_dir:
+                parent_dir = "."
 
-                parent_dir_allowed = False
-                if parent_dir == ".":
-                    if "." in inv_dirs or "" in inv_dirs:
-                        parent_dir_allowed = True
-                else:
-                    if parent_dir in inv_dirs:
-                        parent_dir_allowed = True
-                    elif any(
-                        parent_dir == d or parent_dir.startswith(d + "/")
-                        for d in inv_dirs
-                        if d not in ("", ".")
-                    ):
-                        parent_dir_allowed = True
+            parent_dir_allowed = False
+            if parent_dir == ".":
+                if "." in inv_dirs or "" in inv_dirs:
+                    parent_dir_allowed = True
+            else:
+                if parent_dir in inv_dirs:
+                    parent_dir_allowed = True
+                elif any(
+                    parent_dir == d or parent_dir.startswith(d + "/")
+                    for d in inv_dirs
+                    if d not in ("", ".")
+                ):
+                    parent_dir_allowed = True
 
-                if not parent_dir_allowed:
-                    if (
-                        parent_dir.lower() in ticket_lower
-                        or parent_dir.lower() in notes_lower
-                        or cleaned_path.lower() in ticket_lower
-                        or cleaned_path.lower() in notes_lower
-                    ):
-                        parent_dir_allowed = True
+            if not parent_dir_allowed:
+                if (
+                    parent_dir.lower() in ticket_lower
+                    or parent_dir.lower() in notes_lower
+                    or cleaned_path.lower() in ticket_lower
+                    or cleaned_path.lower() in notes_lower
+                ):
+                    parent_dir_allowed = True
 
-                if not parent_dir_allowed:
-                    raise ValueError(
-                        f"Scope proposes creating files under '{parent_dir}/', but investigation only found {sorted(list(inv_dirs))} -- this repository does not use a {parent_dir} directory structure"
-                    )
+            if not parent_dir_allowed:
+                return {
+                    "status": "rejected",
+                    "reason": f"Scope proposes creating files under '{parent_dir}/', but investigation only found {sorted(list(inv_dirs))} -- this repository does not use a {parent_dir} directory structure",
+                }
+
+        # 2. Check if file path, filename, or meaningful stem is explicitly present in notes or ticket
+        if in_notes or in_ticket:
+            continue
+
+        # 3. If file does not exist on disk, and is not in notes, and not in ticket:
+        # Case A: Ticket or subgoal explicitly targets existing code/functions
+        if subgoal_targets_existing:
+            return {
+                "status": "rejected",
+                "reason": f"Scope file '{scope_item}' does not exist in repository and was not found during investigation for ticket modifying existing code.",
+            }
+
+        # Case B: Investigation notes found specific files, but the proposed file has an alien extension
+        # that was never found during investigation (e.g. .py proposed for a .ts repo)
+        if notes_extensions and ext and (ext not in notes_extensions):
+            ext_exists_in_workspace = False
+            if base_dir is not None:
+                try:
+                    ext_exists_in_workspace = any(base_dir.glob(f"*.{ext}")) or any(base_dir.glob(f"*/*.{ext}"))
+                except Exception:
+                    pass
+            if not ext_exists_in_workspace:
+                return {
+                    "status": "rejected",
+                    "reason": f"Scope file '{scope_item}' has file extension '.{ext}' which does not exist in the repository and was not found during investigation.",
+                }
+
+        # Case C: If investigation notes exist and ticket does NOT request creating new files,
+        # touching uninvestigated non-existent files is ungrounded
+        if notes_lower.strip() and not creates_new:
+            return {
+                "status": "rejected",
+                "reason": f"Scope file '{scope_item}' does not exist in repository and was not identified in investigation notes.",
+            }
+
+    return {
+        "status": "accepted",
+        "reason": f"Scope paths ({', '.join(subgoal.scope)}) grounded in investigated files/directories.",
+    }
 
 
-            # 2. Check if file path, filename, or meaningful stem is explicitly present in notes or ticket
-            stem_in_notes = len(file_stem) >= 3 and bool(re.search(r"\b" + re.escape(file_stem) + r"\b", notes_lower))
-            stem_in_ticket = len(file_stem) >= 3 and bool(re.search(r"\b" + re.escape(file_stem) + r"\b", ticket_lower))
-            in_notes = (cleaned_path.lower() in notes_lower) or (file_name in notes_lower) or stem_in_notes
-            in_ticket = (cleaned_path.lower() in ticket_lower) or (file_name in ticket_lower) or stem_in_ticket
-
-            if in_notes or in_ticket:
-                continue
-
-            # 3. If file does not exist on disk, and is not in notes, and not in ticket:
-            # Case A: Ticket or subgoal explicitly targets existing code/functions
-            if subgoal_targets_existing:
-                raise ValueError(
-                    f"Scope file '{scope_item}' does not exist in repository and was not found during investigation for ticket modifying existing code."
-                )
-
-            # Case B: Investigation notes found specific files, but the proposed file has an alien extension
-            # that was never found during investigation (e.g. .py proposed for a .ts repo)
-            if notes_extensions and ext and (ext not in notes_extensions):
-                # Check if the extension exists on disk in workspace
-                ext_exists_in_workspace = False
-                if base_dir is not None:
-                    try:
-                        ext_exists_in_workspace = any(base_dir.glob(f"*.{ext}")) or any(base_dir.glob(f"*/*.{ext}"))
-                    except Exception:
-                        pass
-                if not ext_exists_in_workspace:
-                    raise ValueError(
-                        f"Scope file '{scope_item}' has file extension '.{ext}' which does not exist in the repository and was not found during investigation."
-                    )
-
-            # Case C: If investigation notes exist and ticket does NOT request creating new files,
-            # touching uninvestigated non-existent files is ungrounded
-            if notes_lower.strip() and not creates_new:
-                raise ValueError(
-                    f"Scope file '{scope_item}' does not exist in repository and was not identified in investigation notes."
-                )
+def _validate_plan_grounding(
+    subgoals: List[Subgoal],
+    workspace: Optional[Any],
+    ticket: str,
+    investigation_notes: str,
+    investigated_directories: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Validate that subgoal scopes are grounded in the repository or investigation notes."""
+    results = []
+    for subgoal in subgoals:
+        res = _check_single_subgoal_grounding(
+            subgoal, workspace, ticket, investigation_notes, investigated_directories
+        )
+        if res["status"] == "rejected":
+            raise ValueError(res["reason"])
+        results.append(res)
+    return results
 
 
 
@@ -1179,9 +1204,27 @@ def node_plan(
         state["current_subgoal"] = None
         state["last_feedback"] = None
         state["gate_status"] = None
+
+        grounding_checks = [
+            {
+                "subgoal": sg.description,
+                "scope": list(sg.scope),
+                **_check_single_subgoal_grounding(
+                    sg, workspace, ticket, investigation_notes, state.get("investigated_directories")
+                ),
+            }
+            for sg in subgoals
+        ]
+        subgoals_with_grounding = []
+        for sg, gc in zip(subgoals, grounding_checks):
+            sg_dict = sg.model_dump() if hasattr(sg, "model_dump") else dict(sg)
+            sg_dict["directory_grounding"] = gc
+            subgoals_with_grounding.append(sg_dict)
+
         traj_entry: Dict[str, Any] = {
             "node": "plan",
-            "subgoals": [sg.model_dump() for sg in subgoals],
+            "subgoals": subgoals_with_grounding,
+            "grounding_checks": grounding_checks,
         }
         if retries_used > 0:
             traj_entry["retries"] = retries_used
@@ -1194,11 +1237,27 @@ def node_plan(
     state["gate_status"] = "planning_failed"
     state["status"] = "escalated"
     state["last_feedback"] = f"Planning failed after retry: {last_error}"
+
+    fail_grounding_checks: List[Dict[str, Any]] = []
+    if 'parsed_subgoals' in locals() and parsed_subgoals:
+        for sg in parsed_subgoals:
+            res = _check_single_subgoal_grounding(
+                sg, workspace, ticket, investigation_notes, state.get("investigated_directories")
+            )
+            fail_grounding_checks.append({
+                "subgoal": getattr(sg, "description", ""),
+                "scope": list(getattr(sg, "scope", [])),
+                **res,
+            })
+    if not fail_grounding_checks:
+        fail_grounding_checks.append({"status": "rejected", "reason": f"Planning validation failed: {last_error}"})
+
     state["trajectory"].append({
         "node": "plan",
         "error_type": "validation_failure",
         "error": f"Planning validation failed: {last_error}",
         "subgoals": [],
+        "grounding_checks": fail_grounding_checks,
     })
     if gatekeeper is not None and hasattr(gatekeeper, "escalate_deadlock"):
         gatekeeper.escalate_deadlock(
@@ -1547,6 +1606,36 @@ def node_gate(
     # Tier 0: Mechanical checks
     mech_result = workspace.run_mechanical_checks(subgoal)
 
+    tier0_telemetry = {
+        "passed": mech_result.passed,
+        "failed_check": mech_result.failed_check,
+        "detail": mech_result.detail,
+        "checks_run": getattr(mech_result, "checks_run", []),
+        "checks": getattr(mech_result, "checks", {}),
+    }
+    if not tier0_telemetry["checks"]:
+        failed = mech_result.failed_check
+        tier0_telemetry["checks"] = {
+            "build": {"ran": True, "passed": failed != "build", "detail": mech_result.detail if failed == "build" else ""},
+            "tests": {"ran": failed not in ("build",), "passed": failed not in ("build", "tests", "no_tests_collected") if failed else True, "detail": mech_result.detail if failed in ("tests", "no_tests_collected") else ""},
+            "scope": {"ran": failed not in ("build", "tests", "no_tests_collected"), "passed": failed != "scope", "detail": mech_result.detail if failed == "scope" else ""},
+        }
+        tier0_telemetry["checks_run"] = [k for k, v in tier0_telemetry["checks"].items() if v.get("ran")]
+
+    test_runner_telemetry = getattr(mech_result, "test_runner_outcome", None)
+    if test_runner_telemetry is None and hasattr(workspace, "last_test_run"):
+        test_runner_telemetry = workspace.last_test_run
+    if test_runner_telemetry is None and tier0_telemetry["checks"]["tests"]["ran"]:
+        test_runner_telemetry = {
+            "ecosystem": None,
+            "command": None,
+            "exit_code": None,
+            "stdout_tail": "",
+            "stderr_tail": "",
+            "output_tail": "",
+            "outcome": "PASSED" if mech_result.passed or mech_result.failed_check != "tests" else "FAILED",
+        }
+
     if not mech_result.passed:
         is_wt = _is_active_worktree(state, workspace)
         wt_path, wt_branch = _get_active_worktree_info(state, workspace)
@@ -1565,6 +1654,16 @@ def node_gate(
         state["mechanical_strike_count"] = current_mech_strikes
         state["gate_status"] = "mechanical_failure"
         state["last_feedback"] = mech_result.detail
+
+        state["trajectory"].append({
+            "node": "gate",
+            "subgoal": subgoal.model_dump() if hasattr(subgoal, "model_dump") else dict(subgoal),
+            "gate_status": "mechanical_failure",
+            "tier0_result": tier0_telemetry,
+            "test_runner": test_runner_telemetry,
+            "jev_request": None,
+            "jev_verdict": None,
+        })
 
         if current_mech_strikes >= 3 and gatekeeper is not None and hasattr(gatekeeper, "escalate_deadlock"):
             gatekeeper.escalate_deadlock(
@@ -1588,6 +1687,16 @@ def node_gate(
             subgoal, diff, mechanical_detail=mech_result.detail
         )
 
+    jev_request_telemetry = {
+        "subgoal": subgoal.model_dump() if hasattr(subgoal, "model_dump") else dict(subgoal),
+        "diff_size": len(diff),
+        "investigation_notes_included": bool(inv_notes),
+    }
+    jev_verdict_telemetry = {
+        "valid": verdict.valid,
+        "probability": getattr(verdict, "probability", 1.0),
+        "reason": getattr(verdict, "reason", None),
+    }
 
     if verdict.valid:
         wt_path = state.get("current_worktree_path")
@@ -1651,6 +1760,15 @@ def node_gate(
         state["semantic_strike_count"] = 0
         state["gate_status"] = "passed"
         state["last_feedback"] = ""
+        state["trajectory"].append({
+            "node": "gate",
+            "subgoal": subgoal.model_dump() if hasattr(subgoal, "model_dump") else dict(subgoal),
+            "gate_status": "passed",
+            "tier0_result": tier0_telemetry,
+            "test_runner": test_runner_telemetry,
+            "jev_request": jev_request_telemetry,
+            "jev_verdict": jev_verdict_telemetry,
+        })
         return state
     else:
         is_wt = _is_active_worktree(state, workspace)
@@ -1678,11 +1796,22 @@ def node_gate(
                "Ensure changes strictly adhere to the application's actual domain, product identity, and branding documented in Investigation Notes, without introducing conflicting domain concepts, alternate sports/business models, or fabricated external entities."
         )
 
+        state["trajectory"].append({
+            "node": "gate",
+            "subgoal": subgoal.model_dump() if hasattr(subgoal, "model_dump") else dict(subgoal),
+            "gate_status": "semantic_failure",
+            "tier0_result": tier0_telemetry,
+            "test_runner": test_runner_telemetry,
+            "jev_request": jev_request_telemetry,
+            "jev_verdict": jev_verdict_telemetry,
+        })
+
         if current_sem_strikes >= 3 and hasattr(gatekeeper, "escalate_deadlock"):
             gatekeeper.escalate_deadlock(
                 trajectory=state.get("trajectory", []),
                 triggering_tier="semantic",
             )
+
         return state
 
 
@@ -1754,10 +1883,33 @@ def node_verify(
             state["gate_status"] = "verified"
             state["status"] = "completed"
 
+        test_runner_info = getattr(workspace, "last_test_run", None)
+        if test_runner_info is None:
+            test_runner_info = {
+                "ecosystem": None,
+                "command": None,
+                "exit_code": None,
+                "stdout_tail": "",
+                "stderr_tail": "",
+                "output_tail": "",
+                "outcome": getattr(outcome, "value", str(outcome)) if 'outcome' in locals() else "UNKNOWN",
+            }
+
         verify_entry: Dict[str, Any] = {
             "node": "verify",
             "gate_status": state.get("gate_status"),
             "status": state.get("status"),
+            "test_runner": test_runner_info,
+            "jev_request": {
+                "ticket": ticket,
+                "diff_size": len(final_diff),
+                "investigation_notes_included": bool(inv_notes),
+            },
+            "jev_verdict": {
+                "valid": verdict.valid,
+                "probability": getattr(verdict, "probability", 1.0),
+                "reason": getattr(verdict, "reason", None),
+            } if verdict is not None else None,
         }
         if verdict is not None:
             if getattr(verdict, "probability", None) is not None:
@@ -1783,6 +1935,13 @@ def node_verify(
             "error": f"Verification error: {str(e)}",
             "gate_status": "verification_failed",
             "status": "escalated",
+            "test_runner": getattr(workspace, "last_test_run", None),
+            "jev_request": {
+                "ticket": state.get("ticket", ""),
+                "diff_size": len(final_diff) if 'final_diff' in locals() else 0,
+                "investigation_notes_included": bool(state.get("investigation_notes")),
+            },
+            "jev_verdict": None,
         })
         if gatekeeper is not None and hasattr(gatekeeper, "escalate_deadlock"):
             gatekeeper.escalate_deadlock(

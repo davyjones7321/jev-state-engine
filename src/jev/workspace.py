@@ -42,6 +42,33 @@ class Workspace:
             Path(worktree_dir).resolve() if worktree_dir else self.repo_dir
         )
         self.base_commit: Optional[str] = self._get_head_commit()
+        self.last_test_run: Optional[dict] = None
+
+    def _record_test_run(
+        self,
+        ecosystem: Optional[str],
+        command: Optional[List[str]],
+        exit_code: Optional[int],
+        stdout: str = "",
+        stderr: str = "",
+        outcome: TestOutcome = TestOutcome.NO_TESTS_COLLECTED,
+    ) -> TestOutcome:
+        stdout_tail = stdout[-1000:] if stdout else ""
+        stderr_tail = stderr[-1000:] if stderr else ""
+        output_tail = stdout_tail
+        if stderr_tail:
+            output_tail = f"{output_tail}\n[stderr]\n{stderr_tail}".strip() if output_tail else stderr_tail
+
+        self.last_test_run = {
+            "ecosystem": ecosystem,
+            "command": command,
+            "exit_code": exit_code,
+            "stdout_tail": stdout_tail,
+            "stderr_tail": stderr_tail,
+            "output_tail": output_tail,
+            "outcome": outcome.value if hasattr(outcome, "value") else str(outcome),
+        }
+        return outcome
 
     def _get_head_commit(self) -> Optional[str]:
         res = self._run_git(["rev-parse", "HEAD"])
@@ -374,10 +401,13 @@ class Workspace:
                     if isinstance(scripts, dict) and "test" in scripts:
                         if (wt / "yarn.lock").exists():
                             cmd = ["yarn", "test"]
+                            ecosystem = "yarn"
                         elif (wt / "pnpm-lock.yaml").exists():
                             cmd = ["pnpm", "test"]
+                            ecosystem = "pnpm"
                         else:
                             cmd = ["npm", "test"]
+                            ecosystem = "npm"
                         res = subprocess.run(
                             cmd,
                             cwd=wt,
@@ -386,39 +416,44 @@ class Workspace:
                             encoding="utf-8",
                             errors="replace",
                         )
-                        return TestOutcome.PASSED if res.returncode == 0 else TestOutcome.FAILED
-            except Exception:
-                pass
+                        outcome = TestOutcome.PASSED if res.returncode == 0 else TestOutcome.FAILED
+                        return self._record_test_run(ecosystem, cmd, res.returncode, res.stdout, res.stderr, outcome)
+            except Exception as e:
+                return self._record_test_run("package_json", None, -1, "", str(e), TestOutcome.FAILED)
 
         # 2. go.mod
         if (wt / "go.mod").exists():
+            cmd = ["go", "test", "./..."]
             try:
                 res = subprocess.run(
-                    ["go", "test", "./..."],
+                    cmd,
                     cwd=wt,
                     capture_output=True,
                     text=True,
                     encoding="utf-8",
                     errors="replace",
                 )
-                return TestOutcome.PASSED if res.returncode == 0 else TestOutcome.FAILED
-            except Exception:
-                return TestOutcome.FAILED
+                outcome = TestOutcome.PASSED if res.returncode == 0 else TestOutcome.FAILED
+                return self._record_test_run("go", cmd, res.returncode, res.stdout, res.stderr, outcome)
+            except Exception as e:
+                return self._record_test_run("go", cmd, -1, "", str(e), TestOutcome.FAILED)
 
         # 3. Cargo.toml
         if (wt / "Cargo.toml").exists():
+            cmd = ["cargo", "test"]
             try:
                 res = subprocess.run(
-                    ["cargo", "test"],
+                    cmd,
                     cwd=wt,
                     capture_output=True,
                     text=True,
                     encoding="utf-8",
                     errors="replace",
                 )
-                return TestOutcome.PASSED if res.returncode == 0 else TestOutcome.FAILED
-            except Exception:
-                return TestOutcome.FAILED
+                outcome = TestOutcome.PASSED if res.returncode == 0 else TestOutcome.FAILED
+                return self._record_test_run("cargo", cmd, res.returncode, res.stdout, res.stderr, outcome)
+            except Exception as e:
+                return self._record_test_run("cargo", cmd, -1, "", str(e), TestOutcome.FAILED)
 
         # 4. pom.xml
         if (wt / "pom.xml").exists():
@@ -427,18 +462,20 @@ class Workspace:
                 mvn_cmd = "./mvnw"
             elif (wt / "mvnw.cmd").exists():
                 mvn_cmd = str(wt / "mvnw.cmd")
+            cmd = [mvn_cmd, "test"]
             try:
                 res = subprocess.run(
-                    [mvn_cmd, "test"],
+                    cmd,
                     cwd=wt,
                     capture_output=True,
                     text=True,
                     encoding="utf-8",
                     errors="replace",
                 )
-                return TestOutcome.PASSED if res.returncode == 0 else TestOutcome.FAILED
-            except Exception:
-                return TestOutcome.FAILED
+                outcome = TestOutcome.PASSED if res.returncode == 0 else TestOutcome.FAILED
+                return self._record_test_run("maven", cmd, res.returncode, res.stdout, res.stderr, outcome)
+            except Exception as e:
+                return self._record_test_run("maven", cmd, -1, "", str(e), TestOutcome.FAILED)
 
         # 5. build.gradle / build.gradle.kts
         if (wt / "build.gradle").exists() or (wt / "build.gradle.kts").exists():
@@ -447,18 +484,20 @@ class Workspace:
                 gradle_cmd = "./gradlew"
             elif (wt / "gradlew.bat").exists():
                 gradle_cmd = str(wt / "gradlew.bat")
+            cmd = [gradle_cmd, "test"]
             try:
                 res = subprocess.run(
-                    [gradle_cmd, "test"],
+                    cmd,
                     cwd=wt,
                     capture_output=True,
                     text=True,
                     encoding="utf-8",
                     errors="replace",
                 )
-                return TestOutcome.PASSED if res.returncode == 0 else TestOutcome.FAILED
-            except Exception:
-                return TestOutcome.FAILED
+                outcome = TestOutcome.PASSED if res.returncode == 0 else TestOutcome.FAILED
+                return self._record_test_run("gradle", cmd, res.returncode, res.stdout, res.stderr, outcome)
+            except Exception as e:
+                return self._record_test_run("gradle", cmd, -1, "", str(e), TestOutcome.FAILED)
 
         # 6. pytest signals
         has_pytest = False
@@ -481,22 +520,26 @@ class Workspace:
             except Exception:
                 pass
 
-
         if has_pytest:
-            res = subprocess.run(
-                [sys.executable, "-m", "pytest", "-q"],
-                cwd=wt,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-            )
-            if res.returncode == 0:
-                return TestOutcome.PASSED
-            elif res.returncode == 5:
-                return TestOutcome.NO_TESTS_COLLECTED
-            else:
-                return TestOutcome.FAILED
+            cmd = [sys.executable, "-m", "pytest", "-q"]
+            try:
+                res = subprocess.run(
+                    cmd,
+                    cwd=wt,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                if res.returncode == 0:
+                    outcome = TestOutcome.PASSED
+                elif res.returncode == 5:
+                    outcome = TestOutcome.NO_TESTS_COLLECTED
+                else:
+                    outcome = TestOutcome.FAILED
+                return self._record_test_run("pytest", cmd, res.returncode, res.stdout, res.stderr, outcome)
+            except Exception as e:
+                return self._record_test_run("pytest", cmd, -1, "", str(e), TestOutcome.FAILED)
 
         # 7. IaC signals
         # Terraform
@@ -508,19 +551,21 @@ class Workspace:
 
         if has_tf:
             if shutil.which("terraform"):
+                cmd = ["terraform", "validate"]
                 try:
                     res = subprocess.run(
-                        ["terraform", "validate"],
+                        cmd,
                         cwd=wt,
                         capture_output=True,
                         text=True,
                         encoding="utf-8",
                         errors="replace",
                     )
-                    return TestOutcome.PASSED if res.returncode == 0 else TestOutcome.FAILED
-                except Exception:
-                    return TestOutcome.FAILED
-            return TestOutcome.NO_TEST_FRAMEWORK
+                    outcome = TestOutcome.PASSED if res.returncode == 0 else TestOutcome.FAILED
+                    return self._record_test_run("terraform", cmd, res.returncode, res.stdout, res.stderr, outcome)
+                except Exception as e:
+                    return self._record_test_run("terraform", cmd, -1, "", str(e), TestOutcome.FAILED)
+            return self._record_test_run("terraform", None, None, "", "", TestOutcome.NO_TEST_FRAMEWORK)
 
         # Ansible
         has_ansible = (
@@ -531,54 +576,60 @@ class Workspace:
         )
         if has_ansible:
             if shutil.which("ansible-lint"):
+                cmd = ["ansible-lint"]
                 try:
                     res = subprocess.run(
-                        ["ansible-lint"],
+                        cmd,
                         cwd=wt,
                         capture_output=True,
                         text=True,
                         encoding="utf-8",
                         errors="replace",
                     )
-                    return TestOutcome.PASSED if res.returncode == 0 else TestOutcome.FAILED
-                except Exception:
-                    return TestOutcome.FAILED
+                    outcome = TestOutcome.PASSED if res.returncode == 0 else TestOutcome.FAILED
+                    return self._record_test_run("ansible", cmd, res.returncode, res.stdout, res.stderr, outcome)
+                except Exception as e:
+                    return self._record_test_run("ansible", cmd, -1, "", str(e), TestOutcome.FAILED)
             elif shutil.which("ansible-playbook"):
                 playbooks = list(wt.glob("playbook*.yml")) + list(wt.glob("playbook*.yaml"))
                 pb_arg = str(playbooks[0]) if playbooks else "."
+                cmd = ["ansible-playbook", "--syntax-check", pb_arg]
                 try:
                     res = subprocess.run(
-                        ["ansible-playbook", "--syntax-check", pb_arg],
+                        cmd,
                         cwd=wt,
                         capture_output=True,
                         text=True,
                         encoding="utf-8",
                         errors="replace",
                     )
-                    return TestOutcome.PASSED if res.returncode == 0 else TestOutcome.FAILED
-                except Exception:
-                    return TestOutcome.FAILED
-            return TestOutcome.NO_TEST_FRAMEWORK
+                    outcome = TestOutcome.PASSED if res.returncode == 0 else TestOutcome.FAILED
+                    return self._record_test_run("ansible", cmd, res.returncode, res.stdout, res.stderr, outcome)
+                except Exception as e:
+                    return self._record_test_run("ansible", cmd, -1, "", str(e), TestOutcome.FAILED)
+            return self._record_test_run("ansible", None, None, "", "", TestOutcome.NO_TEST_FRAMEWORK)
 
         # Helm
         if (wt / "Chart.yaml").exists():
             if shutil.which("helm"):
+                cmd = ["helm", "lint", "."]
                 try:
                     res = subprocess.run(
-                        ["helm", "lint", "."],
+                        cmd,
                         cwd=wt,
                         capture_output=True,
                         text=True,
                         encoding="utf-8",
                         errors="replace",
                     )
-                    return TestOutcome.PASSED if res.returncode == 0 else TestOutcome.FAILED
-                except Exception:
-                    return TestOutcome.FAILED
-            return TestOutcome.NO_TEST_FRAMEWORK
+                    outcome = TestOutcome.PASSED if res.returncode == 0 else TestOutcome.FAILED
+                    return self._record_test_run("helm", cmd, res.returncode, res.stdout, res.stderr, outcome)
+                except Exception as e:
+                    return self._record_test_run("helm", cmd, -1, "", str(e), TestOutcome.FAILED)
+            return self._record_test_run("helm", None, None, "", "", TestOutcome.NO_TEST_FRAMEWORK)
 
         # 8. Fallback
-        return TestOutcome.NO_TESTS_COLLECTED
+        return self._record_test_run(None, None, None, "", "", TestOutcome.NO_TESTS_COLLECTED)
 
 
     @staticmethod
@@ -871,24 +922,48 @@ class Workspace:
                 passed=False,
                 failed_check="build",
                 detail=build_res.detail,
+                checks_run=["build"],
+                checks={
+                    "build": {"ran": True, "passed": False, "detail": build_res.detail},
+                    "tests": {"ran": False, "passed": None},
+                    "scope": {"ran": False, "passed": None},
+                },
+                test_runner_outcome=None,
             )
 
         # 2. run_tests
         test_outcome = self.run_tests()
         diff = self.get_staged_diff()
+        test_run_details = getattr(self, "last_test_run", None)
+
         if test_outcome == TestOutcome.FAILED:
             return MechanicalCheckResult(
                 passed=False,
                 failed_check="tests",
                 detail="Unit tests failed.",
+                checks_run=["build", "tests"],
+                checks={
+                    "build": {"ran": True, "passed": True, "detail": ""},
+                    "tests": {"ran": True, "passed": False, "detail": "Unit tests failed."},
+                    "scope": {"ran": False, "passed": None},
+                },
+                test_runner_outcome=test_run_details,
             )
         elif test_outcome == TestOutcome.NO_TESTS_COLLECTED:
             if subgoal.expects_tests:
                 if not self._is_docs_only_diff(diff):
+                    detail_msg = "No tests collected when expects_tests is True and diff contains code changes."
                     return MechanicalCheckResult(
                         passed=False,
                         failed_check="no_tests_collected",
-                        detail="No tests collected when expects_tests is True and diff contains code changes.",
+                        detail=detail_msg,
+                        checks_run=["build", "tests"],
+                        checks={
+                            "build": {"ran": True, "passed": True, "detail": ""},
+                            "tests": {"ran": True, "passed": False, "detail": detail_msg},
+                            "scope": {"ran": False, "passed": None},
+                        },
+                        test_runner_outcome=test_run_details,
                     )
         elif test_outcome == TestOutcome.NO_TEST_FRAMEWORK:
             pass
@@ -900,6 +975,13 @@ class Workspace:
                 passed=False,
                 failed_check="scope",
                 detail=scope_res.detail,
+                checks_run=["build", "tests", "scope"],
+                checks={
+                    "build": {"ran": True, "passed": True, "detail": ""},
+                    "tests": {"ran": True, "passed": True, "detail": ""},
+                    "scope": {"ran": True, "passed": False, "detail": scope_res.detail},
+                },
+                test_runner_outcome=test_run_details,
             )
 
         untested_flag = (
@@ -919,5 +1001,12 @@ class Workspace:
             passed=True,
             failed_check=None,
             detail=untested_flag,
+            checks_run=["build", "tests", "scope"],
+            checks={
+                "build": {"ran": True, "passed": True, "detail": ""},
+                "tests": {"ran": True, "passed": True, "detail": untested_flag or "passed"},
+                "scope": {"ran": True, "passed": True, "detail": ""},
+            },
+            test_runner_outcome=test_run_details,
         )
 

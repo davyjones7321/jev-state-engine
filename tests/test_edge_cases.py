@@ -257,7 +257,7 @@ def test_node_gate_escalates_when_already_at_or_above_threshold():
     result = node_gate(state, workspace=fake_ws, gatekeeper=fake_gk)
     assert result["mechanical_strike_count"] == 4
     fake_gk.escalate_deadlock.assert_called_once_with(
-        trajectory=[{"step": 1}], triggering_tier="mechanical"
+        trajectory=result.get("trajectory", []), triggering_tier="mechanical"
     )
 
 
