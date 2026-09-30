@@ -312,6 +312,9 @@ def test_verify_ticket_sends_investigation_notes_in_payload():
         assert "state" in payload
         assert payload["state"].get("investigation_notes") == "Project uses Next.js App Router in src/app."
         assert verdict.valid is True
+        instructions = payload["questions"]["valid"]["instructions"]
+        assert "investigation notes" in instructions.lower()
+        assert "already satisfied" in instructions.lower()
 
 
 # 34. test_verify_ticket_instructions_clarifies_untested_pass
@@ -330,6 +333,42 @@ def test_verify_ticket_instructions_clarifies_untested_pass():
         payload = mock_post.call_args.kwargs.get("json", {})
         instructions = payload["questions"]["valid"]["instructions"]
         assert "untested pass" in instructions.lower()
+        assert "completely resolve the ticket" in instructions.lower()
+
+
+# 35. test_verify_ticket_instructions_contextual_when_investigation_notes_present
+def test_verify_ticket_instructions_contextual_when_investigation_notes_present():
+    """Assert Gatekeeper.verify_ticket uses contextual instructions when notes are present vs baseline when empty."""
+    gk = Gatekeeper(api_url="https://api.typesafe.ai/v1/systemone", api_key="test_key")
+    mock_resp = httpx.Response(200, json={"answers": {"valid": {"noul": 0.90}}})
+
+    # Case A: Notes present -> contextual
+    with patch.object(gk.client, "post", return_value=mock_resp) as mock_post:
+        gk.verify_ticket(
+            ticket="Add footer",
+            final_diff="+footer",
+            test_output="NO_TESTS_COLLECTED (Untested pass)",
+            investigation_notes="Contact page already exists in src/app/contact/page.tsx",
+        )
+        payload = mock_post.call_args.kwargs.get("json", {})
+        inst = payload["questions"]["valid"]["instructions"]
+        assert "considering the investigation notes regarding what parts of the ticket were already satisfied" in inst.lower()
+        assert "does the final diff complete the remaining requirements" in inst.lower()
+        assert "untested pass" in inst.lower()
+
+    # Case B: Whitespace-only notes -> baseline fallback
+    with patch.object(gk.client, "post", return_value=mock_resp) as mock_post:
+        gk.verify_ticket(
+            ticket="Add footer",
+            final_diff="+footer",
+            test_output="NO_TESTS_COLLECTED (Untested pass)",
+            investigation_notes="   \n   ",
+        )
+        payload = mock_post.call_args.kwargs.get("json", {})
+        inst = payload["questions"]["valid"]["instructions"]
+        assert "does the final diff completely resolve the ticket" in inst.lower()
+        assert "untested pass" in inst.lower()
+
 
 
 

@@ -201,17 +201,27 @@ class Gatekeeper:
         }
         if investigation_notes:
             state["investigation_notes"] = investigation_notes
+        if investigation_notes and investigation_notes.strip():
+            instructions = (
+                "Considering the investigation notes regarding what parts of the ticket were already satisfied "
+                "in the repository, does the final diff complete the remaining requirements of the ticket, and does "
+                "the test output satisfy verification requirements (allowing an untested pass if the ticket does not "
+                "require automated tests)?"
+            )
+        else:
+            instructions = (
+                "Does the final diff completely resolve the ticket, and does the test output "
+                "satisfy verification requirements (allowing an untested pass if the ticket "
+                "does not require automated tests)?"
+            )
+
         payload = {
             "model": "jev-latest",
             "state": state,
             "questions": {
                 "valid": {
                     "type": "noul",
-                    "instructions": (
-                        "Does the final diff completely resolve the ticket, and does the test output "
-                        "satisfy verification requirements (allowing an untested pass if the ticket "
-                        "does not require automated tests)?"
-                    ),
+                    "instructions": instructions,
                 }
             },
         }

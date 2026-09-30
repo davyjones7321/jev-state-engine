@@ -421,3 +421,24 @@ def test_node_implement_omitted_notes_and_ticket_safe():
     assert "Investigation Notes (Project Architecture & Conventions):" not in prompt_text
     assert res.get("gate_status") is None
 
+
+# 13. Verify node_implement prompt includes export/import convention instructions
+def test_node_implement_includes_export_convention_instruction():
+    ws = MockWorkspace()
+    subgoal = Subgoal(description="Create Footer", scope=["src/components/Footer.tsx"], expects_tests=False)
+    state: State = {
+        "current_subgoal": subgoal,
+        "trajectory": [],
+    }
+    turn_resp = AIMessage(
+        content="Submitting",
+        tool_calls=[{"name": "submit_subgoal", "args": {}, "id": "c1"}],
+    )
+    fake_llm = ScriptedChatModel(responses=[turn_resp])
+    node_implement(state, workspace=ws, llm=fake_llm)
+
+    assert len(fake_llm.invocations) == 1
+    prompt_text = fake_llm.invocations[0][0].content
+    assert "export and import conventions" in prompt_text.lower()
+
+

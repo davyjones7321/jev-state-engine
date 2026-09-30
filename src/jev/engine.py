@@ -1311,9 +1311,10 @@ def node_implement(
         prompt_lines.append(
             "Instructions:\n"
             "1. Strictly adhere to the project architecture, dependencies, styling conventions, and existing component patterns documented in the Investigation Notes. Do not introduce uninstalled libraries or conflicting layout structures (e.g. do not create redundant headers or navbars if layout.tsx or a global component already provides them).\n"
-            "2. Stage all necessary code changes using the `stage_file_mutation` tool.\n"
+            "2. When creating or modifying UI components, align with the project's export and import conventions (e.g. if root layouts and surrounding components use default exports such as `export default function Component`, provide default exports so default imports resolve cleanly).\n"
+            "3. Stage all necessary code changes using the `stage_file_mutation` tool.\n"
             "   Only mutate files within the declared scope.\n"
-            "3. When all changes are staged and you are done, call the `submit_subgoal` tool to submit your work for gate verification."
+            "4. When all changes are staged and you are done, call the `submit_subgoal` tool to submit your work for gate verification."
         )
         prompt_text = "\n\n".join(prompt_lines)
 
