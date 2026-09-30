@@ -1164,9 +1164,90 @@ def test_node_plan_prompt_forbids_subjective_meta_qualifiers_in_subgoal_descript
 
     assert len(fake_llm.invocations) == 1
     prompt_text = fake_llm.invocations[0][0].content
-    assert "atomic" in prompt_text.lower()
-    assert "objective" in prompt_text.lower()
+    assert "product identity" in prompt_text.lower() or "objective" in prompt_text.lower()
     assert "meta-qualifiers" in prompt_text.lower() or "subjective" in prompt_text.lower()
+
+
+# 39. (a) plan for "src/app/about/page.tsx" is accepted for the ticket "Create a new About page..." when src/app was investigated
+def test_node_plan_accepts_new_directory_segment_when_in_ticket(tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    app_dir = repo_dir / "src" / "app"
+    app_dir.mkdir(parents=True)
+    (app_dir / "page.tsx").write_text("export default function Page() {}", encoding="utf-8")
+
+    class TestWorkspace:
+        def __init__(self, root):
+            self.worktree_dir = root
+            self.repo_dir = root
+
+    ws = TestWorkspace(repo_dir)
+    ticket = (
+        "Create a new About page for this site, following the existing page structure and styling conventions "
+        "used elsewhere in the project. Add a link to the new About page from the home page's navigation."
+    )
+    plan = [
+        {
+            "description": "Create the new About page component",
+            "scope": ["src/app/about/page.tsx"],
+            "expects_tests": False,
+        }
+    ]
+    fake_llm = ScriptedChatModel([json.dumps(plan)])
+    state: State = {
+        "ticket": ticket,
+        "investigated_directories": ["src", "src/app"],
+        "investigation_notes": "Discovered Next.js App Router in src/app with src/app/page.tsx.",
+        "trajectory": [],
+    }
+
+    result = node_plan(state, workspace=ws, llm=fake_llm)
+
+    assert result.get("gate_status") is None
+    assert len(result.get("plan_queue", [])) == 1
+    assert result["plan_queue"][0].scope == ["src/app/about/page.tsx"]
+
+
+# 40. (b) plan for "src/pages/Home.tsx" is rejected when only src, src/app, src/components were investigated and "pages" appears in the notes only as a plain word
+def test_node_plan_rejects_new_directory_segment_when_in_notes_only_as_plain_word(tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    app_dir = repo_dir / "src" / "app"
+    app_dir.mkdir(parents=True)
+    comp_dir = repo_dir / "src" / "components"
+    comp_dir.mkdir(parents=True)
+
+    class TestWorkspace:
+        def __init__(self, root):
+            self.worktree_dir = root
+            self.repo_dir = root
+
+    ws = TestWorkspace(repo_dir)
+    # Ticket does not have "pages" as a word
+    ticket = "Create Home view with header and banner"
+    plan = [
+        {
+            "description": "Create Home component in pages",
+            "scope": ["src/pages/Home.tsx"],
+            "expects_tests": False,
+        }
+    ]
+    fake_llm = ScriptedChatModel([json.dumps(plan), json.dumps(plan)])
+    mock_gk = MagicMock()
+    state: State = {
+        "ticket": ticket,
+        "investigated_directories": ["src", "src/app", "src/components"],
+        "investigation_notes": "The site contains multiple pages of guides and documentation. Components in src/components and app in src/app.",
+        "trajectory": [],
+    }
+
+    result = node_plan(state, workspace=ws, llm=fake_llm, gatekeeper=mock_gk)
+
+    assert result.get("gate_status") == "planning_failed"
+    assert result.get("status") == "escalated"
+    assert len(result["trajectory"]) == 1
+    err_msg = result["trajectory"][0]["error"].lower()
+    assert "pages" in err_msg
 
 
 

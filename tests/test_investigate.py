@@ -722,6 +722,192 @@ def test_node_investigate_includes_domain_discovery_instruction():
     assert "business domain" in prompt_text.lower()
 
 
+# 25. (c) a nonexistent directory that failed list_dir is not recorded as investigated
+def test_node_investigate_nonexistent_directory_failed_list_dir_not_recorded(tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    src_dir = repo_dir / "src"
+    src_dir.mkdir()
+
+    class RealWS:
+        def __init__(self, root):
+            self.worktree_dir = root
+            self.repo_dir = root
+
+    ws = RealWS(repo_dir)
+    state: State = {"ticket": "Investigate repo", "trajectory": []}
+
+    turn_1 = AIMessage(
+        content="List real dir and nonexistent dir",
+        tool_calls=[
+            {"name": "list_dir", "args": {"path": "src"}, "id": "c1"},
+            {"name": "list_dir", "args": {"path": "nonexistent_folder"}, "id": "c2"},
+        ],
+    )
+    turn_2 = AIMessage(
+        content="Finish",
+        tool_calls=[{"name": "finish_investigation", "args": {"summary": "Done"}, "id": "c3"}],
+    )
+    fake_llm = ScriptedChatModel(responses=[turn_1, turn_2])
+
+    result = node_investigate(state, workspace=ws, llm=fake_llm)
+
+    assert "investigated_directories" in result
+    inv_dirs = result["investigated_directories"]
+    assert "src" in inv_dirs
+    assert "nonexistent_folder" not in inv_dirs
+
+    # Also verify when workspace.list_dir returns "does not exist"
+    class CustomWS:
+        def __init__(self):
+            self.repo_dir = repo_dir
+            self.worktree_dir = repo_dir
+        def list_dir(self, path):
+            if path == "custom_missing":
+                return "Directory does not exist: custom_missing"
+            return "file.txt"
+
+    ws_custom = CustomWS()
+    turn_custom_1 = AIMessage(
+        content="List custom missing",
+        tool_calls=[{"name": "list_dir", "args": {"path": "custom_missing"}, "id": "c4"}],
+    )
+    turn_custom_2 = AIMessage(
+        content="Finish",
+        tool_calls=[{"name": "finish_investigation", "args": {"summary": "Done"}, "id": "c5"}],
+    )
+    fake_llm_custom = ScriptedChatModel(responses=[turn_custom_1, turn_custom_2])
+    res_custom = node_investigate(state.copy(), workspace=ws_custom, llm=fake_llm_custom)
+    assert "custom_missing" not in res_custom["investigated_directories"]
+
+
+# 26. (a) read_file of an existing file whose content contains the words "not found" still records its directory
+def test_node_investigate_read_file_content_with_not_found_records_directory(tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    api_dir = repo_dir / "src" / "api"
+    api_dir.mkdir(parents=True)
+    booking_file = api_dir / "bookings.ts"
+    booking_file.write_text('export function getBooking() { return "Booking not found"; }', encoding="utf-8")
+
+    class RealWS:
+        def __init__(self, root):
+            self.worktree_dir = root
+            self.repo_dir = root
+
+    ws = RealWS(repo_dir)
+    state: State = {"ticket": "Investigate bookings", "trajectory": []}
+    turn_1 = AIMessage(
+        content="Read bookings file",
+        tool_calls=[{"name": "read_file", "args": {"path": "src/api/bookings.ts"}, "id": "c1"}],
+    )
+    turn_2 = AIMessage(
+        content="Finish",
+        tool_calls=[{"name": "finish_investigation", "args": {"summary": "Done"}, "id": "c2"}],
+    )
+    fake_llm = ScriptedChatModel(responses=[turn_1, turn_2])
+    result = node_investigate(state, workspace=ws, llm=fake_llm)
+
+    assert "investigated_directories" in result
+    assert "src/api" in result["investigated_directories"]
+
+
+# 27. (b) list_dir of a directory containing a file named not-found.tsx still records that directory
+def test_node_investigate_list_dir_with_not_found_file_records_directory(tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    app_dir = repo_dir / "src" / "app"
+    app_dir.mkdir(parents=True)
+    (app_dir / "not-found.tsx").write_text("export default function NotFound() { return <div>404</div>; }", encoding="utf-8")
+
+    class RealWS:
+        def __init__(self, root):
+            self.worktree_dir = root
+            self.repo_dir = root
+
+    ws = RealWS(repo_dir)
+    state: State = {"ticket": "Investigate app router", "trajectory": []}
+    turn_1 = AIMessage(
+        content="List app dir",
+        tool_calls=[{"name": "list_dir", "args": {"path": "src/app"}, "id": "c1"}],
+    )
+    turn_2 = AIMessage(
+        content="Finish",
+        tool_calls=[{"name": "finish_investigation", "args": {"summary": "Done"}, "id": "c2"}],
+    )
+    fake_llm = ScriptedChatModel(responses=[turn_1, turn_2])
+    result = node_investigate(state, workspace=ws, llm=fake_llm)
+
+    assert "investigated_directories" in result
+    assert "src/app" in result["investigated_directories"]
+
+
+# 28. (c) list_dir of a nonexistent directory does not record it
+def test_node_investigate_list_dir_nonexistent_directory_not_recorded(tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    (repo_dir / "src").mkdir()
+
+    class RealWS:
+        def __init__(self, root):
+            self.worktree_dir = root
+            self.repo_dir = root
+
+    ws = RealWS(repo_dir)
+    state: State = {"ticket": "Investigate repo", "trajectory": []}
+    turn_1 = AIMessage(
+        content="List nonexistent dir",
+        tool_calls=[{"name": "list_dir", "args": {"path": "src/missing_subfolder"}, "id": "c1"}],
+    )
+    turn_2 = AIMessage(
+        content="Finish",
+        tool_calls=[{"name": "finish_investigation", "args": {"summary": "Done"}, "id": "c2"}],
+    )
+    fake_llm = ScriptedChatModel(responses=[turn_1, turn_2])
+    result = node_investigate(state, workspace=ws, llm=fake_llm)
+
+    assert "investigated_directories" in result
+    assert "src/missing_subfolder" not in result["investigated_directories"]
+
+
+# 29. (d) grep with a path passes that path to the grep tool
+def test_node_investigate_grep_with_path_passes_path_to_grep_tool(tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    services_dir = repo_dir / "src" / "services"
+    services_dir.mkdir(parents=True)
+    auth_file = services_dir / "auth.py"
+    auth_file.write_text("API_KEY = 'secret'", encoding="utf-8")
+
+    grep_calls = []
+
+    class GrepTrackingWS:
+        def __init__(self, root):
+            self.worktree_dir = root
+            self.repo_dir = root
+
+        def grep(self, query: str, path: Optional[str] = None) -> str:
+            grep_calls.append((query, path))
+            return "auth.py:1:API_KEY = 'secret'"
+
+    ws = GrepTrackingWS(repo_dir)
+    state: State = {"ticket": "Find API key", "trajectory": []}
+    turn_1 = AIMessage(
+        content="Grep in services",
+        tool_calls=[{"name": "grep", "args": {"query": "API_KEY", "path": "src/services"}, "id": "c1"}],
+    )
+    turn_2 = AIMessage(
+        content="Finish",
+        tool_calls=[{"name": "finish_investigation", "args": {"summary": "Found"}, "id": "c2"}],
+    )
+    fake_llm = ScriptedChatModel(responses=[turn_1, turn_2])
+    result = node_investigate(state, workspace=ws, llm=fake_llm)
+
+    assert len(grep_calls) == 1
+    assert grep_calls[0] == ("API_KEY", "src/services")
+    assert "src/services" in result["investigated_directories"]
+
+
 
 
 

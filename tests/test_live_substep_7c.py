@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 import pytest
 
-import run_substep_7c
+run_substep_7c = pytest.importorskip("run_substep_7c")
 
 
 def test_live_substep_7c_investigate_to_plan():

@@ -375,6 +375,8 @@ def node_investigate(
     finished = False
     investigation_summary = ""
     executed_tools: List[Dict[str, Any]] = []
+    raw_worktree = getattr(workspace, "worktree_dir", None) or getattr(workspace, "repo_dir", None)
+    workspace_root: Optional[Path] = Path(raw_worktree).resolve() if raw_worktree else None
 
     # Bind strictly READ-ONLY tools (State 1 constraint)
     @tool
@@ -611,25 +613,62 @@ def node_investigate(
                 result = "Investigation finished."
             elif name == "read_file":
                 actual_path = args.get("path") or args.get("file_path") or args.get("filename") or ""
-                p_parent = Path(actual_path).parent.as_posix().lstrip("./")
-                investigated_dirs.add(p_parent if p_parent else ".")
-                result = read_file.invoke({"path": actual_path}) if hasattr(read_file, "invoke") else read_file(actual_path)
+                try:
+                    result = read_file.invoke({"path": actual_path}) if hasattr(read_file, "invoke") else read_file(actual_path)
+                except Exception as e:
+                    result = f"Error reading file {actual_path}: {e}"
+
+                if workspace_root is not None and actual_path:
+                    try:
+                        p = Path(actual_path)
+                        target = (workspace_root / p).resolve() if not p.is_absolute() else p.resolve()
+                        target.relative_to(workspace_root)
+                        if target.is_file():
+                            parent = target.parent.relative_to(workspace_root).as_posix().lstrip("./")
+                            investigated_dirs.add(parent if parent else ".")
+                    except Exception:
+                        pass
             elif name == "list_dir":
                 actual_path = args.get("path") or args.get("directory") or args.get("dir_path") or "."
-                clean_dir = Path(actual_path).as_posix().lstrip("./")
-                investigated_dirs.add(clean_dir if clean_dir else ".")
-                result = list_dir.invoke({"path": actual_path}) if hasattr(list_dir, "invoke") else list_dir(actual_path)
+                try:
+                    result = list_dir.invoke({"path": actual_path}) if hasattr(list_dir, "invoke") else list_dir(actual_path)
+                except Exception as e:
+                    result = f"Error listing directory {actual_path}: {e}"
+
+                if workspace_root is not None:
+                    try:
+                        p = Path(actual_path)
+                        target = (workspace_root / p).resolve() if not p.is_absolute() else p.resolve()
+                        target.relative_to(workspace_root)
+                        if target.is_dir():
+                            clean_dir = target.relative_to(workspace_root).as_posix().lstrip("./")
+                            investigated_dirs.add(clean_dir if clean_dir else ".")
+                    except Exception:
+                        pass
             elif name == "grep":
                 actual_query = args.get("query") or args.get("pattern") or args.get("search_term") or ""
                 actual_path = args.get("path") or args.get("directory") or args.get("file_path")
-                if actual_path:
-                    g_path = Path(actual_path)
-                    g_parent = g_path.parent.as_posix().lstrip("./") if g_path.suffix else g_path.as_posix().lstrip("./")
-                    investigated_dirs.add(g_parent if g_parent else ".")
                 call_args = {"query": actual_query}
                 if actual_path:
                     call_args["path"] = actual_path
-                result = grep.invoke(call_args) if hasattr(grep, "invoke") else grep(actual_query, actual_path)
+                try:
+                    result = grep.invoke(call_args) if hasattr(grep, "invoke") else grep(actual_query, actual_path)
+                except Exception as e:
+                    result = f"Error running grep: {e}"
+
+                if workspace_root is not None and actual_path:
+                    try:
+                        p = Path(actual_path)
+                        target = (workspace_root / p).resolve() if not p.is_absolute() else p.resolve()
+                        target.relative_to(workspace_root)
+                        if target.is_dir():
+                            clean_dir = target.relative_to(workspace_root).as_posix().lstrip("./")
+                            investigated_dirs.add(clean_dir if clean_dir else ".")
+                        elif target.is_file():
+                            parent = target.parent.relative_to(workspace_root).as_posix().lstrip("./")
+                            investigated_dirs.add(parent if parent else ".")
+                    except Exception:
+                        pass
             else:
                 result = f"Error: Tool '{name}' is not permitted in investigation state. Only read-only tools (list_dir, grep, read_file, finish_investigation) are available."
 
@@ -838,6 +877,24 @@ def _matches_candidate(scope_path: str, candidates: List[str], base_dir: Optiona
     return False
 
 
+def _segment_in_notes_path(segment: str, notes: str) -> bool:
+    """Check if a directory segment appears in investigation notes as part of a path string
+
+    (a token containing '/'), not just as an ordinary word in prose.
+    """
+    if not notes or not segment:
+        return False
+    seg_lower = segment.lower()
+    tokens = re.findall(r'[^\s`"\'()<>\[\]{}]+', notes)
+    for raw_token in tokens:
+        cleaned = raw_token.strip(".,:;!?'\"`").replace("\\", "/")
+        if "/" in cleaned:
+            parts = [p.lower() for p in cleaned.split("/") if p]
+            if seg_lower in parts:
+                return True
+    return False
+
+
 def _check_single_subgoal_grounding(
     subgoal: Subgoal,
     workspace: Optional[Any],
@@ -963,9 +1020,8 @@ def _check_single_subgoal_grounding(
             if not parent_dir_allowed:
                 if (
                     parent_dir.lower() in ticket_lower
-                    or parent_dir.lower() in notes_lower
                     or cleaned_path.lower() in ticket_lower
-                    or cleaned_path.lower() in notes_lower
+                    or _segment_in_notes_path(parent_dir, investigation_notes)
                 ):
                     parent_dir_allowed = True
 
@@ -974,6 +1030,49 @@ def _check_single_subgoal_grounding(
                     "status": "rejected",
                     "reason": f"Scope proposes creating files under '{parent_dir}/', but investigation only found {sorted(list(inv_dirs))} -- this repository does not use a {parent_dir} directory structure",
                 }
+
+            # New rule for new files (files that do not exist on disk), applied to every directory segment that does not already exist on disk:
+            # - The new directory segment(s) must appear in the ticket text as a word, OR appear in the investigation notes as part of a path string (a token containing "/"), not just as an ordinary word in prose.
+            # - Otherwise return status "rejected" with a reason naming the new directory.
+            # - Keep it ecosystem-neutral: no special-casing of Next.js, "pages", "app" or any framework.
+            if parent_dir and parent_dir != ".":
+                segments = [seg for seg in parent_dir.split("/") if seg and seg != "."]
+                for i in range(len(segments)):
+                    current_prefix_path = "/".join(segments[: i + 1])
+                    current_segment = segments[i]
+
+                    # Check if this prefix path already exists on disk
+                    prefix_already_exists = False
+                    if base_dir is not None:
+                        try:
+                            target_dir = (base_dir / current_prefix_path).resolve()
+                            prefix_already_exists = target_dir.exists() and target_dir.is_dir()
+                        except Exception:
+                            prefix_already_exists = False
+
+                    if not prefix_already_exists and inv_dirs:
+                        if current_prefix_path in inv_dirs or any(
+                            d == current_prefix_path or d.startswith(current_prefix_path + "/")
+                            for d in inv_dirs
+                            if d not in ("", ".")
+                        ):
+                            prefix_already_exists = True
+
+                    if not prefix_already_exists:
+                        seg_in_ticket = bool(
+                            re.search(r"\b" + re.escape(current_segment) + r"\b", ticket, re.IGNORECASE)
+                        )
+                        seg_in_notes_path = _segment_in_notes_path(current_segment, investigation_notes)
+
+                        if not (seg_in_ticket or seg_in_notes_path):
+                            return {
+                                "status": "rejected",
+                                "reason": (
+                                    f"Scope proposes creating file under new directory segment '{current_segment}' "
+                                    f"('{current_prefix_path}'), which does not exist on disk, does not appear in the ticket "
+                                    f"text as a word, and does not appear in investigation notes as a path string."
+                                ),
+                            }
 
         # 2. Check if file path, filename, or meaningful stem is explicitly present in notes or ticket
         if in_notes or in_ticket:
