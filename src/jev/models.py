@@ -12,6 +12,14 @@ class TestOutcome(str, Enum):
     NO_TEST_FRAMEWORK = "NO_TEST_FRAMEWORK"
 
 
+class CompileOutcome(str, Enum):
+    PASSED = "PASSED"
+    FAILED = "FAILED"
+    EXEMPT = "EXEMPT"
+    NO_COMPILE_COMMAND = "NO_COMPILE_COMMAND"
+    ENV_NOT_READY = "ENV_NOT_READY"
+
+
 class Subgoal(BaseModel):
     description: str = ""
     scope: List[str] = Field(default_factory=list)
@@ -20,11 +28,12 @@ class Subgoal(BaseModel):
 
 class MechanicalCheckResult(BaseModel):
     passed: bool
-    failed_check: Optional[str] = None  # "build" | "tests" | "no_tests_collected" | "scope"
+    failed_check: Optional[str] = None  # "build" | "compile" | "no_compile_command" | "env_not_ready" | "tests" | "no_tests_collected" | "scope"
     detail: str = ""
     checks_run: List[str] = Field(default_factory=list)
     checks: Dict[str, Any] = Field(default_factory=dict)
     test_runner_outcome: Optional[Dict[str, Any]] = None
+    compile_outcome: Optional[Dict[str, Any]] = None
 
 
 class ValidationVerdict(BaseModel):

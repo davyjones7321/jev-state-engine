@@ -6,12 +6,35 @@ import shutil
 import stat
 import subprocess
 import sys
+import uuid
+from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from pydantic import BaseModel, Field
 
-from jev.models import MechanicalCheckResult, Subgoal, TestOutcome
+from jev.models import CompileOutcome, MechanicalCheckResult, Subgoal, TestOutcome
+
+
+@dataclass(frozen=True)
+class DiagnosticError:
+    raw_line: str
+    file: str
+    code: str
+    message: str
+    line: Optional[int] = None
+    column: Optional[int] = None
+
+    @property
+    def key(self) -> tuple[str, str, str]:
+        return (self.file, self.code, self.message)
+
+    def __getitem__(self, item: str) -> Any:
+        return getattr(self, item)
+
+    def __iter__(self):
+        return iter((self.file, self.code, self.message))
 
 
 class BuildCheckResult(BaseModel):
@@ -31,6 +54,301 @@ class ScopeCheckResult(BaseModel):
         return self.passed
 
 
+def _is_junction_or_symlink(path: Path) -> bool:
+    if not path.exists() and not path.is_symlink():
+        return False
+    if path.is_symlink():
+        return True
+    if sys.platform == "win32":
+        try:
+            st = os.stat(str(path), follow_symlinks=False)
+            if hasattr(st, "st_file_attributes") and (st.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+ALL_SOURCE_EXTENSIONS = {
+    ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
+    ".go",
+    ".rs",
+    ".java", ".kt",
+    ".py",
+}
+
+
+class BaseCompileHandler:
+    name: str = ""
+    source_extensions: set[str] = set()
+
+    def matches(self, touched_files: set[str], wt: Path, repo_dir: Path) -> bool:
+        return any(Path(f).suffix.lower() in self.source_extensions for f in touched_files)
+
+    def prepare_and_get_command(
+        self, wt: Path, repo_dir: Path, touched_files: List[str]
+    ) -> tuple[Optional[List[str]], Optional[CompileOutcome], str]:
+        raise NotImplementedError
+
+    def run_command(
+        self,
+        cmd: List[str],
+        cwd: Path,
+        touched_files: List[str],
+        is_base: bool = False,
+        base_commit: Optional[str] = None,
+        timeout: Optional[int] = 120,
+    ) -> tuple[int, str, str]:
+        exec_cmd = cmd
+        if cmd:
+            resolved = shutil.which(cmd[0])
+            if resolved:
+                exec_cmd = [resolved] + cmd[1:]
+        res = subprocess.run(
+            exec_cmd,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
+        return res.returncode, res.stdout, res.stderr
+
+
+class JsTsCompileHandler(BaseCompileHandler):
+    name = "js_ts"
+    source_extensions = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}
+
+    def matches(self, touched_files: set[str], wt: Path, repo_dir: Path) -> bool:
+        has_ext = any(Path(f).suffix.lower() in self.source_extensions for f in touched_files)
+        has_manifest = (
+            (wt / "package.json").exists()
+            or (repo_dir / "package.json").exists()
+            or (wt / "tsconfig.json").exists()
+            or (repo_dir / "tsconfig.json").exists()
+        )
+        return has_ext and has_manifest
+
+    def prepare_and_get_command(
+        self, wt: Path, repo_dir: Path, touched_files: List[str]
+    ) -> tuple[Optional[List[str]], Optional[CompileOutcome], str]:
+        if (wt / "yarn.lock").exists() or (repo_dir / "yarn.lock").exists():
+            pm = "yarn"
+        elif (wt / "pnpm-lock.yaml").exists() or (repo_dir / "pnpm-lock.yaml").exists():
+            pm = "pnpm"
+        else:
+            pm = "npm"
+
+        pkg_json_path = wt / "package.json"
+        if not pkg_json_path.exists():
+            pkg_json_path = repo_dir / "package.json"
+
+        scripts = {}
+        if pkg_json_path.exists():
+            try:
+                pkg_data = json.loads(pkg_json_path.read_text(encoding="utf-8", errors="replace"))
+                if isinstance(pkg_data, dict):
+                    scripts = pkg_data.get("scripts") or {}
+            except Exception:
+                pass
+
+        has_tsconfig = (wt / "tsconfig.json").exists() or (repo_dir / "tsconfig.json").exists()
+        has_typecheck = "typecheck" in scripts
+        has_build = "build" in scripts
+
+        # Can a compile command be determined?
+        if not has_typecheck and not has_tsconfig and not has_build:
+            return None, CompileOutcome.NO_COMPILE_COMMAND, "No compile command found: package.json has no 'typecheck' or 'build' script, and no tsconfig.json exists."
+
+        # A compile command can be determined! Check if dependencies are ready:
+        has_nm = (
+            (wt / "node_modules").exists()
+            or (repo_dir / "node_modules").exists()
+            or _is_junction_or_symlink(wt / "node_modules")
+            or _is_junction_or_symlink(repo_dir / "node_modules")
+        )
+        if not has_nm:
+            return None, CompileOutcome.ENV_NOT_READY, "Environment not ready: node_modules is missing in repository root. Please install dependencies before running."
+
+        if "typecheck" in scripts:
+            return [pm, "run", "typecheck"], None, ""
+
+        if has_tsconfig:
+            tsc_bin = None
+            for candidate in [
+                wt / "node_modules" / ".bin" / ("tsc.cmd" if sys.platform == "win32" else "tsc"),
+                repo_dir / "node_modules" / ".bin" / ("tsc.cmd" if sys.platform == "win32" else "tsc"),
+            ]:
+                if candidate.exists():
+                    tsc_bin = str(candidate)
+                    break
+            if not tsc_bin:
+                tsc_which = shutil.which("tsc")
+                if tsc_which:
+                    tsc_bin = tsc_which
+
+            if tsc_bin:
+                return [tsc_bin, "--noEmit"], None, ""
+            if shutil.which("npx"):
+                return ["npx", "tsc", "--noEmit"], None, ""
+            return ["tsc", "--noEmit"], None, ""
+
+        if "build" in scripts:
+            return [pm, "run", "build"], None, ""
+
+        return None, CompileOutcome.NO_COMPILE_COMMAND, "No compile command found: package.json has no 'typecheck' or 'build' script, and no tsconfig.json exists."
+
+
+class GoCompileHandler(BaseCompileHandler):
+    name = "go"
+    source_extensions = {".go"}
+
+    def prepare_and_get_command(
+        self, wt: Path, repo_dir: Path, touched_files: List[str]
+    ) -> tuple[Optional[List[str]], Optional[CompileOutcome], str]:
+        if not (wt / "go.mod").exists() and not (repo_dir / "go.mod").exists():
+            return None, CompileOutcome.NO_COMPILE_COMMAND, "No go.mod found for Go source files."
+        return ["go", "build", "./..."], None, ""
+
+
+class RustCompileHandler(BaseCompileHandler):
+    name = "rust"
+    source_extensions = {".rs"}
+
+    def prepare_and_get_command(
+        self, wt: Path, repo_dir: Path, touched_files: List[str]
+    ) -> tuple[Optional[List[str]], Optional[CompileOutcome], str]:
+        if not (wt / "Cargo.toml").exists() and not (repo_dir / "Cargo.toml").exists():
+            return None, CompileOutcome.NO_COMPILE_COMMAND, "No Cargo.toml found for Rust source files."
+        return ["cargo", "check"], None, ""
+
+
+class MavenCompileHandler(BaseCompileHandler):
+    name = "maven"
+    source_extensions = {".java", ".kt"}
+
+    def matches(self, touched_files: set[str], wt: Path, repo_dir: Path) -> bool:
+        has_ext = any(Path(f).suffix.lower() in self.source_extensions for f in touched_files)
+        return has_ext and ((wt / "pom.xml").exists() or (repo_dir / "pom.xml").exists())
+
+    def prepare_and_get_command(
+        self, wt: Path, repo_dir: Path, touched_files: List[str]
+    ) -> tuple[Optional[List[str]], Optional[CompileOutcome], str]:
+        mvn_cmd = "mvn"
+        if (wt / "mvnw").exists():
+            mvn_cmd = "./mvnw"
+        elif (wt / "mvnw.cmd").exists():
+            mvn_cmd = str(wt / "mvnw.cmd")
+        elif (repo_dir / "mvnw").exists():
+            mvn_cmd = "./mvnw"
+        elif (repo_dir / "mvnw.cmd").exists():
+            mvn_cmd = str(repo_dir / "mvnw.cmd")
+        return [mvn_cmd, "-q", "compile"], None, ""
+
+
+class GradleCompileHandler(BaseCompileHandler):
+    name = "gradle"
+    source_extensions = {".java", ".kt"}
+
+    def matches(self, touched_files: set[str], wt: Path, repo_dir: Path) -> bool:
+        has_ext = any(Path(f).suffix.lower() in self.source_extensions for f in touched_files)
+        has_gradle = (
+            (wt / "build.gradle").exists()
+            or (wt / "build.gradle.kts").exists()
+            or (repo_dir / "build.gradle").exists()
+            or (repo_dir / "build.gradle.kts").exists()
+        )
+        return has_ext and has_gradle
+
+    def prepare_and_get_command(
+        self, wt: Path, repo_dir: Path, touched_files: List[str]
+    ) -> tuple[Optional[List[str]], Optional[CompileOutcome], str]:
+        gradle_cmd = "gradle"
+        if (wt / "gradlew").exists():
+            gradle_cmd = "./gradlew"
+        elif (wt / "gradlew.bat").exists():
+            gradle_cmd = str(wt / "gradlew.bat")
+        elif (repo_dir / "gradlew").exists():
+            gradle_cmd = "./gradlew"
+        elif (repo_dir / "gradlew.bat").exists():
+            gradle_cmd = str(repo_dir / "gradlew.bat")
+        return [gradle_cmd, "classes", "-q"], None, ""
+
+
+class JavaKotlinFallbackHandler(BaseCompileHandler):
+    name = "java_kotlin"
+    source_extensions = {".java", ".kt"}
+
+    def prepare_and_get_command(
+        self, wt: Path, repo_dir: Path, touched_files: List[str]
+    ) -> tuple[Optional[List[str]], Optional[CompileOutcome], str]:
+        return None, CompileOutcome.NO_COMPILE_COMMAND, "No Maven (pom.xml) or Gradle (build.gradle) build file found for Java/Kotlin source changes."
+
+
+class PythonCompileHandler(BaseCompileHandler):
+    name = "python"
+    source_extensions = {".py"}
+
+    def prepare_and_get_command(
+        self, wt: Path, repo_dir: Path, touched_files: List[str]
+    ) -> tuple[Optional[List[str]], Optional[CompileOutcome], str]:
+        return ["ast.parse"], None, ""
+
+    def run_command(
+        self,
+        cmd: List[str],
+        cwd: Path,
+        touched_files: List[str],
+        is_base: bool = False,
+        base_commit: Optional[str] = None,
+    ) -> tuple[int, str, str]:
+        for f in touched_files:
+            rel = Path(f).as_posix()
+            if not rel.endswith(".py"):
+                continue
+            if is_base:
+                commit = base_commit or "HEAD"
+                res = subprocess.run(
+                    ["git", "show", f"{commit}:{rel}"],
+                    cwd=cwd,
+                    capture_output=True,
+                )
+                if res.returncode != 0:
+                    continue
+                source_bytes = res.stdout
+            else:
+                p = Path(f)
+                if not p.is_absolute():
+                    p = cwd / p
+                if not p.exists():
+                    continue
+                try:
+                    source_bytes = p.read_bytes()
+                except Exception:
+                    continue
+
+            try:
+                ast.parse(source_bytes, filename=rel)
+            except SyntaxError as e:
+                err_msg = f"SyntaxError in {rel}: {e.msg} (line {e.lineno})"
+                return 1, "", err_msg
+            except Exception as e:
+                return 1, "", f"Compile error in {rel}: {str(e)}"
+        return 0, "", ""
+
+
+ECOSYSTEM_COMPILE_HANDLERS = [
+    JsTsCompileHandler(),
+    GoCompileHandler(),
+    RustCompileHandler(),
+    MavenCompileHandler(),
+    GradleCompileHandler(),
+    JavaKotlinFallbackHandler(),
+    PythonCompileHandler(),
+]
+
+
 class Workspace:
     def __init__(
         self,
@@ -43,6 +361,7 @@ class Workspace:
         )
         self.base_commit: Optional[str] = self._get_head_commit()
         self.last_test_run: Optional[dict] = None
+        self.last_compile_run: Optional[dict] = None
 
     def _record_test_run(
         self,
@@ -188,7 +507,55 @@ class Workspace:
         self._run_git(["clean", "-fd"])
 
     @staticmethod
-    def _force_rmtree(path: Path) -> None:
+    def _is_junction_or_symlink(path: Path) -> bool:
+        if not path.exists() and not path.is_symlink():
+            return False
+        if path.is_symlink():
+            return True
+        if sys.platform == "win32":
+            try:
+                st = os.stat(str(path), follow_symlinks=False)
+                if hasattr(st, "st_file_attributes") and (st.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+                    return True
+            except Exception:
+                pass
+        return False
+
+    @classmethod
+    def _unlink_node_modules(cls, wt_or_path: Path) -> None:
+        nm = wt_or_path / "node_modules" if wt_or_path.name != "node_modules" else wt_or_path
+        if cls._is_junction_or_symlink(nm):
+            try:
+                if sys.platform == "win32":
+                    os.rmdir(str(nm))
+                else:
+                    os.unlink(str(nm))
+            except Exception:
+                try:
+                    os.unlink(str(nm))
+                except Exception:
+                    pass
+
+    @classmethod
+    def _link_node_modules(cls, src_repo_dir: Path, target_worktree_dir: Path) -> None:
+        src_nm = src_repo_dir / "node_modules"
+        target_nm = target_worktree_dir / "node_modules"
+        if src_nm.exists() and src_nm.is_dir() and not target_nm.exists() and not cls._is_junction_or_symlink(target_nm):
+            if sys.platform == "win32":
+                try:
+                    import _winapi
+                    _winapi.CreateJunction(os.path.abspath(str(src_nm)), os.path.abspath(str(target_nm)))
+                except Exception:
+                    pass
+            else:
+                try:
+                    os.symlink(os.path.abspath(str(src_nm)), os.path.abspath(str(target_nm)), target_is_directory=True)
+                except Exception:
+                    pass
+
+    @classmethod
+    def _force_rmtree(cls, path: Path) -> None:
+        cls._unlink_node_modules(path)
         def on_error(func, p, exc_info):
             try:
                 os.chmod(p, stat.S_IWRITE)
@@ -207,8 +574,13 @@ class Workspace:
         if exclude_file.exists():
             try:
                 content = exclude_file.read_text(encoding="utf-8")
+                entries = []
                 if ".jev-worktrees" not in content:
-                    exclude_file.write_text(content.rstrip() + "\n.jev-worktrees/\n", encoding="utf-8")
+                    entries.append(".jev-worktrees/")
+                if "node_modules" not in content:
+                    entries.append("node_modules/")
+                if entries:
+                    exclude_file.write_text(content.rstrip() + "\n" + "\n".join(entries) + "\n", encoding="utf-8")
             except Exception:
                 pass
 
@@ -217,6 +589,7 @@ class Workspace:
 
         # Clean up if prior branch or worktree directory exists
         if worktree_path.exists():
+            self._unlink_node_modules(worktree_path)
             self._run_repo_git(["worktree", "remove", "--force", str(worktree_path)])
             if worktree_path.exists():
                 self._force_rmtree(worktree_path)
@@ -226,6 +599,8 @@ class Workspace:
         res = self._run_repo_git(["worktree", "add", "-b", branch_name, str(worktree_path), "HEAD"])
         if res.returncode != 0:
             raise RuntimeError(f"Failed to create worktree: {res.stderr or res.stdout}")
+
+        self._link_node_modules(self.repo_dir, worktree_path)
 
         self.worktree_dir = worktree_path
         self.current_worktree_path = worktree_path
@@ -260,6 +635,7 @@ class Workspace:
                 )
 
         if wt_path:
+            self._unlink_node_modules(wt_path)
             self._run_repo_git(["worktree", "remove", "--force", str(wt_path)])
             if wt_path.exists():
                 self._force_rmtree(wt_path)
@@ -283,6 +659,7 @@ class Workspace:
         self.worktree_dir = self.repo_dir
 
         if wt_path:
+            self._unlink_node_modules(wt_path)
             self._run_repo_git(["worktree", "remove", "--force", str(wt_path)])
             if wt_path.exists():
                 self._force_rmtree(wt_path)
@@ -914,6 +1291,449 @@ class Workspace:
 
         return has_modifications
 
+    @classmethod
+    def _normalize_diagnostic_path(cls, path_str: str, root_dir: Optional[Path] = None) -> str:
+        s = path_str.strip().replace("\\", "/")
+        if root_dir is not None:
+            try:
+                resolved_root = root_dir.resolve().as_posix()
+                s = s.replace(resolved_root, "")
+                s = s.replace(root_dir.as_posix(), "")
+            except Exception:
+                pass
+        s = s.lstrip("./").lstrip("/")
+        return s.strip()
+
+    @classmethod
+    def _normalize_diagnostic_line(cls, line: str, root_dir: Optional[Path] = None) -> str:
+        s = line.strip()
+        if root_dir is not None:
+            try:
+                s = s.replace("\\", "/")
+                resolved_root = root_dir.resolve().as_posix()
+                s = s.replace(resolved_root, "")
+                s = s.replace(root_dir.as_posix(), "")
+            except Exception:
+                pass
+        return s.strip()
+
+    @classmethod
+    def parse_diagnostics(
+        cls, output: str, root_dir: Optional[Path] = None
+    ) -> List[DiagnosticError]:
+        raw_lines = [line.strip() for line in output.splitlines() if line.strip()]
+        errors: List[DiagnosticError] = []
+
+        ts_pat1 = re.compile(r"^(.*?):(\d+):(\d+)\s*-\s*error(?:\s+([A-Za-z0-9]+))?:\s*(.*)$")
+        ts_pat2 = re.compile(r"^(.*?)\((\d+),\s*(\d+)\):\s*error(?:\s+([A-Za-z0-9]+))?:\s*(.*)$")
+        mvn_pat3 = re.compile(r"^\[ERROR\]\s*(.*?):\[(\d+),\s*(\d+)\]\s*(.*)$")
+        mvn_pat4 = re.compile(r"^\[ERROR\]\s*(.*?):(\d+):\s*(?:error:\s*)?(.*)$")
+        kt_pat5 = re.compile(r"^e:\s*(.*?):(?:\s*\(?(\d+),\s*(\d+)\)?|(\d+):(\d+)):?\s*(?:error:\s*)?(.*)$")
+        rust_pat6a = re.compile(r"^([a-zA-Z0-9_./\\-]+):(\d+):(\d+):\s*error(?:\[([A-Za-z0-9]+)\])?:\s*(.*)$")
+        rust_pat6b = re.compile(r"^error\[([A-Za-z0-9]+)\]:\s*(.*)$")
+        py_pat7a = re.compile(r"^SyntaxError in (.*?):\s*(.*?)(?:\s*\(line \d+\))?$")
+        py_pat7b = re.compile(r"^Compile error in (.*?):\s*(.*)$")
+        generic_pat8 = re.compile(r"^([a-zA-Z0-9_./\\-]+):(\d+)(?::(\d+))?:\s*(?:(?:error|syntax error|warning):\s*)?(.*)$", re.IGNORECASE)
+
+        for line in raw_lines:
+            m = ts_pat1.match(line)
+            if m:
+                file_p = cls._normalize_diagnostic_path(m.group(1), root_dir)
+                code = m.group(4) or ""
+                msg = m.group(5).strip()
+                errors.append(DiagnosticError(raw_line=line, file=file_p, code=code, message=msg, line=int(m.group(2)), column=int(m.group(3))))
+                continue
+
+            m = ts_pat2.match(line)
+            if m:
+                file_p = cls._normalize_diagnostic_path(m.group(1), root_dir)
+                code = m.group(4) or ""
+                msg = m.group(5).strip()
+                errors.append(DiagnosticError(raw_line=line, file=file_p, code=code, message=msg, line=int(m.group(2)), column=int(m.group(3))))
+                continue
+
+            m = mvn_pat3.match(line)
+            if m:
+                file_p = cls._normalize_diagnostic_path(m.group(1), root_dir)
+                msg = m.group(4).strip()
+                errors.append(DiagnosticError(raw_line=line, file=file_p, code="", message=msg, line=int(m.group(2)), column=int(m.group(3))))
+                continue
+
+            m = mvn_pat4.match(line)
+            if m:
+                file_p = cls._normalize_diagnostic_path(m.group(1), root_dir)
+                msg = m.group(3).strip()
+                errors.append(DiagnosticError(raw_line=line, file=file_p, code="", message=msg, line=int(m.group(2)), column=None))
+                continue
+
+            m = kt_pat5.match(line)
+            if m:
+                file_p = cls._normalize_diagnostic_path(m.group(1), root_dir)
+                line_no = int(m.group(2) or m.group(4) or 0)
+                col_no = int(m.group(3) or m.group(5) or 0)
+                msg = m.group(6).strip()
+                errors.append(DiagnosticError(raw_line=line, file=file_p, code="", message=msg, line=line_no, column=col_no))
+                continue
+
+            m = rust_pat6a.match(line)
+            if m:
+                file_p = cls._normalize_diagnostic_path(m.group(1), root_dir)
+                code = m.group(4) or ""
+                msg = m.group(5).strip()
+                errors.append(DiagnosticError(raw_line=line, file=file_p, code=code, message=msg, line=int(m.group(2)), column=int(m.group(3))))
+                continue
+
+            m = rust_pat6b.match(line)
+            if m:
+                code = m.group(1) or ""
+                msg = m.group(2).strip()
+                errors.append(DiagnosticError(raw_line=line, file="", code=code, message=msg))
+                continue
+
+            m = py_pat7a.match(line)
+            if m:
+                file_p = cls._normalize_diagnostic_path(m.group(1), root_dir)
+                msg = m.group(2).strip()
+                errors.append(DiagnosticError(raw_line=line, file=file_p, code="SyntaxError", message=msg))
+                continue
+            m = py_pat7b.match(line)
+            if m:
+                file_p = cls._normalize_diagnostic_path(m.group(1), root_dir)
+                msg = m.group(2).strip()
+                errors.append(DiagnosticError(raw_line=line, file=file_p, code="CompileError", message=msg))
+                continue
+
+            m = generic_pat8.match(line)
+            if m:
+                candidate_file = m.group(1).strip()
+                ext = Path(candidate_file).suffix.lower()
+                if ext in ALL_SOURCE_EXTENSIONS or "/" in candidate_file or "\\" in candidate_file:
+                    file_p = cls._normalize_diagnostic_path(candidate_file, root_dir)
+                    line_no = int(m.group(2))
+                    col_no = int(m.group(3)) if m.group(3) else None
+                    raw_msg = m.group(4).strip()
+                    code_match = re.match(r"^(?:error\s+)?([A-Za-z0-9]+):\s*(.*)$", raw_msg)
+                    if code_match and code_match.group(1).startswith(("TS", "E", "CS")):
+                        code = code_match.group(1)
+                        msg = code_match.group(2).strip()
+                    else:
+                        code = ""
+                        msg = raw_msg
+                    errors.append(DiagnosticError(raw_line=line, file=file_p, code=code, message=msg, line=line_no, column=col_no))
+                    continue
+
+            if line.lower().startswith("error:"):
+                msg = line[6:].strip()
+                errors.append(DiagnosticError(raw_line=line, file="", code="", message=msg))
+                continue
+
+        return errors
+
+    @classmethod
+    def _extract_errors(
+        cls, output: str, root_dir: Optional[Path] = None
+    ) -> List[DiagnosticError]:
+        return cls.parse_diagnostics(output, root_dir)
+
+    @classmethod
+    def _extract_error_lines(
+        cls, output: str, root_dir: Optional[Path] = None
+    ) -> List[str]:
+        return [e.raw_line for e in cls.parse_diagnostics(output, root_dir)]
+
+    def check_compile(
+        self,
+        diff: Optional[str] = None,
+        scope: Optional[Union[List[Union[str, Path]], str, Path]] = None,
+    ) -> Dict[str, Any]:
+        if diff is None:
+            diff = self.get_staged_diff()
+        diff_str = str(diff)
+
+        # 1. Exempt if docs-only diff
+        if self._is_docs_only_diff(diff_str):
+            record = {
+                "ecosystem": None,
+                "command": None,
+                "exit_code": None,
+                "stdout_tail": "",
+                "stderr_tail": "",
+                "output_tail": "",
+                "new_errors": [],
+                "base_errors": [],
+                "outcome": CompileOutcome.EXEMPT.value,
+                "detail": "Docs-only diff exempt from compile.",
+            }
+            self.last_compile_run = record
+            return record
+
+        touched_files = list(self._extract_files_from_diff(diff_str))
+        if scope is not None:
+            if isinstance(scope, (str, Path)):
+                scope_set = {Path(scope).as_posix()}
+            else:
+                scope_set = {Path(s).as_posix() for s in scope}
+            if scope_set:
+                touched_files = [f for f in touched_files if Path(f).as_posix() in scope_set]
+
+        touched_source_files = [
+            f for f in touched_files if Path(f).suffix.lower() in ALL_SOURCE_EXTENSIONS
+        ]
+
+        # 2. Exempt if no source files touched (e.g. CSS, JSON, images, docs, IaC)
+        if not touched_source_files:
+            record = {
+                "ecosystem": None,
+                "command": None,
+                "exit_code": None,
+                "stdout_tail": "",
+                "stderr_tail": "",
+                "output_tail": "",
+                "new_errors": [],
+                "base_errors": [],
+                "outcome": CompileOutcome.EXEMPT.value,
+                "detail": "Diff touches no compiled source files.",
+            }
+            self.last_compile_run = record
+            return record
+
+        # 3. Find matching ecosystem handler
+        handler: Optional[BaseCompileHandler] = None
+        for h in ECOSYSTEM_COMPILE_HANDLERS:
+            if h.matches(set(touched_source_files), self.worktree_dir, self.repo_dir):
+                handler = h
+                break
+
+        if handler is None:
+            record = {
+                "ecosystem": None,
+                "command": None,
+                "exit_code": None,
+                "stdout_tail": "",
+                "stderr_tail": "",
+                "output_tail": "",
+                "new_errors": [],
+                "base_errors": [],
+                "outcome": CompileOutcome.EXEMPT.value,
+                "detail": f"Diff touches no source files of a detected ecosystem.",
+            }
+            self.last_compile_run = record
+            return record
+
+        # 4. Prepare command and check environment
+        cmd, outcome_override, prep_detail = handler.prepare_and_get_command(
+            self.worktree_dir, self.repo_dir, touched_source_files
+        )
+        if outcome_override is not None:
+            record = {
+                "ecosystem": handler.name,
+                "command": cmd,
+                "exit_code": None,
+                "stdout_tail": "",
+                "stderr_tail": "",
+                "output_tail": "",
+                "new_errors": [],
+                "base_errors": [],
+                "outcome": outcome_override.value,
+                "detail": prep_detail,
+            }
+            self.last_compile_run = record
+            return record
+
+        # 5. Run compile in worktree_dir
+        try:
+            exit_code, stdout, stderr = handler.run_command(
+                cmd, self.worktree_dir, touched_source_files, is_base=False
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            record = {
+                "ecosystem": handler.name,
+                "command": cmd,
+                "exit_code": None,
+                "stdout_tail": "",
+                "stderr_tail": "",
+                "output_tail": "",
+                "new_errors": [],
+                "base_errors": [],
+                "outcome": CompileOutcome.ENV_NOT_READY.value,
+                "detail": f"Environment not ready: {type(e).__name__} running compile command {cmd}: {e}",
+            }
+            self.last_compile_run = record
+            return record
+        except Exception as e:
+            record = {
+                "ecosystem": handler.name,
+                "command": cmd,
+                "exit_code": None,
+                "stdout_tail": "",
+                "stderr_tail": "",
+                "output_tail": "",
+                "new_errors": [],
+                "base_errors": [],
+                "outcome": CompileOutcome.ENV_NOT_READY.value,
+                "detail": f"Environment not ready: {type(e).__name__} running compile command {cmd}: {e}",
+            }
+            self.last_compile_run = record
+            return record
+
+        stdout_tail = stdout[-1000:] if stdout else ""
+        stderr_tail = stderr[-1000:] if stderr else ""
+        combined_output = f"{stdout}\n{stderr}".strip()
+        output_tail = combined_output[-1000:] if combined_output else ""
+
+        if exit_code == 0:
+            record = {
+                "ecosystem": handler.name,
+                "command": cmd,
+                "exit_code": 0,
+                "stdout_tail": stdout_tail,
+                "stderr_tail": stderr_tail,
+                "output_tail": output_tail,
+                "new_errors": [],
+                "base_errors": [],
+                "outcome": CompileOutcome.PASSED.value,
+                "detail": "Compile passed.",
+            }
+            self.last_compile_run = record
+            return record
+
+        # 6. Exit code != 0: Extract errors and run baseline comparison in a detached worktree at base_commit
+        wt_errors = self.parse_diagnostics(combined_output, self.worktree_dir)
+        if not wt_errors:
+            record = {
+                "ecosystem": handler.name,
+                "command": cmd,
+                "exit_code": exit_code,
+                "stdout_tail": stdout_tail,
+                "stderr_tail": stderr_tail,
+                "output_tail": output_tail,
+                "new_errors": [],
+                "base_errors": [],
+                "outcome": CompileOutcome.FAILED.value,
+                "detail": f"Compile command exited {exit_code} but no parsable errors were found; output tail: {output_tail}",
+            }
+            self.last_compile_run = record
+            return record
+
+        base_commit_ref = self.base_commit or "HEAD"
+        worktree_base = self.repo_dir / ".jev-worktrees"
+        worktree_base.mkdir(parents=True, exist_ok=True)
+
+        exclude_file = self.repo_dir / ".git" / "info" / "exclude"
+        if exclude_file.exists():
+            try:
+                content = exclude_file.read_text(encoding="utf-8")
+                entries = []
+                if ".jev-worktrees" not in content:
+                    entries.append(".jev-worktrees/")
+                if "node_modules" not in content:
+                    entries.append("node_modules/")
+                if entries:
+                    exclude_file.write_text(content.rstrip() + "\n" + "\n".join(entries) + "\n", encoding="utf-8")
+            except Exception:
+                pass
+
+        base_wt_path = (worktree_base / f"baseline-{uuid.uuid4().hex[:8]}").resolve()
+
+        res = self._run_repo_git(["worktree", "add", "--detach", str(base_wt_path), base_commit_ref])
+        if res.returncode != 0:
+            record = {
+                "ecosystem": handler.name,
+                "command": cmd,
+                "exit_code": exit_code,
+                "stdout_tail": stdout_tail,
+                "stderr_tail": stderr_tail,
+                "output_tail": output_tail,
+                "new_errors": [e.raw_line for e in wt_errors],
+                "base_errors": [],
+                "outcome": CompileOutcome.ENV_NOT_READY.value,
+                "detail": f"Environment not ready: failed to create temporary baseline worktree at {base_commit_ref}: {res.stderr or res.stdout}",
+            }
+            self.last_compile_run = record
+            return record
+
+        base_exit = None
+        base_stdout = ""
+        base_stderr = ""
+        try:
+            self._link_node_modules(self.repo_dir, base_wt_path)
+            base_exit, base_stdout, base_stderr = handler.run_command(
+                cmd, base_wt_path, touched_source_files, is_base=True, base_commit=base_commit_ref
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            record = {
+                "ecosystem": handler.name,
+                "command": cmd,
+                "exit_code": exit_code,
+                "stdout_tail": stdout_tail,
+                "stderr_tail": stderr_tail,
+                "output_tail": output_tail,
+                "new_errors": [e.raw_line for e in wt_errors],
+                "base_errors": [],
+                "outcome": CompileOutcome.ENV_NOT_READY.value,
+                "detail": f"Environment not ready: {type(e).__name__} running base compile command {cmd}: {e}",
+            }
+            self.last_compile_run = record
+            return record
+        except Exception as e:
+            record = {
+                "ecosystem": handler.name,
+                "command": cmd,
+                "exit_code": exit_code,
+                "stdout_tail": stdout_tail,
+                "stderr_tail": stderr_tail,
+                "output_tail": output_tail,
+                "new_errors": [e.raw_line for e in wt_errors],
+                "base_errors": [],
+                "outcome": CompileOutcome.ENV_NOT_READY.value,
+                "detail": f"Environment not ready: {type(e).__name__} running base compile command {cmd}: {e}",
+            }
+            self.last_compile_run = record
+            return record
+        finally:
+            self._unlink_node_modules(base_wt_path)
+            self._run_repo_git(["worktree", "remove", "--force", str(base_wt_path)])
+            if base_wt_path.exists():
+                self._force_rmtree(base_wt_path)
+            self._run_repo_git(["worktree", "prune"])
+
+        base_combined = f"{base_stdout}\n{base_stderr}".strip()
+        base_errors = self.parse_diagnostics(base_combined, base_wt_path)
+
+        remaining_base = Counter(e.key for e in base_errors)
+        new_error_objs = []
+        for err in wt_errors:
+            if remaining_base[err.key] > 0:
+                remaining_base[err.key] -= 1
+            else:
+                new_error_objs.append(err)
+
+        new_error_lines = [e.raw_line for e in new_error_objs]
+        base_error_lines = [e.raw_line for e in base_errors]
+
+        if not new_error_objs:
+            outcome = CompileOutcome.PASSED
+            detail = f"Pre-existing errors passed ({len(wt_errors)} pre-existing error(s) present in base commit)."
+        else:
+            outcome = CompileOutcome.FAILED
+            err_preview = new_error_lines[0] if new_error_lines else "Unknown compile failure"
+            detail = f"Compile failed with {len(new_error_objs)} new error(s): {err_preview}"
+
+        record = {
+            "ecosystem": handler.name,
+            "command": cmd,
+            "exit_code": exit_code,
+            "stdout_tail": stdout_tail,
+            "stderr_tail": stderr_tail,
+            "output_tail": output_tail,
+            "new_errors": new_error_lines,
+            "base_errors": base_error_lines,
+            "outcome": outcome.value,
+            "detail": detail,
+        }
+        self.last_compile_run = record
+        return record
+
     def run_mechanical_checks(self, subgoal: Subgoal) -> MechanicalCheckResult:
         # 1. check_build
         build_res = self.check_build(subgoal.scope)
@@ -925,15 +1745,67 @@ class Workspace:
                 checks_run=["build"],
                 checks={
                     "build": {"ran": True, "passed": False, "detail": build_res.detail},
+                    "compile": {"ran": False, "passed": None},
                     "tests": {"ran": False, "passed": None},
                     "scope": {"ran": False, "passed": None},
                 },
+                compile_outcome=None,
                 test_runner_outcome=None,
             )
 
-        # 2. run_tests
-        test_outcome = self.run_tests()
+        # 2. check_compile
         diff = self.get_staged_diff()
+        compile_res = self.check_compile(diff=diff, scope=subgoal.scope)
+        compile_outcome = compile_res.get("outcome")
+
+        if compile_outcome == CompileOutcome.FAILED.value:
+            return MechanicalCheckResult(
+                passed=False,
+                failed_check="compile",
+                detail=compile_res.get("detail", "Compile check failed."),
+                checks_run=["build", "compile"],
+                checks={
+                    "build": {"ran": True, "passed": True, "detail": ""},
+                    "compile": {"ran": True, "passed": False, "detail": compile_res.get("detail", "")},
+                    "tests": {"ran": False, "passed": None},
+                    "scope": {"ran": False, "passed": None},
+                },
+                compile_outcome=compile_res,
+                test_runner_outcome=None,
+            )
+        elif compile_outcome == CompileOutcome.NO_COMPILE_COMMAND.value:
+            return MechanicalCheckResult(
+                passed=False,
+                failed_check="no_compile_command",
+                detail=compile_res.get("detail", "No compile command found."),
+                checks_run=["build", "compile"],
+                checks={
+                    "build": {"ran": True, "passed": True, "detail": ""},
+                    "compile": {"ran": True, "passed": False, "detail": compile_res.get("detail", "")},
+                    "tests": {"ran": False, "passed": None},
+                    "scope": {"ran": False, "passed": None},
+                },
+                compile_outcome=compile_res,
+                test_runner_outcome=None,
+            )
+        elif compile_outcome == CompileOutcome.ENV_NOT_READY.value:
+            return MechanicalCheckResult(
+                passed=False,
+                failed_check="env_not_ready",
+                detail=compile_res.get("detail", "Environment not ready."),
+                checks_run=["build", "compile"],
+                checks={
+                    "build": {"ran": True, "passed": True, "detail": ""},
+                    "compile": {"ran": True, "passed": False, "detail": compile_res.get("detail", "")},
+                    "tests": {"ran": False, "passed": None},
+                    "scope": {"ran": False, "passed": None},
+                },
+                compile_outcome=compile_res,
+                test_runner_outcome=None,
+            )
+
+        # 3. run_tests
+        test_outcome = self.run_tests()
         test_run_details = getattr(self, "last_test_run", None)
 
         if test_outcome == TestOutcome.FAILED:
@@ -941,12 +1813,14 @@ class Workspace:
                 passed=False,
                 failed_check="tests",
                 detail="Unit tests failed.",
-                checks_run=["build", "tests"],
+                checks_run=["build", "compile", "tests"],
                 checks={
                     "build": {"ran": True, "passed": True, "detail": ""},
+                    "compile": {"ran": True, "passed": True, "detail": compile_res.get("detail", "")},
                     "tests": {"ran": True, "passed": False, "detail": "Unit tests failed."},
                     "scope": {"ran": False, "passed": None},
                 },
+                compile_outcome=compile_res,
                 test_runner_outcome=test_run_details,
             )
         elif test_outcome == TestOutcome.NO_TESTS_COLLECTED:
@@ -957,30 +1831,34 @@ class Workspace:
                         passed=False,
                         failed_check="no_tests_collected",
                         detail=detail_msg,
-                        checks_run=["build", "tests"],
+                        checks_run=["build", "compile", "tests"],
                         checks={
                             "build": {"ran": True, "passed": True, "detail": ""},
+                            "compile": {"ran": True, "passed": True, "detail": compile_res.get("detail", "")},
                             "tests": {"ran": True, "passed": False, "detail": detail_msg},
                             "scope": {"ran": False, "passed": None},
                         },
+                        compile_outcome=compile_res,
                         test_runner_outcome=test_run_details,
                     )
         elif test_outcome == TestOutcome.NO_TEST_FRAMEWORK:
             pass
 
-        # 3. check_scope
+        # 4. check_scope
         scope_res = self.check_scope(diff, subgoal.scope)
         if not scope_res.passed:
             return MechanicalCheckResult(
                 passed=False,
                 failed_check="scope",
                 detail=scope_res.detail,
-                checks_run=["build", "tests", "scope"],
+                checks_run=["build", "compile", "tests", "scope"],
                 checks={
                     "build": {"ran": True, "passed": True, "detail": ""},
+                    "compile": {"ran": True, "passed": True, "detail": compile_res.get("detail", "")},
                     "tests": {"ran": True, "passed": True, "detail": ""},
                     "scope": {"ran": True, "passed": False, "detail": scope_res.detail},
                 },
+                compile_outcome=compile_res,
                 test_runner_outcome=test_run_details,
             )
 
@@ -1001,12 +1879,14 @@ class Workspace:
             passed=True,
             failed_check=None,
             detail=untested_flag,
-            checks_run=["build", "tests", "scope"],
+            checks_run=["build", "compile", "tests", "scope"],
             checks={
                 "build": {"ran": True, "passed": True, "detail": ""},
+                "compile": {"ran": True, "passed": True, "detail": compile_res.get("detail", "")},
                 "tests": {"ran": True, "passed": True, "detail": untested_flag or "passed"},
                 "scope": {"ran": True, "passed": True, "detail": ""},
             },
+            compile_outcome=compile_res,
             test_runner_outcome=test_run_details,
         )
 

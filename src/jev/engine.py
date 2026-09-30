@@ -1735,6 +1735,22 @@ def node_gate(
             "outcome": "PASSED" if mech_result.passed or mech_result.failed_check != "tests" else "FAILED",
         }
 
+    compile_telemetry = getattr(mech_result, "compile_outcome", None)
+    if compile_telemetry is None and hasattr(workspace, "last_compile_run"):
+        compile_telemetry = workspace.last_compile_run
+    if compile_telemetry is None and tier0_telemetry["checks"].get("compile", {}).get("ran"):
+        compile_telemetry = {
+            "ecosystem": None,
+            "command": None,
+            "exit_code": None,
+            "stdout_tail": "",
+            "stderr_tail": "",
+            "output_tail": "",
+            "new_errors": [],
+            "base_errors": [],
+            "outcome": "PASSED" if mech_result.passed or mech_result.failed_check not in ("compile", "no_compile_command", "env_not_ready") else "FAILED",
+        }
+
     if not mech_result.passed:
         is_wt = _is_active_worktree(state, workspace)
         wt_path, wt_branch = _get_active_worktree_info(state, workspace)
@@ -1749,6 +1765,30 @@ def node_gate(
             workspace.worktree_dir = workspace.repo_dir
         state["current_worktree_path"] = None
         state["current_worktree_branch"] = None
+
+        if mech_result.failed_check in ("no_compile_command", "env_not_ready"):
+            state["status"] = "escalated"
+            state["gate_status"] = mech_result.failed_check
+            state["last_feedback"] = mech_result.detail
+
+            state["trajectory"].append({
+                "node": "gate",
+                "subgoal": subgoal.model_dump() if hasattr(subgoal, "model_dump") else dict(subgoal),
+                "gate_status": mech_result.failed_check,
+                "tier0_result": tier0_telemetry,
+                "compile": compile_telemetry,
+                "test_runner": test_runner_telemetry,
+                "jev_request": None,
+                "jev_verdict": None,
+            })
+
+            if gatekeeper is not None and hasattr(gatekeeper, "escalate_deadlock"):
+                gatekeeper.escalate_deadlock(
+                    trajectory=state.get("trajectory", []),
+                    triggering_tier="mechanical",
+                )
+            return state
+
         current_mech_strikes = state.get("mechanical_strike_count", 0) + 1
         state["mechanical_strike_count"] = current_mech_strikes
         state["gate_status"] = "mechanical_failure"
@@ -1759,6 +1799,7 @@ def node_gate(
             "subgoal": subgoal.model_dump() if hasattr(subgoal, "model_dump") else dict(subgoal),
             "gate_status": "mechanical_failure",
             "tier0_result": tier0_telemetry,
+            "compile": compile_telemetry,
             "test_runner": test_runner_telemetry,
             "jev_request": None,
             "jev_verdict": None,
@@ -1864,6 +1905,7 @@ def node_gate(
             "subgoal": subgoal.model_dump() if hasattr(subgoal, "model_dump") else dict(subgoal),
             "gate_status": "passed",
             "tier0_result": tier0_telemetry,
+            "compile": compile_telemetry,
             "test_runner": test_runner_telemetry,
             "jev_request": jev_request_telemetry,
             "jev_verdict": jev_verdict_telemetry,
@@ -1900,6 +1942,7 @@ def node_gate(
             "subgoal": subgoal.model_dump() if hasattr(subgoal, "model_dump") else dict(subgoal),
             "gate_status": "semantic_failure",
             "tier0_result": tier0_telemetry,
+            "compile": compile_telemetry,
             "test_runner": test_runner_telemetry,
             "jev_request": jev_request_telemetry,
             "jev_verdict": jev_verdict_telemetry,
@@ -1959,8 +2002,50 @@ def node_verify(
         if not final_diff and workspace is not None and hasattr(workspace, "get_staged_diff"):
             final_diff = workspace.get_staged_diff()
 
+        # Compile check on final merged tree
+        compile_info = None
+        if workspace is not None and hasattr(workspace, "check_compile"):
+            compile_info = workspace.check_compile(diff=final_diff)
+
+        test_runner_info = getattr(workspace, "last_test_run", None)
+        if test_runner_info is None:
+            test_runner_info = {
+                "ecosystem": None,
+                "command": None,
+                "exit_code": None,
+                "stdout_tail": "",
+                "stderr_tail": "",
+                "output_tail": "",
+                "outcome": getattr(outcome, "value", str(outcome)) if 'outcome' in locals() else "UNKNOWN",
+            }
+
         ticket = state.get("ticket", "")
         inv_notes = state.get("investigation_notes")
+
+        if compile_info is not None and compile_info.get("outcome") in ("FAILED", "NO_COMPILE_COMMAND", "ENV_NOT_READY"):
+            state["gate_status"] = "verification_failed"
+            state["status"] = "escalated" if compile_info.get("outcome") in ("NO_COMPILE_COMMAND", "ENV_NOT_READY") else "verification_failed"
+            state["last_feedback"] = f"Final compile check failed: {compile_info.get('detail')}"
+            verify_entry = {
+                "node": "verify",
+                "gate_status": "verification_failed",
+                "status": state["status"],
+                "compile": compile_info,
+                "test_runner": test_runner_info,
+                "jev_request": {
+                    "ticket": ticket,
+                    "diff_size": len(final_diff),
+                    "investigation_notes_included": bool(inv_notes),
+                },
+                "jev_verdict": None,
+            }
+            state["trajectory"].append(verify_entry)
+            if gatekeeper is not None and hasattr(gatekeeper, "escalate_deadlock"):
+                gatekeeper.escalate_deadlock(
+                    trajectory=state.get("trajectory", []),
+                    triggering_tier="mechanical",
+                )
+            return state
 
         verdict = None
         if gatekeeper is not None and hasattr(gatekeeper, "verify_ticket"):
@@ -1982,22 +2067,11 @@ def node_verify(
             state["gate_status"] = "verified"
             state["status"] = "completed"
 
-        test_runner_info = getattr(workspace, "last_test_run", None)
-        if test_runner_info is None:
-            test_runner_info = {
-                "ecosystem": None,
-                "command": None,
-                "exit_code": None,
-                "stdout_tail": "",
-                "stderr_tail": "",
-                "output_tail": "",
-                "outcome": getattr(outcome, "value", str(outcome)) if 'outcome' in locals() else "UNKNOWN",
-            }
-
         verify_entry: Dict[str, Any] = {
             "node": "verify",
             "gate_status": state.get("gate_status"),
             "status": state.get("status"),
+            "compile": compile_info,
             "test_runner": test_runner_info,
             "jev_request": {
                 "ticket": ticket,
@@ -2034,6 +2108,7 @@ def node_verify(
             "error": f"Verification error: {str(e)}",
             "gate_status": "verification_failed",
             "status": "escalated",
+            "compile": compile_info if 'compile_info' in locals() else getattr(workspace, "last_compile_run", None),
             "test_runner": getattr(workspace, "last_test_run", None),
             "jev_request": {
                 "ticket": state.get("ticket", ""),
