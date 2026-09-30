@@ -1092,7 +1092,8 @@ def node_plan(
         "Instructions:",
         "1. Break down the task into an ordered sequence of atomic Subgoals.",
         "2. For each Subgoal, specify:",
-        "   - 'description': Clear, concise explanation of the atomic change.",
+        "   - 'description': Clear, atomic, and objective description of the functional change (e.g. 'Create the About page component at src/app/about/page.tsx for Smash Arena').",
+        "     CRITICAL: Do NOT include subjective meta-qualifiers, styling instructions, or cross-file comparison clauses in 'description' (e.g. do NOT say 'following dark theme', 'using Tailwind v4 styling', 'consistent with existing pages like contact and home', or 'adhering to glassmorphism conventions'). Architectural and styling conventions belong in Investigation Notes, not in the subgoal description, because the gatekeeper evaluates the diff strictly against every clause in the description.",
         "   - 'scope': Non-empty list of exact file paths to touch or create. No placeholder or empty scopes allowed.",
         "   - 'expects_tests': Boolean (true/false) indicating whether automated tests are expected to pass/run for this step.",
         "3. GROUNDING REQUIREMENTS (CRITICAL):",
@@ -1257,6 +1258,15 @@ def node_implement(
                 path: Path to the file to modify, relative to repository root.
                 content: The complete new content of the file.
             """
+            norm_path = Path(path).as_posix().lstrip("./")
+            norm_scope = {Path(s).as_posix().lstrip("./") for s in (subgoal.scope or [])}
+            if norm_scope and norm_path not in norm_scope:
+                return (
+                    f"Error: Target path '{path}' is not within declared scope {subgoal.scope}. "
+                    "You may only mutate files within the declared scope for this subgoal. "
+                    "Subsequent subgoals will address other files."
+                )
+
             if hasattr(workspace, "stage_file_mutation"):
                 workspace.stage_file_mutation(path, content)
                 return f"Successfully staged mutation for {path}"
@@ -1417,7 +1427,16 @@ def node_implement(
                     actual_content = args.get("content")
                     if actual_content is None:
                         actual_content = args.get("code", args.get("text", ""))
-                    if actual_path and hasattr(workspace, "stage_file_mutation"):
+
+                    norm_path = Path(actual_path).as_posix().lstrip("./")
+                    norm_scope = {Path(s).as_posix().lstrip("./") for s in (subgoal.scope or [])}
+                    if norm_scope and norm_path not in norm_scope:
+                        result = (
+                            f"Error: Target path '{actual_path}' is not within declared scope {subgoal.scope}. "
+                            "You may only mutate files within the declared scope for this subgoal. "
+                            "Subsequent subgoals will address other files."
+                        )
+                    elif actual_path and hasattr(workspace, "stage_file_mutation"):
                         try:
                             workspace.stage_file_mutation(actual_path, actual_content)
                             result = f"Successfully staged mutation for {actual_path}"

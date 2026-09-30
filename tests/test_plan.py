@@ -1143,6 +1143,33 @@ def test_node_plan_includes_warning_when_investigation_incomplete(tmp_path):
     assert "WARNING: Investigation hit its maximum turn cap" in prompt_text
 
 
+# 38. Planning prompt instructs atomic and objective descriptions, forbidding subjective meta-qualifiers
+def test_node_plan_prompt_forbids_subjective_meta_qualifiers_in_subgoal_descriptions():
+    plan = [
+        {
+            "description": "Create the About page for Smash Arena",
+            "scope": ["src/app/about/page.tsx"],
+            "expects_tests": False,
+        }
+    ]
+    fake_llm = ScriptedChatModel([json.dumps(plan)])
+    state: State = {
+        "ticket": "Create About page",
+        "investigation_notes": "Next.js App Router in src/app",
+        "investigated_directories": ["src/app"],
+        "trajectory": [],
+    }
+
+    node_plan(state, llm=fake_llm)
+
+    assert len(fake_llm.invocations) == 1
+    prompt_text = fake_llm.invocations[0][0].content
+    assert "atomic" in prompt_text.lower()
+    assert "objective" in prompt_text.lower()
+    assert "meta-qualifiers" in prompt_text.lower() or "subjective" in prompt_text.lower()
+
+
+
 
 
 

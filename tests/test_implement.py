@@ -502,4 +502,87 @@ def test_node_implement_extracts_root_metadata_when_available(tmp_path):
     assert "Smash Arena | Premium Badminton Court Booking Platform" in prompt_text
 
 
+# 16. Verify stage_file_mutation immediately rejects out-of-scope files
+def test_stage_file_mutation_rejects_out_of_scope_files_immediately():
+    ws = MockWorkspace()
+    subgoal = Subgoal(
+        description="Implement add helper",
+        scope=["math_utils.py"],
+        expects_tests=True,
+    )
+    state: State = {
+        "current_subgoal": subgoal,
+        "trajectory": [],
+    }
+
+    # Turn 1: Attempt to mutate out of scope file (e.g. Header.tsx)
+    turn_1_resp = AIMessage(
+        content="Mutating Header",
+        tool_calls=[
+            {
+                "name": "stage_file_mutation",
+                "args": {
+                    "path": "Header.tsx",
+                    "content": "// out of scope",
+                },
+                "id": "call_1",
+            }
+        ],
+    )
+    turn_2_resp = AIMessage(
+        content="Submitting",
+        tool_calls=[{"name": "submit_subgoal", "args": {}, "id": "call_2"}],
+    )
+
+    fake_llm = ScriptedChatModel(responses=[turn_1_resp, turn_2_resp])
+    node_implement(state, workspace=ws, llm=fake_llm)
+
+    # ws.staged_mutations must NOT contain Header.tsx
+    assert len(ws.staged_mutations) == 0
+    # Tool response sent back to LLM must contain error about declared scope
+    assert len(fake_llm.invocations) == 2
+    tool_msgs = [m for m in fake_llm.invocations[1] if isinstance(m, ToolMessage) and getattr(m, "tool_call_id", None) == "call_1"]
+    assert len(tool_msgs) == 1
+    assert "not within declared scope" in tool_msgs[0].content.lower()
+
+
+# 17. Verify stage_file_mutation allows in-scope files
+def test_stage_file_mutation_allows_in_scope_files():
+    ws = MockWorkspace()
+    subgoal = Subgoal(
+        description="Implement add helper",
+        scope=["src/math_utils.py"],
+        expects_tests=True,
+    )
+    state: State = {
+        "current_subgoal": subgoal,
+        "trajectory": [],
+    }
+
+    turn_1_resp = AIMessage(
+        content="Mutating in scope",
+        tool_calls=[
+            {
+                "name": "stage_file_mutation",
+                "args": {
+                    "path": "src/math_utils.py",
+                    "content": "def add(): pass",
+                },
+                "id": "call_1",
+            }
+        ],
+    )
+    turn_2_resp = AIMessage(
+        content="Submitting",
+        tool_calls=[{"name": "submit_subgoal", "args": {}, "id": "call_2"}],
+    )
+
+    fake_llm = ScriptedChatModel(responses=[turn_1_resp, turn_2_resp])
+    node_implement(state, workspace=ws, llm=fake_llm)
+
+    assert len(ws.staged_mutations) == 1
+    assert ws.staged_mutations[0]["path"] == "src/math_utils.py"
+
+
+
 
