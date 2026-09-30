@@ -442,3 +442,64 @@ def test_node_implement_includes_export_convention_instruction():
     assert "export and import conventions" in prompt_text.lower()
 
 
+# 14. Verify node_implement prompt includes domain fidelity instructions
+def test_node_implement_includes_domain_fidelity_instruction():
+    ws = MockWorkspace()
+    subgoal = Subgoal(description="Create About page", scope=["src/app/about/page.tsx"], expects_tests=False)
+    state: State = {
+        "current_subgoal": subgoal,
+        "trajectory": [],
+    }
+    turn_resp = AIMessage(
+        content="Submitting",
+        tool_calls=[{"name": "submit_subgoal", "args": {}, "id": "c1"}],
+    )
+    fake_llm = ScriptedChatModel(responses=[turn_resp])
+    node_implement(state, workspace=ws, llm=fake_llm)
+
+    assert len(fake_llm.invocations) == 1
+    prompt_text = fake_llm.invocations[0][0].content
+    assert "business domain" in prompt_text.lower()
+    assert "never invent an alternate sport" in prompt_text.lower()
+
+
+# 15. Verify node_implement extracts root metadata from layout.tsx or package.json when present
+def test_node_implement_extracts_root_metadata_when_available(tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    app_dir = repo_dir / "src" / "app"
+    app_dir.mkdir(parents=True)
+    layout_content = """
+    export const metadata = {
+      title: "Smash Arena | Premium Badminton Court Booking Platform",
+      description: "Book indoor and outdoor badminton courts instantly."
+    };
+    """
+    (app_dir / "layout.tsx").write_text(layout_content, encoding="utf-8")
+
+    class RealWS(MockWorkspace):
+        def __init__(self, root):
+            super().__init__()
+            self.worktree_dir = root
+            self.repo_dir = root
+
+    ws = RealWS(repo_dir)
+    subgoal = Subgoal(description="Create About page", scope=["src/app/about/page.tsx"], expects_tests=False)
+    state: State = {
+        "current_subgoal": subgoal,
+        "trajectory": [],
+    }
+    turn_resp = AIMessage(
+        content="Submitting",
+        tool_calls=[{"name": "submit_subgoal", "args": {}, "id": "c1"}],
+    )
+    fake_llm = ScriptedChatModel(responses=[turn_resp])
+    node_implement(state, workspace=ws, llm=fake_llm)
+
+    assert len(fake_llm.invocations) == 1
+    prompt_text = fake_llm.invocations[0][0].content
+    assert "Product Identity & Business Domain:" in prompt_text
+    assert "Smash Arena | Premium Badminton Court Booking Platform" in prompt_text
+
+
+

@@ -544,7 +544,8 @@ def node_investigate(
         "Instructions:",
         "1. You have read-only access to investigate the codebase using the available tools: `list_dir`, `grep`, and `read_file`.",
         "2. Explore the file structure, find relevant files, and understand existing patterns and architecture.",
-        "3. When you have gathered enough context to plan the implementation, call `finish_investigation` with a comprehensive summary of your findings.",
+        "3. Identify the application's product identity, business domain, and core entity concepts from root metadata (e.g. package.json, layout files, README) and document them in your summary.",
+        "4. When you have gathered enough context to plan the implementation, call `finish_investigation` with a comprehensive summary of your findings.",
     ]
     prompt_text = "\n".join(prompt_lines)
 
@@ -1296,6 +1297,55 @@ def node_implement(
 
         existing_files_context = []
         worktree = getattr(workspace, "worktree_dir", getattr(workspace, "repo_dir", None))
+
+        # Grounding: Extract Product Identity & Business Domain if root metadata is present
+        if worktree:
+            wt_path = Path(worktree)
+            layout_candidates = [
+                wt_path / "src" / "app" / "layout.tsx",
+                wt_path / "src" / "app" / "layout.jsx",
+                wt_path / "src" / "app" / "layout.js",
+                wt_path / "app" / "layout.tsx",
+                wt_path / "app" / "layout.jsx",
+                wt_path / "app" / "layout.js",
+                wt_path / "layout.tsx",
+            ]
+            extracted_title = None
+            extracted_desc = None
+            for cand in layout_candidates:
+                if cand.exists() and cand.is_file():
+                    try:
+                        content = cand.read_text(encoding="utf-8")
+                        title_match = re.search(r'title:\s*["\']([^"\']+)["\']', content)
+                        desc_match = re.search(r'description:\s*["\']([^"\']+)["\']', content)
+                        if title_match:
+                            extracted_title = title_match.group(1).strip()
+                        if desc_match:
+                            extracted_desc = desc_match.group(1).strip()
+                        if extracted_title or extracted_desc:
+                            break
+                    except Exception:
+                        pass
+
+            pkg_json = wt_path / "package.json"
+            if (not extracted_title or not extracted_desc) and pkg_json.exists() and pkg_json.is_file():
+                try:
+                    pkg_data = json.loads(pkg_json.read_text(encoding="utf-8"))
+                    if not extracted_title and "name" in pkg_data:
+                        extracted_title = str(pkg_data["name"]).strip()
+                    if not extracted_desc and "description" in pkg_data:
+                        extracted_desc = str(pkg_data["description"]).strip()
+                except Exception:
+                    pass
+
+            if extracted_title or extracted_desc:
+                identity_lines = ["Product Identity & Business Domain:"]
+                if extracted_title:
+                    identity_lines.append(f"- Title: {extracted_title}")
+                if extracted_desc:
+                    identity_lines.append(f"- Description: {extracted_desc}")
+                prompt_lines.append("\n".join(identity_lines))
+
         if worktree and subgoal.scope:
             for s_file in subgoal.scope:
                 target_file = Path(worktree) / s_file
@@ -1311,10 +1361,11 @@ def node_implement(
         prompt_lines.append(
             "Instructions:\n"
             "1. Strictly adhere to the project architecture, dependencies, styling conventions, and existing component patterns documented in the Investigation Notes. Do not introduce uninstalled libraries or conflicting layout structures (e.g. do not create redundant headers or navbars if layout.tsx or a global component already provides them).\n"
-            "2. When creating or modifying UI components, align with the project's export and import conventions (e.g. if root layouts and surrounding components use default exports such as `export default function Component`, provide default exports so default imports resolve cleanly).\n"
-            "3. Stage all necessary code changes using the `stage_file_mutation` tool.\n"
+            "2. Strictly adhere to the application's actual business domain, product identity, and branding documented in the Investigation Notes and repository. Never invent an alternate sport, brand, company name, or unrelated business model (e.g. do not substitute Padel or Tennis for Badminton).\n"
+            "3. When creating or modifying UI components, align with the project's export and import conventions (e.g. if root layouts and surrounding components use default exports such as `export default function Component`, provide default exports so default imports resolve cleanly).\n"
+            "4. Stage all necessary code changes using the `stage_file_mutation` tool.\n"
             "   Only mutate files within the declared scope.\n"
-            "4. When all changes are staged and you are done, call the `submit_subgoal` tool to submit your work for gate verification."
+            "5. When all changes are staged and you are done, call the `submit_subgoal` tool to submit your work for gate verification."
         )
         prompt_text = "\n\n".join(prompt_lines)
 
@@ -1604,7 +1655,8 @@ def node_gate(
             verdict.reason
             or f"Semantic validation rejected by Gatekeeper{prob_str}. "
                "Diff contradicted project conventions, exceeded declared scope, or failed to implement the required subgoal. "
-               "Ensure changes match the project architecture, dependencies, and styling in Investigation Notes."
+               "Ensure changes match the project architecture, dependencies, and styling in Investigation Notes. "
+               "Ensure changes strictly adhere to the application's actual domain, product identity, and branding documented in Investigation Notes, without introducing conflicting domain concepts, alternate sports/business models, or fabricated external entities."
         )
 
         if current_sem_strikes >= 3 and hasattr(gatekeeper, "escalate_deadlock"):

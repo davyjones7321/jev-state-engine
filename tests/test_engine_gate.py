@@ -278,5 +278,7 @@ def test_node_gate_enriches_feedback_when_verdict_reason_none(base_state):
     assert res["gate_status"] == "semantic_failure"
     assert "0.15" in res["last_feedback"]
     assert "Investigation Notes" in res["last_feedback"]
+    assert "domain" in res["last_feedback"].lower()
+
 
 

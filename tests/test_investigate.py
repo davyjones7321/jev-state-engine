@@ -706,5 +706,22 @@ def test_node_investigate_sets_investigation_incomplete_on_turn_cap(tmp_path):
     assert result.get("investigation_notes") is not None
 
 
+# 24. node_investigate includes domain and product identity discovery instructions in prompt
+def test_node_investigate_includes_domain_discovery_instruction():
+    state: State = {"ticket": "Create About page", "trajectory": []}
+    turn_resp = AIMessage(
+        content="Done",
+        tool_calls=[{"name": "finish_investigation", "args": {"summary": "Notes"}, "id": "c1"}],
+    )
+    fake_llm = ScriptedChatModel(responses=[turn_resp])
+    node_investigate(state, llm=fake_llm)
+
+    assert len(fake_llm.invocations) == 1
+    prompt_text = fake_llm.invocations[0][0].content
+    assert "product identity" in prompt_text.lower()
+    assert "business domain" in prompt_text.lower()
+
+
+
 
 
