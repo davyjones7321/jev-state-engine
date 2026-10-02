@@ -21,6 +21,13 @@ class CompileOutcome(str, Enum):
     ENV_NOT_READY = "ENV_NOT_READY"
 
 
+class TestPolicy(str, Enum):
+    AUTO = "auto"
+    VERIFY_ONLY = "verify-only"
+    NEVER = "never"
+    ALWAYS = "always"
+
+
 class Subgoal(BaseModel):
     description: str = ""
     scope: List[str] = Field(default_factory=list)
@@ -62,5 +69,6 @@ class State(TypedDict, total=False):
     base_commit: Optional[str]
     integration_branch: Optional[str]
     subgoal_base_commit: Optional[str]
+    test_policy: Optional[str]
 
 

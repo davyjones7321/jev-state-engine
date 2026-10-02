@@ -38,6 +38,13 @@ def build_parser() -> argparse.ArgumentParser:
         default="main-thread",
         help="Execution thread identifier for checkpoint persistence",
     )
+    parser.add_argument(
+        "--test-policy",
+        type=str,
+        choices=["auto", "verify-only", "never", "always"],
+        default="auto",
+        help="Execution policy for repository test suites (auto, verify-only, never, always; defaults to auto)",
+    )
     return parser
 
 
@@ -80,6 +87,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         gatekeeper=gatekeeper,
         llm=llm,
         db_path=args.db_path,
+        test_policy=args.test_policy,
     )
 
     final_state = engine.execute(ticket=args.ticket, thread_id=args.thread_id)

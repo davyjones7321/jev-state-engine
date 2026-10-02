@@ -115,6 +115,11 @@ Runs purely local, deterministic checks before touching external networks or API
    * **Python:** `pytest.ini`, `pyproject.toml` (`[tool.pytest]`), or auto-discovered test directories (`test_*.py`, `*_test.py`, `tests/`).
    * **Infrastructure as Code (IaC):** Terraform (`terraform validate`), Ansible (`ansible-lint` / `ansible-playbook --syntax-check`), and Helm (`helm lint`).
 4. **Docs-Only Diff Classification (`_is_docs_only_diff`):** Uses lexical and AST-level comment analysis (supporting Markdown, TypeScript/JavaScript block/line comments, and Python docstrings/comments). When a diff modifies only documentation or comments without altering executable logic, it permits an untested pass even if no unit tests run.
+5. **Configurable Test Execution Policy (`--test-policy`):** Controls when and if native test runners execute during mechanical checks:
+   * **`auto` (Default):** Honors `subgoal.expects_tests`. When a subgoal does not expect tests (`expects_tests == False`), intermediate mechanical checks skip running test suites.
+   * **`verify-only`:** Skips test execution during intermediate subgoals to accelerate development on large repos, running the full test suite once during final verification (`node_verify`).
+   * **`never`:** Disables test runner execution completely (intermediate and final verification), qualifying as an untested pass while still strictly enforcing AST syntax (`check_build`), compilation / typechecks (`check_compile`), and scope creep validation.
+   * **`always`:** Enforces running the full test suite on every single subgoal regardless of `subgoal.expects_tests`.
 
 ### Tier 1: Semantic Gating
 When Tier 0 passes, the staged diff is sent to TypeSafe AI's Jev System One classifier:
@@ -226,6 +231,7 @@ python -m src.main "<TICKET_DESCRIPTION>" [OPTIONS]
 | `--repo-dir` | Path | `.` (Current Dir) | Absolute or relative path to the target repository. |
 | `--db-path` | Path | `checkpoints.db` | Path to the SQLite checkpoint database. |
 | `--thread-id` | String | `main-thread` | Unique thread identifier for state persistence and run resumption. |
+| `--test-policy` | String | `auto` | Test execution policy (`auto`, `verify-only`, `never`, `always`). Controls whether test suites run on every subgoal, only during final verification, or are bypassed entirely. |
 
 ### Examples
 
@@ -237,7 +243,23 @@ python -m src.main "Add docstrings to all exported functions in auth.ts" \
     --thread-id ticket-101
 ```
 
-#### 2. Resume an interrupted or escalated thread
+#### 2. Skip test runner on repositories with pre-existing failures (`--test-policy never`)
+```bash
+python -m src.main "Implement string utilities in src/utils/string.ts" \
+    --repo-dir ../my-target-project \
+    --thread-id ticket-string-utils \
+    --test-policy never
+```
+
+#### 3. Run test runner only during final verification (`--test-policy verify-only`)
+```bash
+python -m src.main "Refactor user authentication pipeline" \
+    --repo-dir ../my-target-project \
+    --thread-id ticket-auth-refactor \
+    --test-policy verify-only
+```
+
+#### 4. Resume an interrupted or escalated thread
 ```bash
 # Resumes execution from the exact state saved under 'ticket-101'
 python -m src.main "Add docstrings to all exported functions in auth.ts" \
@@ -278,7 +300,7 @@ python -m src.main "Add docstrings to all exported functions in auth.ts" \
 
 ## Testing & Quality Gates
 
-The engine includes a comprehensive test suite (187+ unit, integration, and AST security tests).
+The engine includes a comprehensive test suite (264+ unit, integration, and AST security tests).
 
 ### Run Test Suite
 
@@ -312,15 +334,16 @@ jev-state-engine/
 │       ├── __init__.py          # Package initialization
 │       ├── engine.py            # LangGraph FSM (5 nodes, routing, SqliteSaver)
 │       ├── gatekeeper.py        # TypeSafe AI HTTP client (Tier 1 & verification)
-│       ├── models.py            # Pydantic schemas (Subgoal, Verdict, State)
+│       ├── models.py            # Pydantic schemas (Subgoal, Verdict, State, TestPolicy)
 │       └── workspace.py         # Git worktree lifecycle, AST checks, test runners
-├── tests/                       # Comprehensive pytest suite (187+ tests)
+├── tests/                       # Comprehensive pytest suite (264+ tests)
 │   ├── test_engine.py           # FSM graph execution and routing tests
 │   ├── test_gatekeeper.py       # Gatekeeper HTTP retries and payload tests
 │   ├── test_implement.py        # Implementation node and mutation tests
 │   ├── test_investigate.py      # Investigation tools and path confinement tests
 │   ├── test_plan.py             # Planning node, schema validation, and grounding
 │   ├── test_state_guard.py      # AST static audit and schema integrity tests
+│   ├── test_test_policy.py      # Test execution policy (--test-policy) tests
 │   ├── test_workspace.py        # Build checks, multi-ecosystem runners, scope checks
 │   └── test_worktree.py         # Worktree isolation, fast-forward merge, discard
 ├── requirements.txt             # Python dependencies

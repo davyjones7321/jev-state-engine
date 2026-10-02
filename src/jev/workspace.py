@@ -1896,7 +1896,10 @@ class Workspace:
         return record
 
     def run_mechanical_checks(
-        self, subgoal: Subgoal, base_commit: Optional[str] = None
+        self,
+        subgoal: Subgoal,
+        base_commit: Optional[str] = None,
+        test_policy: str = "auto",
     ) -> MechanicalCheckResult:
         self.last_test_run = None
         self.last_compile_run = None
@@ -1971,10 +1974,29 @@ class Workspace:
             )
 
         # 3. run_tests
-        test_outcome = self.run_tests()
-        test_run_details = getattr(self, "last_test_run", None)
+        should_run_tests = False
+        if test_policy == "always":
+            should_run_tests = True
+        elif test_policy == "auto":
+            should_run_tests = getattr(subgoal, "expects_tests", True)
+        elif test_policy in ("never", "verify-only"):
+            should_run_tests = False
 
-        if test_outcome == TestOutcome.ENV_NOT_READY:
+        if should_run_tests:
+            test_outcome = self.run_tests()
+            test_run_details = getattr(self, "last_test_run", None)
+            if isinstance(test_run_details, dict):
+                test_run_details["ran"] = True
+        else:
+            test_outcome = TestOutcome.NO_TESTS_COLLECTED
+            self._record_test_run(
+                None, None, None, "", "", TestOutcome.NO_TESTS_COLLECTED
+            )
+            test_run_details = getattr(self, "last_test_run", None)
+            if isinstance(test_run_details, dict):
+                test_run_details["ran"] = False
+
+        if should_run_tests and test_outcome == TestOutcome.ENV_NOT_READY:
             err_detail = (
                 (test_run_details.get("stderr_tail") or test_run_details.get("output_tail") or "").strip()
                 if test_run_details
@@ -1994,7 +2016,7 @@ class Workspace:
                 compile_outcome=compile_res,
                 test_runner_outcome=test_run_details,
             )
-        elif test_outcome == TestOutcome.FAILED:
+        elif should_run_tests and test_outcome == TestOutcome.FAILED:
             return MechanicalCheckResult(
                 passed=False,
                 failed_check="tests",
@@ -2009,7 +2031,7 @@ class Workspace:
                 compile_outcome=compile_res,
                 test_runner_outcome=test_run_details,
             )
-        elif test_outcome == TestOutcome.NO_TESTS_COLLECTED:
+        elif should_run_tests and test_outcome == TestOutcome.NO_TESTS_COLLECTED:
             if subgoal.expects_tests:
                 if not self._is_docs_only_diff(diff):
                     detail_msg = "No tests collected when expects_tests is True and diff contains code changes."
@@ -2037,11 +2059,11 @@ class Workspace:
                 passed=False,
                 failed_check="scope",
                 detail=scope_res.detail,
-                checks_run=["build", "compile", "tests", "scope"],
+                checks_run=["build", "compile", "tests", "scope"] if should_run_tests else ["build", "compile", "scope"],
                 checks={
                     "build": {"ran": True, "passed": True, "detail": ""},
                     "compile": {"ran": True, "passed": True, "detail": compile_res.get("detail", "")},
-                    "tests": {"ran": True, "passed": True, "detail": ""},
+                    "tests": {"ran": should_run_tests, "passed": True, "detail": "" if should_run_tests else f"Skipped per test policy: {test_policy}"},
                     "scope": {"ran": True, "passed": False, "detail": scope_res.detail},
                 },
                 compile_outcome=compile_res,
@@ -2049,15 +2071,19 @@ class Workspace:
             )
 
         untested_flag = (
-            "Untested pass: NO_TEST_FRAMEWORK."
-            if test_outcome == TestOutcome.NO_TEST_FRAMEWORK
+            f"Untested pass: skipped per test_policy={test_policy}."
+            if not should_run_tests
             else (
-                "Untested pass: docs-only diff with NO_TESTS_COLLECTED."
-                if test_outcome == TestOutcome.NO_TESTS_COLLECTED and subgoal.expects_tests
+                "Untested pass: NO_TEST_FRAMEWORK."
+                if test_outcome == TestOutcome.NO_TEST_FRAMEWORK
                 else (
-                    "Untested pass: expects_tests=False with NO_TESTS_COLLECTED."
-                    if test_outcome == TestOutcome.NO_TESTS_COLLECTED
-                    else ""
+                    "Untested pass: docs-only diff with NO_TESTS_COLLECTED."
+                    if test_outcome == TestOutcome.NO_TESTS_COLLECTED and subgoal.expects_tests
+                    else (
+                        "Untested pass: expects_tests=False with NO_TESTS_COLLECTED."
+                        if test_outcome == TestOutcome.NO_TESTS_COLLECTED
+                        else ""
+                    )
                 )
             )
         )
@@ -2065,11 +2091,11 @@ class Workspace:
             passed=True,
             failed_check=None,
             detail=untested_flag,
-            checks_run=["build", "compile", "tests", "scope"],
+            checks_run=["build", "compile", "tests", "scope"] if should_run_tests else ["build", "compile", "scope"],
             checks={
                 "build": {"ran": True, "passed": True, "detail": ""},
                 "compile": {"ran": True, "passed": True, "detail": compile_res.get("detail", "")},
-                "tests": {"ran": True, "passed": True, "detail": untested_flag or "passed"},
+                "tests": {"ran": should_run_tests, "passed": True, "detail": untested_flag or "passed"},
                 "scope": {"ran": True, "passed": True, "detail": ""},
             },
             compile_outcome=compile_res,

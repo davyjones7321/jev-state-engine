@@ -1762,10 +1762,13 @@ def node_gate(
 
     # Tier 0: Mechanical checks
     subgoal_base_commit = state.get("subgoal_base_commit")
+    test_policy = state.get("test_policy", "auto")
+    kwargs: Dict[str, Any] = {}
     if _accepts_param(workspace.run_mechanical_checks, "base_commit"):
-        mech_result = workspace.run_mechanical_checks(subgoal, base_commit=subgoal_base_commit)
-    else:
-        mech_result = workspace.run_mechanical_checks(subgoal)
+        kwargs["base_commit"] = subgoal_base_commit
+    if _accepts_param(workspace.run_mechanical_checks, "test_policy"):
+        kwargs["test_policy"] = test_policy
+    mech_result = workspace.run_mechanical_checks(subgoal, **kwargs)
 
     tier0_telemetry = {
         "passed": mech_result.passed,
@@ -1790,7 +1793,7 @@ def node_gate(
     elif tier0_telemetry.get("checks", {}).get("tests", {}).get("ran"):
         tests_ran = True
 
-    if not tests_ran:
+    if mech_result.failed_check in ("build", "compile", "no_compile_command", "env_not_ready") or (not tests_ran and not mech_result.passed):
         test_runner_telemetry = {"ran": False}
     else:
         test_runner_telemetry = getattr(mech_result, "test_runner_outcome", None)
@@ -1798,14 +1801,19 @@ def node_gate(
             test_runner_telemetry = workspace.last_test_run
         if test_runner_telemetry is None:
             test_runner_telemetry = {
+                "ran": tests_ran,
                 "ecosystem": None,
                 "command": None,
                 "exit_code": None,
                 "stdout_tail": "",
                 "stderr_tail": "",
                 "output_tail": "",
-                "outcome": "PASSED" if mech_result.passed or mech_result.failed_check != "tests" else "FAILED",
+                "outcome": "PASSED" if mech_result.passed or mech_result.failed_check != "tests" else ("NO_TESTS_COLLECTED" if not tests_ran else "FAILED"),
             }
+        elif isinstance(test_runner_telemetry, dict):
+            test_runner_telemetry = dict(test_runner_telemetry)
+            if "ran" not in test_runner_telemetry:
+                test_runner_telemetry["ran"] = tests_ran
 
     compile_telemetry = getattr(mech_result, "compile_outcome", None)
     if compile_telemetry is None and hasattr(workspace, "last_compile_run"):
@@ -2137,7 +2145,12 @@ def node_verify(
         test_output = ""
         tests_ran = False
         outcome = None
-        if workspace is not None and hasattr(workspace, "run_tests"):
+        test_policy = state.get("test_policy", "auto")
+        if test_policy == "never":
+            outcome = TestOutcome.NO_TESTS_COLLECTED
+            test_output = "NO_TESTS_COLLECTED (Untested pass: tests disabled via test_policy=never)"
+            tests_ran = False
+        elif workspace is not None and hasattr(workspace, "run_tests"):
             outcome = workspace.run_tests()
             tests_ran = True
             test_output = getattr(outcome, "value", str(outcome))
@@ -2190,11 +2203,21 @@ def node_verify(
             test_output = "NO_TEST_FRAMEWORK (Untested pass: no test framework present in workspace)"
 
         if not tests_ran:
-            test_runner_info = {"ran": False}
+            test_runner_info = {
+                "ran": False,
+                "ecosystem": None,
+                "command": None,
+                "exit_code": None,
+                "stdout_tail": "",
+                "stderr_tail": "",
+                "output_tail": "",
+                "outcome": getattr(outcome, "value", str(outcome)) if 'outcome' in locals() and outcome is not None else "NO_TESTS_COLLECTED",
+            }
         else:
             test_runner_info = getattr(workspace, "last_test_run", None)
             if test_runner_info is None:
                 test_runner_info = {
+                    "ran": True,
                     "ecosystem": None,
                     "command": None,
                     "exit_code": None,
@@ -2203,6 +2226,9 @@ def node_verify(
                     "output_tail": "",
                     "outcome": getattr(outcome, "value", str(outcome)) if 'outcome' in locals() else "UNKNOWN",
                 }
+            elif isinstance(test_runner_info, dict):
+                test_runner_info = dict(test_runner_info)
+                test_runner_info["ran"] = True
 
         verdict = None
         if gatekeeper is not None and hasattr(gatekeeper, "verify_ticket"):
@@ -2399,10 +2425,12 @@ class JevEngine:
         llm: Optional[Any] = None,
         db_path: Optional[Union[str, Path]] = "checkpoints.db",
         checkpointer: Optional[BaseCheckpointSaver] = None,
+        test_policy: str = "auto",
     ):
         self.workspace = workspace
         self.gatekeeper = gatekeeper
         self.llm = llm
+        self.test_policy = test_policy
 
         if checkpointer is not None:
             self.checkpointer = checkpointer
@@ -2507,6 +2535,7 @@ class JevEngine:
             "base_commit": base_commit,
             "integration_branch": integration_branch,
             "subgoal_base_commit": base_commit,
+            "test_policy": self.test_policy,
             "plan_queue": [],
             "current_subgoal": None,
             "mechanical_strike_count": 0,
