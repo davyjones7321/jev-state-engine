@@ -23,7 +23,8 @@ from langgraph.checkpoint.base import (
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from jev.models import State, Subgoal
+from jev.models import State, Subgoal, TestOutcome
+from jev.workspace import MainDivergedError, TrackedModificationsError, Workspace
 
 
 
@@ -1397,7 +1398,15 @@ def node_implement(
             subgoal_desc = getattr(subgoal, "description", "") or "subgoal"
             clean_desc = re.sub(r"[^a-zA-Z0-9_-]", "_", subgoal_desc)[:20].strip("_") or "subgoal"
             subgoal_id = f"{clean_desc}_{uuid.uuid4().hex[:6]}"
-            wt_path = workspace.create_subgoal_worktree(subgoal_id)
+            base_ref = state.get("integration_branch") or "HEAD"
+            if hasattr(workspace, "get_branch_commit") and state.get("integration_branch"):
+                try:
+                    state["subgoal_base_commit"] = workspace.get_branch_commit(state["integration_branch"])
+                except Exception:
+                    state["subgoal_base_commit"] = state.get("base_commit")
+            elif hasattr(workspace, "base_commit"):
+                state["subgoal_base_commit"] = workspace.base_commit
+            wt_path = workspace.create_subgoal_worktree(subgoal_id, base_ref=base_ref)
             state["current_worktree_path"] = str(wt_path)
             state["current_worktree_branch"] = f"jev-subgoal-{subgoal_id}"
         elif hasattr(workspace, "worktree_dir") and state.get("current_worktree_path"):
@@ -1667,6 +1676,55 @@ def _get_active_worktree_info(state: State, workspace: Optional[Any]) -> tuple[O
     return resolved_path, resolved_branch
 
 
+def _format_compile_feedback(
+    compile_info: Dict[str, Any], fallback_detail: str = ""
+) -> str:
+    cmd = compile_info.get("command")
+    cmd_str = " ".join(cmd) if isinstance(cmd, list) else str(cmd or "")
+    new_errors = compile_info.get("new_errors") or []
+
+    if not new_errors:
+        if cmd_str:
+            return f"Compile command failed: {cmd_str}\n{fallback_detail or compile_info.get('detail', '')}".strip()
+        return fallback_detail or compile_info.get("detail", "Compile check failed.")
+
+    header_lines = []
+    if cmd_str:
+        header_lines.append(f"Command: {cmd_str}")
+    header_lines.append("Errors:")
+    header = "\n".join(header_lines)
+
+    max_lines = 20
+    max_total_chars = 3000
+
+    selected_errors: List[str] = []
+
+    for err in new_errors:
+        err_str = str(err).strip()
+        if not err_str:
+            continue
+        if len(selected_errors) >= max_lines:
+            break
+
+        remaining_if_stopped = len(new_errors) - (len(selected_errors) + 1)
+        omission_line = f"\n...and {remaining_if_stopped} more errors omitted" if remaining_if_stopped > 0 else ""
+
+        candidate_body = "\n".join(selected_errors + [err_str])
+        candidate_total = f"{header}\n{candidate_body}{omission_line}"
+
+        if len(candidate_total) > max_total_chars and selected_errors:
+            break
+
+        selected_errors.append(err_str)
+
+    omitted = len(new_errors) - len(selected_errors)
+    out_lines = [header] + selected_errors
+    if omitted > 0:
+        out_lines.append(f"...and {omitted} more errors omitted")
+
+    return "\n".join(out_lines)
+
+
 def node_gate(
     state: State,
     workspace: Optional[Any] = None,
@@ -1703,7 +1761,11 @@ def node_gate(
         subgoal = Subgoal()
 
     # Tier 0: Mechanical checks
-    mech_result = workspace.run_mechanical_checks(subgoal)
+    subgoal_base_commit = state.get("subgoal_base_commit")
+    if _accepts_param(workspace.run_mechanical_checks, "base_commit"):
+        mech_result = workspace.run_mechanical_checks(subgoal, base_commit=subgoal_base_commit)
+    else:
+        mech_result = workspace.run_mechanical_checks(subgoal)
 
     tier0_telemetry = {
         "passed": mech_result.passed,
@@ -1716,24 +1778,34 @@ def node_gate(
         failed = mech_result.failed_check
         tier0_telemetry["checks"] = {
             "build": {"ran": True, "passed": failed != "build", "detail": mech_result.detail if failed == "build" else ""},
-            "tests": {"ran": failed not in ("build",), "passed": failed not in ("build", "tests", "no_tests_collected") if failed else True, "detail": mech_result.detail if failed in ("tests", "no_tests_collected") else ""},
-            "scope": {"ran": failed not in ("build", "tests", "no_tests_collected"), "passed": failed != "scope", "detail": mech_result.detail if failed == "scope" else ""},
+            "compile": {"ran": failed not in ("build",), "passed": failed not in ("build", "compile", "no_compile_command", "env_not_ready") if failed else True, "detail": mech_result.detail if failed in ("compile", "no_compile_command", "env_not_ready") else ""},
+            "tests": {"ran": failed not in ("build", "compile", "no_compile_command", "env_not_ready"), "passed": failed not in ("build", "compile", "no_compile_command", "env_not_ready", "tests", "no_tests_collected") if failed else True, "detail": mech_result.detail if failed in ("tests", "no_tests_collected") else ""},
+            "scope": {"ran": failed not in ("build", "compile", "no_compile_command", "env_not_ready", "tests", "no_tests_collected"), "passed": failed != "scope", "detail": mech_result.detail if failed == "scope" else ""},
         }
         tier0_telemetry["checks_run"] = [k for k, v in tier0_telemetry["checks"].items() if v.get("ran")]
 
-    test_runner_telemetry = getattr(mech_result, "test_runner_outcome", None)
-    if test_runner_telemetry is None and hasattr(workspace, "last_test_run"):
-        test_runner_telemetry = workspace.last_test_run
-    if test_runner_telemetry is None and tier0_telemetry["checks"]["tests"]["ran"]:
-        test_runner_telemetry = {
-            "ecosystem": None,
-            "command": None,
-            "exit_code": None,
-            "stdout_tail": "",
-            "stderr_tail": "",
-            "output_tail": "",
-            "outcome": "PASSED" if mech_result.passed or mech_result.failed_check != "tests" else "FAILED",
-        }
+    tests_ran = False
+    if "tests" in tier0_telemetry.get("checks_run", []):
+        tests_ran = True
+    elif tier0_telemetry.get("checks", {}).get("tests", {}).get("ran"):
+        tests_ran = True
+
+    if not tests_ran:
+        test_runner_telemetry = {"ran": False}
+    else:
+        test_runner_telemetry = getattr(mech_result, "test_runner_outcome", None)
+        if test_runner_telemetry is None and hasattr(workspace, "last_test_run"):
+            test_runner_telemetry = workspace.last_test_run
+        if test_runner_telemetry is None:
+            test_runner_telemetry = {
+                "ecosystem": None,
+                "command": None,
+                "exit_code": None,
+                "stdout_tail": "",
+                "stderr_tail": "",
+                "output_tail": "",
+                "outcome": "PASSED" if mech_result.passed or mech_result.failed_check != "tests" else "FAILED",
+            }
 
     compile_telemetry = getattr(mech_result, "compile_outcome", None)
     if compile_telemetry is None and hasattr(workspace, "last_compile_run"):
@@ -1786,13 +1858,20 @@ def node_gate(
                 gatekeeper.escalate_deadlock(
                     trajectory=state.get("trajectory", []),
                     triggering_tier="mechanical",
+                    integration_branch=state.get("integration_branch"),
                 )
             return state
 
         current_mech_strikes = state.get("mechanical_strike_count", 0) + 1
         state["mechanical_strike_count"] = current_mech_strikes
         state["gate_status"] = "mechanical_failure"
-        state["last_feedback"] = mech_result.detail
+        if mech_result.failed_check == "compile":
+            state["last_feedback"] = _format_compile_feedback(
+                compile_telemetry or getattr(mech_result, "compile_outcome", None) or {},
+                fallback_detail=mech_result.detail,
+            )
+        else:
+            state["last_feedback"] = mech_result.detail
 
         state["trajectory"].append({
             "node": "gate",
@@ -1806,9 +1885,13 @@ def node_gate(
         })
 
         if current_mech_strikes >= 3 and gatekeeper is not None and hasattr(gatekeeper, "escalate_deadlock"):
+            kwargs: Dict[str, Any] = {}
+            if state.get("integration_branch"):
+                kwargs["integration_branch"] = state.get("integration_branch")
             gatekeeper.escalate_deadlock(
                 trajectory=state.get("trajectory", []),
                 triggering_tier="mechanical",
+                **kwargs,
             )
         return state
 
@@ -1844,10 +1927,29 @@ def node_gate(
         is_worktree_active = _is_active_worktree(state, workspace)
 
         if wt_path and hasattr(workspace, "merge_subgoal_worktree"):
+            target_branch = state.get("integration_branch")
+            if not target_branch:
+                state["gate_status"] = "merge_failed"
+                state["status"] = "escalated"
+                err_msg = "Worktree merge failed: integration_branch is missing from state"
+                state["last_feedback"] = err_msg
+                state["trajectory"].append({
+                    "node": "gate",
+                    "error_type": "missing_integration_branch",
+                    "error": err_msg,
+                    "gate_status": "merge_failed",
+                })
+                if gatekeeper is not None and hasattr(gatekeeper, "escalate_deadlock"):
+                    gatekeeper.escalate_deadlock(
+                        trajectory=state.get("trajectory", []),
+                        triggering_tier="merge",
+                    )
+                return state
             try:
                 workspace.merge_subgoal_worktree(
                     wt_path,
                     wt_branch,
+                    target_branch=target_branch,
                 )
             except Exception as e:
                 state["gate_status"] = "merge_failed"
@@ -1863,6 +1965,7 @@ def node_gate(
                     gatekeeper.escalate_deadlock(
                         trajectory=state.get("trajectory", []),
                         triggering_tier="merge",
+                        integration_branch=target_branch,
                     )
                 return state
         elif is_worktree_active:
@@ -1889,6 +1992,7 @@ def node_gate(
                 gatekeeper.escalate_deadlock(
                     trajectory=state.get("trajectory", []),
                     triggering_tier="worktree",
+                    integration_branch=state.get("integration_branch"),
                 )
             return state
         elif hasattr(workspace, "commit_subgoal"):
@@ -1949,9 +2053,13 @@ def node_gate(
         })
 
         if current_sem_strikes >= 3 and hasattr(gatekeeper, "escalate_deadlock"):
+            kwargs: Dict[str, Any] = {}
+            if state.get("integration_branch"):
+                kwargs["integration_branch"] = state.get("integration_branch")
             gatekeeper.escalate_deadlock(
                 trajectory=state.get("trajectory", []),
                 triggering_tier="semantic",
+                **kwargs,
             )
 
         return state
@@ -1962,19 +2070,108 @@ def node_verify(
     workspace: Optional[Any] = None,
     gatekeeper: Optional[Any] = None,
 ) -> State:
-    """State 4: VERIFICATION (Executes full test suite and final ticket verification)."""
+    """State 4: VERIFICATION (Executes full test suite and final ticket verification on a dedicated verify worktree)."""
     if "trajectory" not in state or state["trajectory"] is None:
         state["trajectory"] = []
 
-    try:
-        # Ensure workspace points to the main repository (workspace.repo_dir) for all verification checks
-        if workspace is not None and hasattr(workspace, "repo_dir") and isinstance(workspace.repo_dir, Path):
-            workspace.worktree_dir = workspace.repo_dir
+    integration_branch = state.get("integration_branch")
+    base_commit = state.get("base_commit")
+    ticket = state.get("ticket", "")
+    inv_notes = state.get("investigation_notes")
 
+    verify_wt_path = None
+    compile_info = None
+    test_runner_info = {"ran": False}
+    final_diff = ""
+
+    try:
+        # 0. Create dedicated detached worktree off the integration branch
+        if not integration_branch:
+            raise ValueError("integration_branch is required for verification; direct verification on main is disallowed")
+        if workspace is not None and hasattr(workspace, "create_verify_worktree"):
+            verify_wt_path = workspace.create_verify_worktree(integration_branch)
+
+        if workspace is not None:
+            if hasattr(workspace, "get_cumulative_diff"):
+                final_diff = workspace.get_cumulative_diff(base_ref=base_commit)
+            elif hasattr(workspace, "get_staged_diff"):
+                final_diff = workspace.get_staged_diff()
+
+        if not final_diff and workspace is not None and hasattr(workspace, "get_staged_diff"):
+            final_diff = workspace.get_staged_diff()
+
+        # 1. Compile check against base_commit
+        if workspace is not None and hasattr(workspace, "check_compile"):
+            compile_info = workspace.check_compile(diff=final_diff, base_commit=base_commit)
+
+        if compile_info is not None and compile_info.get("outcome") in ("FAILED", "NO_COMPILE_COMMAND", "ENV_NOT_READY"):
+            state["gate_status"] = "verification_failed"
+            state["status"] = "escalated" if compile_info.get("outcome") in ("NO_COMPILE_COMMAND", "ENV_NOT_READY") else "verification_failed"
+            state["last_feedback"] = f"Final compile check failed: {compile_info.get('detail')}"
+            verify_entry = {
+                "node": "verify",
+                "gate_status": "verification_failed",
+                "status": state["status"],
+                "compile": compile_info,
+                "test_runner": {"ran": False},
+                "jev_request": {
+                    "ticket": ticket,
+                    "diff_size": len(final_diff),
+                    "investigation_notes_included": bool(inv_notes),
+                },
+                "jev_verdict": None,
+            }
+            state["trajectory"].append(verify_entry)
+            if gatekeeper is not None and hasattr(gatekeeper, "escalate_deadlock"):
+                kwargs: Dict[str, Any] = {}
+                if integration_branch:
+                    kwargs["integration_branch"] = integration_branch
+                gatekeeper.escalate_deadlock(
+                    trajectory=state.get("trajectory", []),
+                    triggering_tier="mechanical",
+                    **kwargs,
+                )
+            return state
+
+        # 2. Run unit tests
         test_output = ""
+        tests_ran = False
+        outcome = None
         if workspace is not None and hasattr(workspace, "run_tests"):
             outcome = workspace.run_tests()
+            tests_ran = True
             test_output = getattr(outcome, "value", str(outcome))
+
+        if outcome == TestOutcome.ENV_NOT_READY or test_output == "ENV_NOT_READY":
+            test_runner_info = getattr(workspace, "last_test_run", None)
+            err_detail = (test_runner_info or {}).get("stderr_tail") or "Test runner executable not found."
+            state["gate_status"] = "verification_failed"
+            state["status"] = "escalated"
+            state["last_feedback"] = f"Final test check failed: Environment not ready: {err_detail}"
+            verify_entry = {
+                "node": "verify",
+                "gate_status": "verification_failed",
+                "status": "escalated",
+                "compile": compile_info,
+                "test_runner": test_runner_info,
+                "jev_request": {
+                    "ticket": ticket,
+                    "diff_size": len(final_diff),
+                    "investigation_notes_included": bool(inv_notes),
+                },
+                "jev_verdict": None,
+            }
+            state["trajectory"].append(verify_entry)
+            if gatekeeper is not None and hasattr(gatekeeper, "escalate_deadlock"):
+                kwargs: Dict[str, Any] = {}
+                if integration_branch:
+                    kwargs["integration_branch"] = integration_branch
+                gatekeeper.escalate_deadlock(
+                    trajectory=state.get("trajectory", []),
+                    triggering_tier="mechanical",
+                    **kwargs,
+                )
+            return state
 
         # Determine if any subgoals expected automated tests
         any_expects_tests = False
@@ -1992,60 +2189,20 @@ def node_verify(
         elif test_output == "NO_TEST_FRAMEWORK":
             test_output = "NO_TEST_FRAMEWORK (Untested pass: no test framework present in workspace)"
 
-        final_diff = ""
-        if workspace is not None:
-            if hasattr(workspace, "get_cumulative_diff"):
-                final_diff = workspace.get_cumulative_diff()
-            elif hasattr(workspace, "get_staged_diff"):
-                final_diff = workspace.get_staged_diff()
-
-        if not final_diff and workspace is not None and hasattr(workspace, "get_staged_diff"):
-            final_diff = workspace.get_staged_diff()
-
-        # Compile check on final merged tree
-        compile_info = None
-        if workspace is not None and hasattr(workspace, "check_compile"):
-            compile_info = workspace.check_compile(diff=final_diff)
-
-        test_runner_info = getattr(workspace, "last_test_run", None)
-        if test_runner_info is None:
-            test_runner_info = {
-                "ecosystem": None,
-                "command": None,
-                "exit_code": None,
-                "stdout_tail": "",
-                "stderr_tail": "",
-                "output_tail": "",
-                "outcome": getattr(outcome, "value", str(outcome)) if 'outcome' in locals() else "UNKNOWN",
-            }
-
-        ticket = state.get("ticket", "")
-        inv_notes = state.get("investigation_notes")
-
-        if compile_info is not None and compile_info.get("outcome") in ("FAILED", "NO_COMPILE_COMMAND", "ENV_NOT_READY"):
-            state["gate_status"] = "verification_failed"
-            state["status"] = "escalated" if compile_info.get("outcome") in ("NO_COMPILE_COMMAND", "ENV_NOT_READY") else "verification_failed"
-            state["last_feedback"] = f"Final compile check failed: {compile_info.get('detail')}"
-            verify_entry = {
-                "node": "verify",
-                "gate_status": "verification_failed",
-                "status": state["status"],
-                "compile": compile_info,
-                "test_runner": test_runner_info,
-                "jev_request": {
-                    "ticket": ticket,
-                    "diff_size": len(final_diff),
-                    "investigation_notes_included": bool(inv_notes),
-                },
-                "jev_verdict": None,
-            }
-            state["trajectory"].append(verify_entry)
-            if gatekeeper is not None and hasattr(gatekeeper, "escalate_deadlock"):
-                gatekeeper.escalate_deadlock(
-                    trajectory=state.get("trajectory", []),
-                    triggering_tier="mechanical",
-                )
-            return state
+        if not tests_ran:
+            test_runner_info = {"ran": False}
+        else:
+            test_runner_info = getattr(workspace, "last_test_run", None)
+            if test_runner_info is None:
+                test_runner_info = {
+                    "ecosystem": None,
+                    "command": None,
+                    "exit_code": None,
+                    "stdout_tail": "",
+                    "stderr_tail": "",
+                    "output_tail": "",
+                    "outcome": getattr(outcome, "value", str(outcome)) if 'outcome' in locals() else "UNKNOWN",
+                }
 
         verdict = None
         if gatekeeper is not None and hasattr(gatekeeper, "verify_ticket"):
@@ -2055,6 +2212,19 @@ def node_verify(
                 verdict = gatekeeper.verify_ticket(ticket, final_diff, test_output)
 
             if verdict.valid:
+                # Discard verify worktree safely first
+                if verify_wt_path and hasattr(workspace, "discard_verify_worktree"):
+                    workspace.discard_verify_worktree(verify_wt_path)
+                    verify_wt_path = None
+
+                # Fast-forward main to integration branch
+                if workspace is not None and hasattr(workspace, "fast_forward_main"):
+                    workspace.fast_forward_main(integration_branch, base_commit=base_commit)
+
+                # Delete integration branch on successful landing
+                if workspace is not None and hasattr(workspace, "delete_integration_branch"):
+                    workspace.delete_integration_branch(integration_branch)
+
                 state["gate_status"] = "verified"
                 state["status"] = "completed"
                 state["last_feedback"] = ""
@@ -2064,6 +2234,13 @@ def node_verify(
                 prob_str = f" (confidence: {verdict.probability:.2f})" if hasattr(verdict, "probability") and isinstance(verdict.probability, (int, float)) else ""
                 state["last_feedback"] = verdict.reason or f"Verification rejected by Gatekeeper{prob_str}."
         else:
+            if verify_wt_path and hasattr(workspace, "discard_verify_worktree"):
+                workspace.discard_verify_worktree(verify_wt_path)
+                verify_wt_path = None
+            if workspace is not None and hasattr(workspace, "fast_forward_main"):
+                workspace.fast_forward_main(integration_branch, base_commit=base_commit)
+            if workspace is not None and hasattr(workspace, "delete_integration_branch"):
+                workspace.delete_integration_branch(integration_branch)
             state["gate_status"] = "verified"
             state["status"] = "completed"
 
@@ -2093,11 +2270,47 @@ def node_verify(
         state["trajectory"].append(verify_entry)
 
         if state.get("gate_status") == "verification_failed" and gatekeeper is not None and hasattr(gatekeeper, "escalate_deadlock"):
+            kwargs: Dict[str, Any] = {}
+            if integration_branch:
+                kwargs["integration_branch"] = integration_branch
             gatekeeper.escalate_deadlock(
                 trajectory=state.get("trajectory", []),
                 triggering_tier="verification",
+                **kwargs,
             )
         return state
+
+    except (MainDivergedError, TrackedModificationsError) as e:
+        status_key = "main_diverged" if isinstance(e, MainDivergedError) else "tracked_modifications"
+        state["gate_status"] = status_key
+        state["status"] = "escalated"
+        state["last_feedback"] = str(e)
+        state["trajectory"].append({
+            "node": "verify",
+            "error_type": status_key,
+            "error": str(e),
+            "gate_status": status_key,
+            "status": "escalated",
+            "compile": compile_info,
+            "test_runner": test_runner_info,
+            "jev_request": {
+                "ticket": ticket,
+                "diff_size": len(final_diff),
+                "investigation_notes_included": bool(inv_notes),
+            },
+            "jev_verdict": None,
+        })
+        if gatekeeper is not None and hasattr(gatekeeper, "escalate_deadlock"):
+            kwargs = {}
+            if integration_branch:
+                kwargs["integration_branch"] = integration_branch
+            gatekeeper.escalate_deadlock(
+                trajectory=state.get("trajectory", []),
+                triggering_tier="verification",
+                **kwargs,
+            )
+        return state
+
     except Exception as e:
         state["gate_status"] = "verification_failed"
         state["status"] = "escalated"
@@ -2109,20 +2322,28 @@ def node_verify(
             "gate_status": "verification_failed",
             "status": "escalated",
             "compile": compile_info if 'compile_info' in locals() else getattr(workspace, "last_compile_run", None),
-            "test_runner": getattr(workspace, "last_test_run", None),
+            "test_runner": test_runner_info,
             "jev_request": {
-                "ticket": state.get("ticket", ""),
-                "diff_size": len(final_diff) if 'final_diff' in locals() else 0,
-                "investigation_notes_included": bool(state.get("investigation_notes")),
+                "ticket": ticket,
+                "diff_size": len(final_diff),
+                "investigation_notes_included": bool(inv_notes),
             },
             "jev_verdict": None,
         })
         if gatekeeper is not None and hasattr(gatekeeper, "escalate_deadlock"):
+            kwargs = {}
+            if integration_branch:
+                kwargs["integration_branch"] = integration_branch
             gatekeeper.escalate_deadlock(
                 trajectory=state.get("trajectory", []),
                 triggering_tier="verification",
+                **kwargs,
             )
         return state
+
+    finally:
+        if verify_wt_path and workspace is not None and hasattr(workspace, "discard_verify_worktree"):
+            workspace.discard_verify_worktree(verify_wt_path)
 
 
 
@@ -2269,8 +2490,23 @@ class JevEngine:
         return builder.compile(checkpointer=self.checkpointer)
 
     def execute(self, ticket: str, thread_id: str = "default") -> State:
+        base_commit = None
+        if self.workspace is not None:
+            if hasattr(self.workspace, "base_commit") and self.workspace.base_commit:
+                base_commit = self.workspace.base_commit
+            elif hasattr(self.workspace, "_get_head_commit"):
+                base_commit = self.workspace._get_head_commit()
+
+        integration_branch = f"jev-ticket-{thread_id}"
+        if self.workspace is not None and hasattr(self.workspace, "create_integration_branch"):
+            self.workspace.create_integration_branch(integration_branch, base_commit=base_commit)
+
         initial_state: State = {
             "ticket": ticket,
+            "thread_id": thread_id,
+            "base_commit": base_commit,
+            "integration_branch": integration_branch,
+            "subgoal_base_commit": base_commit,
             "plan_queue": [],
             "current_subgoal": None,
             "mechanical_strike_count": 0,

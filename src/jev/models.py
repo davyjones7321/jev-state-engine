@@ -10,6 +10,7 @@ class TestOutcome(str, Enum):
     FAILED = "FAILED"
     NO_TESTS_COLLECTED = "NO_TESTS_COLLECTED"
     NO_TEST_FRAMEWORK = "NO_TEST_FRAMEWORK"
+    ENV_NOT_READY = "ENV_NOT_READY"
 
 
 class CompileOutcome(str, Enum):
@@ -57,4 +58,9 @@ class State(TypedDict, total=False):
     investigation_incomplete: bool
     current_worktree_path: Optional[str]
     current_worktree_branch: Optional[str]
+    thread_id: Optional[str]
+    base_commit: Optional[str]
+    integration_branch: Optional[str]
+    subgoal_base_commit: Optional[str]
+
 

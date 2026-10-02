@@ -17,6 +17,16 @@ from pydantic import BaseModel, Field
 from jev.models import CompileOutcome, MechanicalCheckResult, Subgoal, TestOutcome
 
 
+class MainDivergedError(RuntimeError):
+    """Raised when main branch diverged from base_commit or cannot be fast-forwarded."""
+    pass
+
+
+class TrackedModificationsError(RuntimeError):
+    """Raised when working tree has tracked modifications preventing fast-forward."""
+    pass
+
+
 @dataclass(frozen=True)
 class DiagnosticError:
     raw_line: str
@@ -390,10 +400,16 @@ class Workspace:
         return outcome
 
     def _get_head_commit(self) -> Optional[str]:
-        res = self._run_git(["rev-parse", "HEAD"])
+        res = self._run_repo_git(["rev-parse", "HEAD"])
         if res.returncode == 0 and res.stdout.strip():
             return res.stdout.strip()
         return None
+
+    def get_current_head(self) -> str:
+        sha = self._get_head_commit()
+        if not sha:
+            raise RuntimeError("Could not resolve current HEAD")
+        return sha
 
     def _run_git(self, args: List[str], check: bool = False) -> subprocess.CompletedProcess:
         return subprocess.run(
@@ -490,10 +506,11 @@ class Workspace:
             res = self._run_git(["diff", "--cached"])
         return res.stdout
 
-    def get_cumulative_diff(self) -> str:
-        """Returns the full cumulative diff since workspace initialization (both committed and uncommitted)."""
-        if self.base_commit:
-            res = self._run_git(["diff", self.base_commit])
+    def get_cumulative_diff(self, base_ref: Optional[str] = None) -> str:
+        """Returns the full cumulative diff since workspace initialization or base_ref (both committed and uncommitted)."""
+        ref = base_ref or self.base_commit
+        if ref:
+            res = self._run_git(["diff", ref])
             if res.returncode == 0 and res.stdout.strip():
                 return res.stdout
         return self.get_staged_diff()
@@ -565,8 +582,28 @@ class Workspace:
         if path.exists():
             shutil.rmtree(path, onerror=on_error)
 
-    def create_subgoal_worktree(self, subgoal_id: str) -> Path:
-        """Creates an isolated git worktree for a subgoal."""
+    def create_integration_branch(self, branch_name: str, base_commit: Optional[str] = None) -> str:
+        """Creates an integration branch from base_commit."""
+        base_ref = base_commit or self.base_commit or "HEAD"
+        self._run_repo_git(["branch", "-D", branch_name])
+        res = self._run_repo_git(["branch", branch_name, base_ref])
+        if res.returncode != 0:
+            raise RuntimeError(f"Failed to create integration branch {branch_name} from {base_ref}: {res.stderr or res.stdout}")
+        return branch_name
+
+    def delete_integration_branch(self, branch_name: str) -> None:
+        """Deletes the integration branch."""
+        self._run_repo_git(["branch", "-D", branch_name])
+
+    def get_branch_commit(self, branch_name: str) -> str:
+        """Returns the commit SHA for a branch."""
+        res = self._run_repo_git(["rev-parse", branch_name])
+        if res.returncode == 0 and res.stdout.strip():
+            return res.stdout.strip()
+        raise RuntimeError(f"Could not resolve commit for branch {branch_name}")
+
+    def create_subgoal_worktree(self, subgoal_id: str, base_ref: Optional[str] = None) -> Path:
+        """Creates an isolated git worktree for a subgoal branching from base_ref."""
         worktree_base = self.repo_dir / ".jev-worktrees"
         worktree_base.mkdir(parents=True, exist_ok=True)
 
@@ -596,7 +633,8 @@ class Workspace:
 
         self._run_repo_git(["branch", "-D", branch_name])
 
-        res = self._run_repo_git(["worktree", "add", "-b", branch_name, str(worktree_path), "HEAD"])
+        start_point = base_ref or "HEAD"
+        res = self._run_repo_git(["worktree", "add", "-b", branch_name, str(worktree_path), start_point])
         if res.returncode != 0:
             raise RuntimeError(f"Failed to create worktree: {res.stderr or res.stdout}")
 
@@ -611,8 +649,15 @@ class Workspace:
         self,
         worktree_path: Optional[Union[str, Path]] = None,
         branch_name: Optional[str] = None,
+        target_branch: Optional[str] = None,
     ) -> None:
-        """Merges changes from the subgoal worktree into the main repo branch and cleans up."""
+        """Merges changes from the subgoal worktree strictly into target_branch (fast-forward) and cleans up.
+
+        Refuses to merge directly to main without an explicit target_branch.
+        """
+        if not target_branch:
+            raise ValueError("target_branch is required for merge_subgoal_worktree; direct merge to main is disallowed")
+
         wt_path = Path(worktree_path).resolve() if worktree_path else getattr(self, "current_worktree_path", None)
         br_name = branch_name or getattr(self, "current_worktree_branch", None)
 
@@ -623,15 +668,23 @@ class Workspace:
                 commit_msg = f"Subgoal committed ({br_name})" if br_name else "Subgoal committed"
                 subprocess.run(["git", "commit", "-m", commit_msg], cwd=wt_path, capture_output=True, text=True, encoding="utf-8", errors="replace")
 
-
         self.worktree_dir = self.repo_dir
 
         if br_name:
-            merge_res = self._run_repo_git(["merge", "--ff-only", br_name])
-            if merge_res.returncode != 0:
-                self._run_repo_git(["merge", "--abort"])
+            anc_check = self._run_repo_git(["merge-base", "--is-ancestor", target_branch, br_name])
+            if anc_check.returncode != 0:
                 raise RuntimeError(
-                    f"Failed to fast-forward merge subgoal branch {br_name}: {merge_res.stderr or merge_res.stdout}"
+                    f"Cannot fast-forward merge {br_name} into {target_branch}: {target_branch} is not an ancestor of {br_name}"
+                )
+            subgoal_sha_res = self._run_repo_git(["rev-parse", br_name])
+            if subgoal_sha_res.returncode != 0:
+                raise RuntimeError(f"Could not resolve commit for subgoal branch {br_name}")
+            subgoal_sha = subgoal_sha_res.stdout.strip()
+
+            update_res = self._run_repo_git(["update-ref", f"refs/heads/{target_branch}", subgoal_sha])
+            if update_res.returncode != 0:
+                raise RuntimeError(
+                    f"Failed to fast-forward merge {br_name} into {target_branch}: {update_res.stderr or update_res.stdout}"
                 )
 
         if wt_path:
@@ -646,6 +699,73 @@ class Workspace:
 
         self.current_worktree_path = None
         self.current_worktree_branch = None
+
+    def create_verify_worktree(self, integration_branch: str) -> Path:
+        """Creates a dedicated detached worktree for final verification from the integration branch."""
+        worktree_base = self.repo_dir / ".jev-worktrees"
+        worktree_base.mkdir(parents=True, exist_ok=True)
+
+        verify_wt_path = (worktree_base / f"verify-{uuid.uuid4().hex[:8]}").resolve()
+        if verify_wt_path.exists():
+            self._unlink_node_modules(verify_wt_path)
+            self._run_repo_git(["worktree", "remove", "--force", str(verify_wt_path)])
+            if verify_wt_path.exists():
+                self._force_rmtree(verify_wt_path)
+
+        res = self._run_repo_git(["worktree", "add", "--detach", str(verify_wt_path), integration_branch])
+        if res.returncode != 0:
+            raise RuntimeError(f"Failed to create verify worktree from {integration_branch}: {res.stderr or res.stdout}")
+
+        self._link_node_modules(self.repo_dir, verify_wt_path)
+        self.worktree_dir = verify_wt_path
+        return verify_wt_path
+
+    def discard_verify_worktree(self, verify_path: Union[str, Path]) -> None:
+        """Discards the verify worktree safely, ensuring node_modules is unlinked first."""
+        v_path = Path(verify_path).resolve()
+        self.worktree_dir = self.repo_dir
+        if v_path.exists() or v_path.is_symlink():
+            self._unlink_node_modules(v_path)
+            self._run_repo_git(["worktree", "remove", "--force", str(v_path)])
+            if v_path.exists():
+                self._force_rmtree(v_path)
+            self._run_repo_git(["worktree", "prune"])
+
+    def fast_forward_main(self, integration_branch: str, base_commit: Optional[str] = None) -> None:
+        """Fast-forwards main to the integration branch.
+
+        Refuses if repo_dir has tracked modifications or if main diverged from base_commit.
+        """
+        self.worktree_dir = self.repo_dir
+
+        # 1. Check for tracked modifications (ignore untracked files with -uno)
+        status_res = self._run_repo_git(["status", "--porcelain", "-uno"])
+        if status_res.stdout.strip():
+            raise TrackedModificationsError(
+                f"Cannot fast-forward main: working tree has tracked modifications:\n{status_res.stdout}"
+            )
+
+        # 2. Check if main moved since base_commit
+        current_head = self._get_head_commit()
+        if base_commit and current_head != base_commit:
+            raise MainDivergedError(
+                f"Cannot fast-forward main: HEAD ({current_head}) does not match base_commit ({base_commit})"
+            )
+
+        # 3. Check if integration_branch is a fast-forward from HEAD
+        anc_res = self._run_repo_git(["merge-base", "--is-ancestor", "HEAD", integration_branch])
+        if anc_res.returncode != 0:
+            raise MainDivergedError(
+                f"Cannot fast-forward main: {integration_branch} is not a descendant of main"
+            )
+
+        # 4. Perform fast-forward merge
+        merge_res = self._run_repo_git(["merge", "--ff-only", integration_branch])
+        if merge_res.returncode != 0:
+            self._run_repo_git(["merge", "--abort"])
+            raise RuntimeError(
+                f"Failed to fast-forward main to {integration_branch}: {merge_res.stderr or merge_res.stdout}"
+            )
 
     def discard_subgoal_worktree(
         self,
@@ -785,8 +905,14 @@ class Workspace:
                         else:
                             cmd = ["npm", "test"]
                             ecosystem = "npm"
+                        resolved = shutil.which(cmd[0])
+                        if not resolved:
+                            return self._record_test_run(
+                                ecosystem, cmd, None, "", f"Executable '{cmd[0]}' not found.", TestOutcome.ENV_NOT_READY
+                            )
+                        exec_cmd = [resolved] + cmd[1:]
                         res = subprocess.run(
-                            cmd,
+                            exec_cmd,
                             cwd=wt,
                             capture_output=True,
                             text=True,
@@ -801,9 +927,15 @@ class Workspace:
         # 2. go.mod
         if (wt / "go.mod").exists():
             cmd = ["go", "test", "./..."]
+            resolved = shutil.which(cmd[0])
+            if not resolved:
+                return self._record_test_run(
+                    "go", cmd, None, "", f"Executable '{cmd[0]}' not found.", TestOutcome.ENV_NOT_READY
+                )
+            exec_cmd = [resolved] + cmd[1:]
             try:
                 res = subprocess.run(
-                    cmd,
+                    exec_cmd,
                     cwd=wt,
                     capture_output=True,
                     text=True,
@@ -818,9 +950,15 @@ class Workspace:
         # 3. Cargo.toml
         if (wt / "Cargo.toml").exists():
             cmd = ["cargo", "test"]
+            resolved = shutil.which(cmd[0])
+            if not resolved:
+                return self._record_test_run(
+                    "cargo", cmd, None, "", f"Executable '{cmd[0]}' not found.", TestOutcome.ENV_NOT_READY
+                )
+            exec_cmd = [resolved] + cmd[1:]
             try:
                 res = subprocess.run(
-                    cmd,
+                    exec_cmd,
                     cwd=wt,
                     capture_output=True,
                     text=True,
@@ -835,14 +973,22 @@ class Workspace:
         # 4. pom.xml
         if (wt / "pom.xml").exists():
             mvn_cmd = "mvn"
-            if (wt / "mvnw").exists():
+            if sys.platform == "win32" and (wt / "mvnw.cmd").exists():
+                mvn_cmd = str(wt / "mvnw.cmd")
+            elif (wt / "mvnw").exists():
                 mvn_cmd = "./mvnw"
             elif (wt / "mvnw.cmd").exists():
                 mvn_cmd = str(wt / "mvnw.cmd")
             cmd = [mvn_cmd, "test"]
+            resolved = shutil.which(cmd[0])
+            if not resolved:
+                return self._record_test_run(
+                    "maven", cmd, None, "", f"Executable '{cmd[0]}' not found.", TestOutcome.ENV_NOT_READY
+                )
+            exec_cmd = [resolved] + cmd[1:]
             try:
                 res = subprocess.run(
-                    cmd,
+                    exec_cmd,
                     cwd=wt,
                     capture_output=True,
                     text=True,
@@ -857,14 +1003,22 @@ class Workspace:
         # 5. build.gradle / build.gradle.kts
         if (wt / "build.gradle").exists() or (wt / "build.gradle.kts").exists():
             gradle_cmd = "gradle"
-            if (wt / "gradlew").exists():
+            if sys.platform == "win32" and (wt / "gradlew.bat").exists():
+                gradle_cmd = str(wt / "gradlew.bat")
+            elif (wt / "gradlew").exists():
                 gradle_cmd = "./gradlew"
             elif (wt / "gradlew.bat").exists():
                 gradle_cmd = str(wt / "gradlew.bat")
             cmd = [gradle_cmd, "test"]
+            resolved = shutil.which(cmd[0])
+            if not resolved:
+                return self._record_test_run(
+                    "gradle", cmd, None, "", f"Executable '{cmd[0]}' not found.", TestOutcome.ENV_NOT_READY
+                )
+            exec_cmd = [resolved] + cmd[1:]
             try:
                 res = subprocess.run(
-                    cmd,
+                    exec_cmd,
                     cwd=wt,
                     capture_output=True,
                     text=True,
@@ -942,7 +1096,9 @@ class Workspace:
                     return self._record_test_run("terraform", cmd, res.returncode, res.stdout, res.stderr, outcome)
                 except Exception as e:
                     return self._record_test_run("terraform", cmd, -1, "", str(e), TestOutcome.FAILED)
-            return self._record_test_run("terraform", None, None, "", "", TestOutcome.NO_TEST_FRAMEWORK)
+            return self._record_test_run(
+                "terraform", ["terraform", "validate"], None, "", "Executable 'terraform' not found.", TestOutcome.ENV_NOT_READY
+            )
 
         # Ansible
         has_ansible = (
@@ -984,12 +1140,14 @@ class Workspace:
                     return self._record_test_run("ansible", cmd, res.returncode, res.stdout, res.stderr, outcome)
                 except Exception as e:
                     return self._record_test_run("ansible", cmd, -1, "", str(e), TestOutcome.FAILED)
-            return self._record_test_run("ansible", None, None, "", "", TestOutcome.NO_TEST_FRAMEWORK)
+            return self._record_test_run(
+                "ansible", ["ansible-lint"], None, "", "Executable 'ansible-lint' not found.", TestOutcome.ENV_NOT_READY
+            )
 
         # Helm
         if (wt / "Chart.yaml").exists():
+            cmd = ["helm", "lint", "."]
             if shutil.which("helm"):
-                cmd = ["helm", "lint", "."]
                 try:
                     res = subprocess.run(
                         cmd,
@@ -1003,7 +1161,9 @@ class Workspace:
                     return self._record_test_run("helm", cmd, res.returncode, res.stdout, res.stderr, outcome)
                 except Exception as e:
                     return self._record_test_run("helm", cmd, -1, "", str(e), TestOutcome.FAILED)
-            return self._record_test_run("helm", None, None, "", "", TestOutcome.NO_TEST_FRAMEWORK)
+            return self._record_test_run(
+                "helm", cmd, None, "", "Executable 'helm' not found.", TestOutcome.ENV_NOT_READY
+            )
 
         # 8. Fallback
         return self._record_test_run(None, None, None, "", "", TestOutcome.NO_TESTS_COLLECTED)
@@ -1445,6 +1605,7 @@ class Workspace:
         self,
         diff: Optional[str] = None,
         scope: Optional[Union[List[Union[str, Path]], str, Path]] = None,
+        base_commit: Optional[str] = None,
     ) -> Dict[str, Any]:
         if diff is None:
             diff = self.get_staged_diff()
@@ -1615,7 +1776,7 @@ class Workspace:
             self.last_compile_run = record
             return record
 
-        base_commit_ref = self.base_commit or "HEAD"
+        base_commit_ref = base_commit or self.base_commit or "HEAD"
         worktree_base = self.repo_dir / ".jev-worktrees"
         worktree_base.mkdir(parents=True, exist_ok=True)
 
@@ -1734,7 +1895,12 @@ class Workspace:
         self.last_compile_run = record
         return record
 
-    def run_mechanical_checks(self, subgoal: Subgoal) -> MechanicalCheckResult:
+    def run_mechanical_checks(
+        self, subgoal: Subgoal, base_commit: Optional[str] = None
+    ) -> MechanicalCheckResult:
+        self.last_test_run = None
+        self.last_compile_run = None
+
         # 1. check_build
         build_res = self.check_build(subgoal.scope)
         if not build_res.passed:
@@ -1755,7 +1921,7 @@ class Workspace:
 
         # 2. check_compile
         diff = self.get_staged_diff()
-        compile_res = self.check_compile(diff=diff, scope=subgoal.scope)
+        compile_res = self.check_compile(diff=diff, scope=subgoal.scope, base_commit=base_commit)
         compile_outcome = compile_res.get("outcome")
 
         if compile_outcome == CompileOutcome.FAILED.value:
@@ -1808,7 +1974,27 @@ class Workspace:
         test_outcome = self.run_tests()
         test_run_details = getattr(self, "last_test_run", None)
 
-        if test_outcome == TestOutcome.FAILED:
+        if test_outcome == TestOutcome.ENV_NOT_READY:
+            err_detail = (
+                (test_run_details.get("stderr_tail") or test_run_details.get("output_tail") or "").strip()
+                if test_run_details
+                else "Test runner executable not found."
+            )
+            return MechanicalCheckResult(
+                passed=False,
+                failed_check="env_not_ready",
+                detail=f"Environment not ready: {err_detail}",
+                checks_run=["build", "compile", "tests"],
+                checks={
+                    "build": {"ran": True, "passed": True, "detail": ""},
+                    "compile": {"ran": True, "passed": True, "detail": compile_res.get("detail", "")},
+                    "tests": {"ran": True, "passed": False, "detail": f"Environment not ready: {err_detail}"},
+                    "scope": {"ran": False, "passed": None},
+                },
+                compile_outcome=compile_res,
+                test_runner_outcome=test_run_details,
+            )
+        elif test_outcome == TestOutcome.FAILED:
             return MechanicalCheckResult(
                 passed=False,
                 failed_check="tests",

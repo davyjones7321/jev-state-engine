@@ -307,10 +307,13 @@ def test_junction_cleanup_never_touches_target(git_repo):
 def test_verify_stage_compile_failure(git_repo):
     ws = git_repo
     gk = FakeGatekeeper()
+    base_commit = ws.base_commit
+    ws.create_integration_branch("jev-ticket-verify_fail")
 
-    # Introduce a new compile failure on the main merged tree
-    (ws.repo_dir / "src" / "app.py").write_text("def broken_syntax(\n", encoding="utf-8")
-    subprocess.run(["git", "add", "src/app.py"], cwd=ws.repo_dir, check=True, capture_output=True)
+    # Introduce a new compile failure on the integration branch
+    wt = ws.create_subgoal_worktree("broken_sg", base_ref="jev-ticket-verify_fail")
+    (wt / "src" / "app.py").write_text("def broken_syntax(\n", encoding="utf-8")
+    ws.merge_subgoal_worktree(wt, "jev-subgoal-broken_sg", target_branch="jev-ticket-verify_fail")
 
     state: State = {
         "ticket": "Verify ticket",
@@ -325,6 +328,8 @@ def test_verify_stage_compile_failure(git_repo):
         "investigation_notes": "Notes",
         "current_worktree_path": None,
         "current_worktree_branch": None,
+        "integration_branch": "jev-ticket-verify_fail",
+        "base_commit": base_commit,
     }
 
     out = node_verify(state, workspace=ws, gatekeeper=gk)
@@ -715,10 +720,11 @@ def test_compile_verify_stage_baseline_different_tree_fails_on_merge_error(tmp_p
     subprocess.run(["git", "commit", "-m", "Clean base commit"], cwd=repo, check=True, capture_output=True)
 
     ws = Workspace(repo_dir=repo)
-    # ws.base_commit points to "Clean base commit"
+    base_commit = ws.get_current_head()
 
-    # Now subgoals were executed and merged into repo_dir (the merged tree).
-    # In repo_dir, a compile error is introduced (e.g. check.js now fails with a TS error)
+    # Now subgoals were executed and committed onto the integration branch.
+    # In the integration branch, a compile error is introduced (check.js fails with a TS error)
+    subprocess.run(["git", "checkout", "-b", "jev-ticket-verify-merge"], cwd=repo, check=True, capture_output=True)
     check_js_fail = (
         "console.error('src/index.ts:1:1: error TS9999: Merge conflict or breakage');\n"
         "process.exit(1);\n"
@@ -727,13 +733,14 @@ def test_compile_verify_stage_baseline_different_tree_fails_on_merge_error(tmp_p
     (repo / "src" / "index.ts").write_text("export const a = 2;\n", encoding="utf-8")
     subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
     subprocess.run(["git", "commit", "-m", "Merged subgoals commit with breakage"], cwd=repo, check=True, capture_output=True)
-
-    # In node_verify, worktree_dir == repo_dir
-    ws.worktree_dir = ws.repo_dir
+    subprocess.run(["git", "checkout", "main"], cwd=repo, check=True, capture_output=True)
 
     gk = FakeGatekeeper()
     state: State = {
         "ticket": "Implement feature",
+        "thread_id": "verify-merge",
+        "base_commit": base_commit,
+        "integration_branch": "jev-ticket-verify-merge",
         "plan_queue": [],
         "current_subgoal": None,
         "mechanical_strike_count": 0,
@@ -862,4 +869,220 @@ def test_compile_baseline_worktree_creation_failure_env_not_ready(tmp_path):
         assert res["outcome"] == CompileOutcome.ENV_NOT_READY.value
         assert "Environment not ready" in res["detail"]
         assert "failed to create temporary baseline worktree" in res["detail"]
+
+
+# Scenario 22: (a) Retry feedback includes all new_errors, capped at 20 lines and 3000 chars
+def test_compile_retry_feedback_all_errors_and_truncation(tmp_path):
+    repo = tmp_path / "repo_retry_fb"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Tester"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "tester@example.com"], cwd=repo, check=True, capture_output=True)
+
+    pkg_json = {
+        "name": "retry-fb-test",
+        "scripts": {"typecheck": "node check.js"}
+    }
+    (repo / "package.json").write_text(json.dumps(pkg_json), encoding="utf-8")
+    (repo / "node_modules").mkdir()
+
+    # Part 1: 5 new errors -> all 5 appear in last_feedback, plus command run
+    check_js_content = """const fs = require('fs');
+let content = '';
+try { content = fs.readFileSync('src/a.ts', 'utf-8'); } catch (e) {}
+if (content.includes('error5')) {
+  console.error('src/a.ts:1:1 - error TS1001: Error one');
+  console.error('src/b.ts:2:2 - error TS1002: Error two');
+  console.error('src/c.ts:3:3 - error TS1003: Error three');
+  console.error('src/d.ts:4:4 - error TS1004: Error four');
+  console.error('src/e.ts:5:5 - error TS1005: Error five');
+  process.exit(1);
+}
+if (content.includes('error30')) {
+  for (let i = 1; i <= 30; i++) {
+    console.error(`src/f${i}.ts:${i}:${i} - error TS2000: Error number ${i}`);
+  }
+  process.exit(1);
+}
+console.log('clean');
+process.exit(0);
+"""
+    (repo / "check.js").write_text(check_js_content, encoding="utf-8")
+    (repo / "src").mkdir()
+    (repo / "src" / "a.ts").write_text("export const a = 1;\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+
+    ws = Workspace(repo_dir=repo)
+    wt_path = ws.create_subgoal_worktree("fb-5")
+    ws_wt = Workspace(repo_dir=repo, worktree_dir=wt_path)
+
+    try:
+        (wt_path / "src" / "a.ts").write_text("export const a = 'error5';\n", encoding="utf-8")
+        subprocess.run(["git", "add", "src/a.ts"], cwd=wt_path, check=True, capture_output=True)
+
+        subgoal = Subgoal(description="Update a.ts", scope=["src/a.ts"], expects_tests=False)
+        gk = FakeGatekeeper()
+        state: State = {
+            "ticket": "Ticket",
+            "plan_queue": [],
+            "current_subgoal": subgoal,
+            "mechanical_strike_count": 0,
+            "semantic_strike_count": 0,
+            "trajectory": [],
+            "gate_status": None,
+            "last_feedback": None,
+            "status": None,
+            "investigation_notes": "Notes",
+            "current_worktree_path": str(wt_path),
+            "current_worktree_branch": "jev-subgoal-fb-5",
+        }
+
+        out = node_gate(state, workspace=ws_wt, gatekeeper=gk)
+        assert out["gate_status"] == "mechanical_failure"
+        fb = out["last_feedback"]
+        assert "Error one" in fb
+        assert "Error two" in fb
+        assert "Error three" in fb
+        assert "Error four" in fb
+        assert "Error five" in fb
+        assert "typecheck" in fb or "node check.js" in fb or "npm" in fb
+        assert "more errors omitted" not in fb
+    finally:
+        ws.discard_subgoal_worktree(wt_path, "jev-subgoal-fb-5")
+
+    # Part 2: 30 new errors -> truncated with the omitted count
+    wt_path_30 = ws.create_subgoal_worktree("fb-30")
+    ws_wt_30 = Workspace(repo_dir=repo, worktree_dir=wt_path_30)
+
+    try:
+        (wt_path_30 / "src" / "a.ts").write_text("export const a = 'error30';\n", encoding="utf-8")
+        subprocess.run(["git", "add", "src/a.ts"], cwd=wt_path_30, check=True, capture_output=True)
+
+        subgoal = Subgoal(description="Update a.ts again", scope=["src/a.ts"], expects_tests=False)
+        gk = FakeGatekeeper()
+        state_30: State = {
+            "ticket": "Ticket",
+            "plan_queue": [],
+            "current_subgoal": subgoal,
+            "mechanical_strike_count": 0,
+            "semantic_strike_count": 0,
+            "trajectory": [],
+            "gate_status": None,
+            "last_feedback": None,
+            "status": None,
+            "investigation_notes": "Notes",
+            "current_worktree_path": str(wt_path_30),
+            "current_worktree_branch": "jev-subgoal-fb-30",
+        }
+
+        out = node_gate(state_30, workspace=ws_wt_30, gatekeeper=gk)
+        assert out["gate_status"] == "mechanical_failure"
+        fb = out["last_feedback"]
+        assert "...and 10 more errors omitted" in fb
+        assert len(fb) <= 3000
+        assert "typecheck" in fb or "node check.js" in fb or "npm" in fb
+        assert "Error number 1" in fb
+        assert "Error number 20" in fb
+        assert "Error number 21" not in fb
+    finally:
+        ws.discard_subgoal_worktree(wt_path_30, "jev-subgoal-fb-30")
+
+
+# Scenario 23: (b) Compile failure after a subgoal that ran tests -> trajectory test_runner is {"ran": false}
+def test_compile_failure_after_subgoal_that_ran_tests_telemetry_not_leaked(tmp_path):
+    repo = tmp_path / "repo_no_leak"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Tester"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "tester@example.com"], cwd=repo, check=True, capture_output=True)
+
+    pkg_json = {
+        "name": "no-leak-test",
+        "scripts": {
+            "typecheck": "node check.js"
+        }
+    }
+    (repo / "package.json").write_text(json.dumps(pkg_json), encoding="utf-8")
+    (repo / "node_modules").mkdir()
+
+    # Real pytest test file so run_tests() runs pytest and passes
+    (repo / "test_sample.py").write_text("def test_clean():\n    assert True\n", encoding="utf-8")
+
+    check_js = """const fs = require('fs');
+let content = '';
+try { content = fs.readFileSync('src/index.ts', 'utf-8'); } catch (e) {}
+if (content.includes('broken')) {
+  console.error('src/index.ts:1:1 - error TS9999: Broke typecheck');
+  process.exit(1);
+}
+console.log('typecheck clean');
+process.exit(0);
+"""
+    (repo / "check.js").write_text(check_js, encoding="utf-8")
+    (repo / "src").mkdir()
+    (repo / "src" / "index.ts").write_text("export const val = 1;\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "Initial clean commit"], cwd=repo, check=True, capture_output=True)
+
+    ws = Workspace(repo_dir=repo)
+    gk = FakeGatekeeper()
+    branch_name = ws.create_integration_branch("jev-ticket-no-leak")
+
+    # Subgoal 1: Updates index.ts, passes compile and runs tests successfully
+    wt1 = ws.create_subgoal_worktree("sg1", base_ref=branch_name)
+    ws_wt1 = Workspace(repo_dir=repo, worktree_dir=wt1)
+    (wt1 / "src" / "index.ts").write_text("export const val = 2;\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=wt1, check=True, capture_output=True)
+
+    sg1 = Subgoal(description="Subgoal 1 passing", scope=["src/index.ts"], expects_tests=True)
+    state: State = {
+        "ticket": "Implement feature",
+        "thread_id": "no-leak",
+        "base_commit": ws.base_commit,
+        "integration_branch": branch_name,
+        "subgoal_base_commit": ws.get_branch_commit(branch_name),
+        "plan_queue": [],
+        "current_subgoal": sg1,
+        "mechanical_strike_count": 0,
+        "semantic_strike_count": 0,
+        "trajectory": [],
+        "gate_status": None,
+        "last_feedback": None,
+        "status": None,
+        "investigation_notes": "Notes",
+        "current_worktree_path": str(wt1),
+        "current_worktree_branch": "jev-subgoal-sg1",
+    }
+
+    state = node_gate(state, workspace=ws_wt1, gatekeeper=gk)
+    assert state["gate_status"] == "passed"
+    entry1 = state["trajectory"][-1]
+    assert entry1["test_runner"] is not None
+    assert entry1["test_runner"]["outcome"] == "PASSED"
+    # Ensure workspace.last_test_run was populated by Subgoal 1
+    assert ws.last_test_run is not None or ws_wt1.last_test_run is not None
+
+    # Subgoal 2: Introduces a compile failure into src/index.ts
+    state["subgoal_base_commit"] = ws.get_branch_commit(branch_name)
+    wt2 = ws.create_subgoal_worktree("sg2", base_ref=branch_name)
+    ws_wt2 = Workspace(repo_dir=repo, worktree_dir=wt2)
+    (wt2 / "src" / "index.ts").write_text("export const val = 'broken';\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=wt2, check=True, capture_output=True)
+
+    sg2 = Subgoal(description="Subgoal 2 with compile fail", scope=["src/index.ts"], expects_tests=True)
+    state["current_subgoal"] = sg2
+    state["current_worktree_path"] = str(wt2)
+    state["current_worktree_branch"] = "jev-subgoal-sg2"
+    state["gate_status"] = None
+
+    state = node_gate(state, workspace=ws_wt2, gatekeeper=gk)
+    assert state["gate_status"] == "mechanical_failure"
+    entry2 = state["trajectory"][-1]
+    assert entry2["compile"]["outcome"] == CompileOutcome.FAILED.value
+    # Assert trajectory test_runner is {"ran": False}, NOT the stale result from Subgoal 1!
+    assert entry2["test_runner"] == {"ran": False}
+    # Assert workspace.last_test_run was reset and not leaked
+    assert ws_wt2.last_test_run is None
+
 

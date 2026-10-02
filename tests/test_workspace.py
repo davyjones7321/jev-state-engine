@@ -396,7 +396,7 @@ def test_run_tests_detects_package_json_yarn(git_repo):
     pkg.write_text('{"scripts": {"test": "jest"}}', encoding="utf-8")
     (git_repo / "yarn.lock").write_text("", encoding="utf-8")
 
-    with patch("subprocess.run") as mock_run:
+    with patch("shutil.which", side_effect=lambda x: x), patch("subprocess.run") as mock_run:
         mock_run.return_value = subprocess.CompletedProcess(args=["yarn", "test"], returncode=0, stdout="pass", stderr="")
         outcome = ws.run_tests()
         assert outcome == TestOutcome.PASSED
@@ -416,7 +416,7 @@ def test_run_tests_detects_package_json_pnpm(git_repo):
     pkg.write_text('{"scripts": {"test": "vitest"}}', encoding="utf-8")
     (git_repo / "pnpm-lock.yaml").write_text("", encoding="utf-8")
 
-    with patch("subprocess.run") as mock_run:
+    with patch("shutil.which", side_effect=lambda x: x), patch("subprocess.run") as mock_run:
         mock_run.return_value = subprocess.CompletedProcess(args=["pnpm", "test"], returncode=0, stdout="pass", stderr="")
         outcome = ws.run_tests()
         assert outcome == TestOutcome.PASSED
@@ -433,7 +433,7 @@ def test_run_tests_detects_package_json_npm(git_repo):
     pkg.write_text('{"scripts": {"test": "mocha"}}', encoding="utf-8")
     (git_repo / "package-lock.json").write_text("{}", encoding="utf-8")
 
-    with patch("subprocess.run") as mock_run:
+    with patch("shutil.which", side_effect=lambda x: x), patch("subprocess.run") as mock_run:
         mock_run.return_value = subprocess.CompletedProcess(args=["npm", "test"], returncode=0, stdout="pass", stderr="")
         outcome = ws.run_tests()
         assert outcome == TestOutcome.PASSED
@@ -448,7 +448,7 @@ def test_run_tests_detects_go_mod(git_repo):
     ws = Workspace(repo_dir=git_repo)
     (git_repo / "go.mod").write_text("module example.com/m\n", encoding="utf-8")
 
-    with patch("subprocess.run") as mock_run:
+    with patch("shutil.which", side_effect=lambda x: x), patch("subprocess.run") as mock_run:
         mock_run.return_value = subprocess.CompletedProcess(args=["go", "test", "./..."], returncode=0, stdout="ok", stderr="")
         outcome = ws.run_tests()
         assert outcome == TestOutcome.PASSED
@@ -463,7 +463,7 @@ def test_run_tests_detects_cargo_toml(git_repo):
     ws = Workspace(repo_dir=git_repo)
     (git_repo / "Cargo.toml").write_text("[package]\nname = \"foo\"\n", encoding="utf-8")
 
-    with patch("subprocess.run") as mock_run:
+    with patch("shutil.which", side_effect=lambda x: x), patch("subprocess.run") as mock_run:
         mock_run.return_value = subprocess.CompletedProcess(args=["cargo", "test"], returncode=0, stdout="ok", stderr="")
         outcome = ws.run_tests()
         assert outcome == TestOutcome.PASSED
@@ -478,7 +478,7 @@ def test_run_tests_detects_pom_xml(git_repo):
     ws = Workspace(repo_dir=git_repo)
     (git_repo / "pom.xml").write_text("<project></project>", encoding="utf-8")
 
-    with patch("subprocess.run") as mock_run:
+    with patch("shutil.which", side_effect=lambda x: x), patch("subprocess.run") as mock_run:
         mock_run.return_value = subprocess.CompletedProcess(args=["mvn", "test"], returncode=0, stdout="ok", stderr="")
         outcome = ws.run_tests()
         assert outcome == TestOutcome.PASSED
@@ -494,7 +494,7 @@ def test_run_tests_detects_build_gradle(git_repo):
     ws = Workspace(repo_dir=git_repo)
     (git_repo / "build.gradle").write_text("// gradle", encoding="utf-8")
 
-    with patch("subprocess.run") as mock_run:
+    with patch("shutil.which", side_effect=lambda x: x), patch("subprocess.run") as mock_run:
         mock_run.return_value = subprocess.CompletedProcess(args=["gradle", "test"], returncode=0, stdout="ok", stderr="")
         outcome = ws.run_tests()
         assert outcome == TestOutcome.PASSED
@@ -520,15 +520,17 @@ def test_run_tests_detects_pytest_signals(git_repo):
         assert "-q" in args
 
 
-# 29. test_run_tests_iac_no_test_framework_when_tool_missing
-def test_run_tests_iac_no_test_framework_when_tool_missing(git_repo):
-    """Terraform files without terraform binary installed return TestOutcome.NO_TEST_FRAMEWORK."""
+# 29. test_run_tests_iac_env_not_ready_when_tool_missing
+def test_run_tests_iac_env_not_ready_when_tool_missing(git_repo):
+    """Terraform files without terraform binary installed return TestOutcome.ENV_NOT_READY."""
     ws = Workspace(repo_dir=git_repo)
     (git_repo / "main.tf").write_text("resource \"null_resource\" \"x\" {}", encoding="utf-8")
 
     with patch("shutil.which", return_value=None):
         outcome = ws.run_tests()
-        assert outcome == TestOutcome.NO_TEST_FRAMEWORK
+        assert outcome == TestOutcome.ENV_NOT_READY
+        assert ws.last_test_run is not None
+        assert ws.last_test_run["outcome"] == "ENV_NOT_READY"
 
 
 # 30. test_run_tests_fallback_no_tests_collected
@@ -539,22 +541,22 @@ def test_run_tests_fallback_no_tests_collected(git_repo):
     assert outcome == TestOutcome.NO_TESTS_COLLECTED
 
 
-# 31. test_mechanical_checks_no_test_framework_untested_pass
-def test_mechanical_checks_no_test_framework_untested_pass(git_repo):
-    """NO_TEST_FRAMEWORK always yields an Untested Pass even when expects_tests=True."""
+# 31. test_mechanical_checks_env_not_ready_fails_tier0
+def test_mechanical_checks_env_not_ready_fails_tier0(git_repo):
+    """ENV_NOT_READY is treated as a mechanical failure that fails Tier 0."""
     ws = Workspace(repo_dir=git_repo)
     ws.stage_file_mutation("main.tf", "resource \"null_resource\" \"x\" {}\n")
     ws.commit_subgoal("Init")
 
     ws.stage_file_mutation("main.tf", "resource \"null_resource\" \"x\" { triggers = {} }\n")
-    ws.run_tests = MagicMock(return_value=TestOutcome.NO_TEST_FRAMEWORK)
+    ws.run_tests = MagicMock(return_value=TestOutcome.ENV_NOT_READY)
 
     subgoal = Subgoal(scope=["main.tf"], expects_tests=True)
     res = ws.run_mechanical_checks(subgoal)
 
-    assert res.passed is True
-    assert res.failed_check is None
-    assert "Untested pass: NO_TEST_FRAMEWORK." in res.detail
+    assert res.passed is False
+    assert res.failed_check == "env_not_ready"
+    assert "Environment not ready" in res.detail
 
 
 # 32. test_workspace_subprocess_emoji_utf8_encoding_safety
@@ -568,4 +570,64 @@ def test_workspace_subprocess_emoji_utf8_encoding_safety(git_repo):
     assert "🚀" in diff
     assert "🎉" in diff
     assert "🌟" in diff
+
+
+# 33. test_run_tests_resolves_windows_cmd_bat_and_executes_resolved_path
+def test_run_tests_resolves_windows_cmd_bat_and_executes_resolved_path(git_repo):
+    """Workspace.run_tests resolves executable via shutil.which, executing the full path (.cmd/.bat on Windows)."""
+    ws = Workspace(repo_dir=git_repo)
+    pkg = git_repo / "package.json"
+    pkg.write_text('{"scripts": {"test": "mocha"}}', encoding="utf-8")
+    (git_repo / "package-lock.json").write_text("{}", encoding="utf-8")
+
+    fake_resolved_npm = r"C:\Program Files\nodejs\npm.CMD"
+    with patch("shutil.which", return_value=fake_resolved_npm), patch("subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(args=[fake_resolved_npm, "test"], returncode=0, stdout="pass", stderr="")
+        outcome = ws.run_tests()
+        assert outcome == TestOutcome.PASSED
+        mock_run.assert_called_once()
+        args = mock_run.call_args[0][0]
+        assert args == [fake_resolved_npm, "test"]
+
+
+# 34. test_run_tests_returns_env_not_ready_when_tool_missing_across_ecosystems
+@pytest.mark.parametrize(
+    "marker_files,ecosystem",
+    [
+        ({"package.json": '{"scripts": {"test": "jest"}}', "yarn.lock": ""}, "yarn"),
+        ({"package.json": '{"scripts": {"test": "vitest"}}', "pnpm-lock.yaml": ""}, "pnpm"),
+        ({"package.json": '{"scripts": {"test": "test"}}', "package-lock.json": "{}"}, "npm"),
+        ({"go.mod": "module test\n"}, "go"),
+        ({"Cargo.toml": '[package]\nname = "test"\n'}, "cargo"),
+        ({"pom.xml": "<project></project>"}, "maven"),
+        ({"build.gradle": "// gradle"}, "gradle"),
+    ],
+)
+def test_run_tests_returns_env_not_ready_when_tool_missing_across_ecosystems(git_repo, marker_files, ecosystem):
+    """When the detected test runner executable is not found in PATH, return ENV_NOT_READY."""
+    ws = Workspace(repo_dir=git_repo)
+    for name, content in marker_files.items():
+        (git_repo / name).write_text(content, encoding="utf-8")
+
+    with patch("shutil.which", return_value=None):
+        outcome = ws.run_tests()
+        assert outcome == TestOutcome.ENV_NOT_READY
+        assert ws.last_test_run is not None
+        assert ws.last_test_run["ecosystem"] == ecosystem
+        assert ws.last_test_run["outcome"] == "ENV_NOT_READY"
+        assert "not found" in ws.last_test_run["stderr_tail"].lower()
+
+
+# 35. test_run_tests_package_json_no_test_script_returns_no_tests_collected
+def test_run_tests_package_json_no_test_script_returns_no_tests_collected(git_repo):
+    """package.json without a 'test' script returns NO_TESTS_COLLECTED and passes Tier 0 when expects_tests=False."""
+    ws = Workspace(repo_dir=git_repo)
+    (git_repo / "package.json").write_text('{"name": "app", "scripts": {"build": "next build"}}', encoding="utf-8")
+    outcome = ws.run_tests()
+    assert outcome == TestOutcome.NO_TESTS_COLLECTED
+    assert ws.last_test_run["outcome"] == "NO_TESTS_COLLECTED"
+
+    subgoal = Subgoal(scope=["package.json"], expects_tests=False)
+    res = ws.run_mechanical_checks(subgoal)
+    assert res.passed is True
 

@@ -235,9 +235,14 @@ def test_verify_records_telemetry_on_pass_and_fail(git_workspace):
     and Jev verdict on both pass and failure.
     """
     ws = git_workspace
+    base_commit = ws.get_current_head()
+    branch_pass = ws.create_integration_branch("test-thread-pass")
     gk_pass = FakeGatekeeper(verify_verdict=ValidationVerdict(valid=True, probability=0.96, reason="All good"))
     state_pass: State = {
         "ticket": "Test ticket",
+        "thread_id": "test-thread-pass",
+        "base_commit": base_commit,
+        "integration_branch": branch_pass,
         "plan_queue": [],
         "current_subgoal": None,
         "mechanical_strike_count": 0,
@@ -264,9 +269,13 @@ def test_verify_records_telemetry_on_pass_and_fail(git_workspace):
     assert verify_entry["jev_verdict"]["probability"] == 0.96
 
     # Now verify failure
+    branch_fail = ws.create_integration_branch("test-thread-fail")
     gk_fail = FakeGatekeeper(verify_verdict=ValidationVerdict(valid=False, probability=0.31, reason="Incomplete diff"))
     state_fail: State = {
         "ticket": "Test ticket",
+        "thread_id": "test-thread-fail",
+        "base_commit": base_commit,
+        "integration_branch": branch_fail,
         "plan_queue": [],
         "current_subgoal": None,
         "mechanical_strike_count": 0,
@@ -458,10 +467,9 @@ def test_gate_records_scope_failure_telemetry(git_workspace):
     assert "extra.py" in tier0["detail"]
 
 
-def test_workspace_run_tests_records_no_test_framework_outcome(git_workspace, monkeypatch):
-    """Workspace.run_tests: asserts NO_TEST_FRAMEWORK is recorded with ecosystem
-
-    and no command when the tool is missing.
+def test_workspace_run_tests_records_env_not_ready_outcome(git_workspace, monkeypatch):
+    """Workspace.run_tests: asserts ENV_NOT_READY is recorded with ecosystem
+    when the tool is missing.
     """
     ws = git_workspace
     tf_file = ws.repo_dir / "main.tf"
@@ -472,11 +480,10 @@ def test_workspace_run_tests_records_no_test_framework_outcome(git_workspace, mo
     monkeypatch.setattr(shutil, "which", lambda cmd: None)
 
     outcome = ws.run_tests()
-    assert outcome == TestOutcome.NO_TEST_FRAMEWORK
+    assert outcome == TestOutcome.ENV_NOT_READY
 
     assert ws.last_test_run is not None
     assert ws.last_test_run["ecosystem"] == "terraform"
-    assert ws.last_test_run["outcome"] == "NO_TEST_FRAMEWORK"
-    assert ws.last_test_run["command"] is None
+    assert ws.last_test_run["outcome"] == "ENV_NOT_READY"
     assert ws.last_test_run["exit_code"] is None
 

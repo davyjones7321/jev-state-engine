@@ -263,10 +263,21 @@ def test_schema_guard_node_gate(base_fixture_state, tmp_path):
 def test_schema_guard_node_verify(base_fixture_state, tmp_path):
     repo_dir = tmp_path / "repo"
     repo_dir.mkdir()
+    subprocess.run(["git", "init", "-b", "master"], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo_dir, check=True, capture_output=True)
+    foo = repo_dir / "foo.py"
+    foo.write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo_dir, check=True, capture_output=True)
+
     ws = Workspace(repo_dir=repo_dir)
+    ws.create_integration_branch("jev-ticket-fixture")
     gk = FakeGatekeeper()
 
-    out = node_verify(dict(base_fixture_state), workspace=ws, gatekeeper=gk)
+    state = dict(base_fixture_state)
+    state["integration_branch"] = "jev-ticket-fixture"
+    out = node_verify(state, workspace=ws, gatekeeper=gk)
     for k in out.keys():
         assert k in State.__annotations__, f"node_verify returned undeclared key: {k}"
 

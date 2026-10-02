@@ -1,6 +1,7 @@
 import sqlite3
 import sys
 from pathlib import Path
+from typing import Optional
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -42,10 +43,13 @@ class FakeWorkspace:
         self.rollback_call_count = 0
         self.commit_call_count = 0
 
-    def run_mechanical_checks(self, subgoal):
+    def run_mechanical_checks(self, subgoal, base_commit=None):
         return self.mechanical_result
 
     def get_staged_diff(self):
+        return self.staged_diff
+
+    def get_cumulative_diff(self, base_ref=None):
         return self.staged_diff
 
     def rollback_subgoal(self):
@@ -61,6 +65,18 @@ class FakeWorkspace:
         return self.test_outcome
 
     def stage_file_mutation(self, path, content):
+        pass
+
+    def create_verify_worktree(self, integration_branch: str):
+        return None
+
+    def discard_verify_worktree(self, verify_wt_path):
+        pass
+
+    def fast_forward_main(self, integration_branch: str, base_commit: Optional[str] = None):
+        pass
+
+    def delete_integration_branch(self, branch_name: str):
         pass
 
 
@@ -243,7 +259,11 @@ def test_fsm_node_lifecycle():
     gk = FakeGatekeeper()
 
     # Investigate
-    state: State = {"ticket": "Implement feature Y", "trajectory": []}
+    state: State = {
+        "ticket": "Implement feature Y",
+        "trajectory": [],
+        "integration_branch": "jev-ticket-lifecycle",
+    }
     state = node_investigate(state, workspace=ws)
     assert "Workspace status" in state.get("last_feedback", "")
     assert len(state["trajectory"]) == 1
@@ -310,6 +330,7 @@ def test_jev_engine_execute_escalation(tmp_path):
     gk.escalate_deadlock.assert_called_once_with(
         trajectory=final_state["trajectory"],
         triggering_tier="mechanical",
+        integration_branch="jev-ticket-fail-1",
     )
 
 
@@ -383,6 +404,7 @@ def test_jev_engine_execute_semantic_escalation(tmp_path):
     gk.escalate_deadlock.assert_called_once_with(
         trajectory=final_state["trajectory"],
         triggering_tier="semantic",
+        integration_branch="jev-ticket-sem-fail-1",
     )
 
 
@@ -410,6 +432,7 @@ def test_jev_engine_execute_verification_failure(tmp_path):
     gk.escalate_deadlock.assert_called_once_with(
         trajectory=final_state["trajectory"],
         triggering_tier="verification",
+        integration_branch="jev-ticket-ver-fail-1",
     )
 
 
@@ -477,6 +500,7 @@ def test_node_verify_uses_cumulative_diff_and_untested_context():
 
     state = {
         "ticket": "Add docstring to func",
+        "integration_branch": "jev-ticket-test",
         "trajectory": [
             {
                 "node": "plan",
@@ -512,6 +536,7 @@ def test_node_verify_failure_escalates():
 
     state = {
         "ticket": "Fix issue",
+        "integration_branch": "jev-ticket-test",
         "trajectory": [],
     }
 
@@ -533,6 +558,7 @@ def test_node_verify_catches_exception_and_escalates():
     gk = MagicMock()
     state = {
         "ticket": "Fix issue",
+        "integration_branch": "jev-ticket-test",
         "trajectory": [],
     }
 
@@ -561,6 +587,7 @@ def test_node_verify_passes_investigation_notes_to_gatekeeper():
 
     state = {
         "ticket": "Fix issue",
+        "integration_branch": "jev-ticket-test",
         "investigation_notes": "Architecture notes for ticket",
         "trajectory": [],
     }
@@ -587,6 +614,7 @@ def test_node_verify_records_probability_in_trajectory_and_feedback():
 
     state = {
         "ticket": "Add feature",
+        "integration_branch": "jev-ticket-test",
         "trajectory": [],
     }
 
@@ -597,6 +625,23 @@ def test_node_verify_records_probability_in_trajectory_and_feedback():
     assert "0.33" in res["last_feedback"]
     assert len(res["trajectory"]) == 1
     assert res["trajectory"][0]["probability"] == 0.33
+
+
+# 20. Test node_verify requires integration_branch and escalates if missing
+def test_node_verify_requires_integration_branch_missing_escalates():
+    """Assert node_verify without integration_branch fails and escalates without running verification on main."""
+    ws = MagicMock()
+    gk = MagicMock()
+    state = {
+        "ticket": "Test ticket",
+        "trajectory": [],
+    }
+
+    res = node_verify(state, workspace=ws, gatekeeper=gk)
+    assert res["status"] == "escalated"
+    assert res["gate_status"] == "verification_failed"
+    assert "integration_branch is required" in res["last_feedback"]
+    gk.escalate_deadlock.assert_called_once()
 
 
 

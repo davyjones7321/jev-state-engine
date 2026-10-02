@@ -234,11 +234,14 @@ class Gatekeeper:
         trajectory: List[Dict[str, Any]],
         triggering_tier: str,
         log_path: Union[str, Path] = "escalation.log",
+        integration_branch: Optional[str] = None,
     ) -> None:
         """Logs deadlock escalation details and dumps escalation.log for HITL review."""
         log_file = Path(log_path)
-        content = {
+        content: Dict[str, Any] = {
             "triggering_tier": triggering_tier,
             "trajectory": trajectory,
         }
+        if integration_branch:
+            content["integration_branch"] = integration_branch
         log_file.write_text(json.dumps(content, indent=2, default=str), encoding="utf-8")
