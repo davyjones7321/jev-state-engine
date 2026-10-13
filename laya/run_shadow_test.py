@@ -53,6 +53,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Execution thread identifier",
     )
     parser.add_argument(
+        "--repo-dir",
+        type=str,
+        default=None,
+        help="Path to the repository to execute within",
+    )
+    parser.add_argument(
         "--test-policy",
         type=str,
         choices=["auto", "verify-only", "never", "always"],
@@ -104,11 +110,12 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
-    repo_dir = repo_root.resolve()
-    env_file = repo_dir / ".env"
+    repo_dir = Path(args.repo_dir).resolve() if args.repo_dir else repo_root.resolve()
+    engine_env = repo_root / ".env"
+    env_file = engine_env if engine_env.exists() else ((repo_dir / ".env") if (repo_dir / ".env").exists() else None)
 
     print("Initializing Primary Gatekeeper (Jev)...")
-    primary_gatekeeper = Gatekeeper(env_file=env_file if env_file.exists() else None)
+    primary_gatekeeper = Gatekeeper(env_file=env_file)
 
     print("Initializing Shadow Evaluator (Laya on CPU)...")
     laya_agent = laya.load("convaiinnovations/laya-typed-decisions")
