@@ -57,3 +57,7 @@ scratch/
 *.swo
 .DS_Store
 Thumbs.db
+
+# Important notes (local only)
+importan.md
+*.jsonl
