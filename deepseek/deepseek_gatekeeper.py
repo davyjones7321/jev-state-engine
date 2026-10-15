@@ -44,9 +44,10 @@ class DeepSeekGatekeeper:
         investigation_notes: Optional[str] = None,
     ) -> DeepSeekVerdict:
         """Evaluates a subgoal using DeepSeek-R1 with step-by-step reasoning."""
+        scope_str = ", ".join(subgoal.scope) if isinstance(subgoal.scope, list) else str(subgoal.scope or "")
         payload = {
             "subgoal": subgoal.description,
-            "scope": subgoal.scope,
+            "scope": scope_str,
             "diff": diff,
             "mechanical_detail": mechanical_detail,
             "investigation_notes": investigation_notes or "",

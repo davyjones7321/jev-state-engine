@@ -40,7 +40,7 @@ model = AutoModelForCausalLM.from_pretrained(
 print(">>> [3/5] Setting up FastAPI Server...")
 from fastapi import FastAPI
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Union
 import json
 
 app = FastAPI(title="DeepSeek-R1 Gatekeeper Server")
@@ -48,7 +48,7 @@ app = FastAPI(title="DeepSeek-R1 Gatekeeper Server")
 class ValidationRequest(BaseModel):
     ticket: Optional[str] = None
     subgoal: Optional[str] = None
-    scope: Optional[str] = None
+    scope: Optional[Union[str, List[str]]] = None
     diff: str = ""
     mechanical_detail: Optional[str] = ""
     investigation_notes: Optional[str] = ""
@@ -63,6 +63,7 @@ def validate(req: ValidationRequest):
     t0 = time.time()
     target_desc = req.ticket if req.is_final_verification else req.subgoal
     target_type = "Final Ticket Verification" if req.is_final_verification else "Subgoal Validation"
+    scope_str = ", ".join(req.scope) if isinstance(req.scope, list) else (req.scope or "Not specified")
     
     prompt = (
         "You are an authoritative code gatekeeper and semantic diff validator.\n"

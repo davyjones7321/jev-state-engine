@@ -65,7 +65,7 @@ class TriShadowGatekeeper:
             t_laya = time.time()
             try:
                 l_state: Dict[str, Any] = {
-                    "description": subgoal.description,
+                    "subgoal": subgoal.description,
                     "scope": subgoal.scope,
                     "diff": diff,
                 }
@@ -77,14 +77,21 @@ class TriShadowGatekeeper:
                 questions = {
                     "valid": {
                         "type": "noul",
-                        "instructions": "Does the diff fully and correctly implement the subgoal described in state, without exceeding its declared scope?",
+                        "instructions": (
+                            "Does the diff fully and correctly implement the subgoal described in state, "
+                            "without exceeding its declared scope?"
+                        ),
                     }
                 }
-                decisions = self.laya.decide(l_state, questions)
-                laya_ans = decisions.get("valid")
-                laya_valid = bool(laya_ans.value)
-                laya_prob = round(float(laya_ans.confidence), 4)
+                laya_res = self.laya.predict(state=l_state, questions=questions)
+                answers = laya_res.get("answers", {})
+                valid_ans = answers.get("valid", {})
+                noul_val = valid_ans.get("noul")
+                if noul_val is not None:
+                    laya_prob = round(float(noul_val), 4)
+                    laya_valid = laya_prob >= 0.5
             except Exception as e:
+                print(f"[SHADOW JUDGE WARNING] Laya evaluation error: {e}")
                 laya_valid = None
                 laya_prob = 0.0
             laya_ms = (time.time() - t_laya) * 1000
@@ -153,14 +160,21 @@ class TriShadowGatekeeper:
                 questions = {
                     "valid": {
                         "type": "noul",
-                        "instructions": "Does the final diff completely resolve the ticket, and does the test output satisfy verification requirements?",
+                        "instructions": (
+                            "Does the final diff completely resolve the ticket, and does the test output "
+                            "satisfy verification requirements?"
+                        ),
                     }
                 }
-                decisions = self.laya.decide(l_state, questions)
-                laya_ans = decisions.get("valid")
-                laya_valid = bool(laya_ans.value)
-                laya_prob = round(float(laya_ans.confidence), 4)
-            except Exception:
+                laya_res = self.laya.predict(state=l_state, questions=questions)
+                answers = laya_res.get("answers", {})
+                valid_ans = answers.get("valid", {})
+                noul_val = valid_ans.get("noul")
+                if noul_val is not None:
+                    laya_prob = round(float(noul_val), 4)
+                    laya_valid = laya_prob >= 0.5
+            except Exception as e:
+                print(f"[SHADOW JUDGE WARNING] Laya evaluation error: {e}")
                 laya_valid = None
                 laya_prob = 0.0
             laya_ms = (time.time() - t_laya) * 1000
