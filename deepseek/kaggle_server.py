@@ -180,6 +180,11 @@ if public_url:
 else:
     print("❌ Tunnel timed out. Check Kaggle internet connection.")
 
-# Keep cell alive
+# Keep cell alive with active heartbeat
+print(">>> Server & Tunnel are active! (Keep this Kaggle cell running)")
+minutes = 0
 while True:
     time.sleep(60)
+    minutes += 1
+    if minutes % 5 == 0:
+        print(f"[Keep-Alive] Running for {minutes} min. Endpoint: {public_url}")

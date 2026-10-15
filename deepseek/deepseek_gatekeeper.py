@@ -22,7 +22,7 @@ class DeepSeekGatekeeper:
     def __init__(
         self,
         endpoint_url: Optional[str] = None,
-        timeout: float = 90.0,
+        timeout: float = 180.0,
         log_path: Optional[Union[str, Path]] = None,
     ):
         self.endpoint_url = (
