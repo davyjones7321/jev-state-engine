@@ -62,6 +62,20 @@ class ValidationVerdict(BaseModel):
     extra_answers: Optional[Dict[str, Any]] = None
 
 
+class JevFeedback(BaseModel):
+    """Bounded, internal representation of feedback returned by Jev.
+
+    This model is observational only: the existing ``ValidationVerdict.valid``
+    value remains the source of gate authority.
+    """
+
+    verdict: Optional[bool] = None
+    confidence: Optional[float] = None
+    diagnostics: List[str] = Field(default_factory=list)
+    questions: List[str] = Field(default_factory=list)
+    unknowns: List[str] = Field(default_factory=list)
+
+
 class State(TypedDict, total=False):
     ticket: str
     plan_queue: List[Subgoal]

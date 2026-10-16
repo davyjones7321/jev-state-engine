@@ -336,6 +336,55 @@ def test_duplicate_diff_guard_disabled_when_retry_intel_off():
     assert res["gate_status"] == "passed"
 
 
+def test_mechanical_feedback_and_ledger_attempt_include_structured_retry_evidence():
+    subgoal = Subgoal(id="sg-structured", description="Implement feature", scope=["feat.py"])
+    state: State = {
+        "current_subgoal": subgoal,
+        "mechanical_strike_count": 0,
+        "semantic_strike_count": 0,
+        "failed_attempts": [],
+        "trajectory": [],
+    }
+    diff = "diff --git a/feat.py b/feat.py\n+bad =\n"
+    ws = MagicMock()
+    ws.get_staged_diff.return_value = diff
+    ws.run_mechanical_checks.return_value = MechanicalCheckResult(
+        passed=False, failed_check="compile", detail="syntax error",
+        compile_outcome={"new_errors": ["feat.py:1 syntax error"], "base_errors": []},
+    )
+    recorder = MagicMock()
+
+    result = node_gate(state, workspace=ws, gatekeeper=MagicMock(), recorder=recorder)
+    evidence = result["failed_attempts"][0]["failure_evidence"]
+    assert {"failure_class", "known_facts", "unknowns", "required_inspection", "prior_attempts", "retry_constraints"} <= set(evidence)
+    assert "compile" == evidence["failure_class"]
+    assert "Failure evidence:" in result["last_feedback"]
+    recorded = recorder.record_attempt.call_args.kwargs["failure_evidence"]
+    assert recorded["required_inspection"] == evidence["required_inspection"]
+
+
+def test_empty_diff_is_mechanical_and_skips_semantic_validation():
+    subgoal = Subgoal(id="sg-empty", description="Implement feature", scope=["feat.py"])
+    state: State = {
+        "current_subgoal": subgoal,
+        "mechanical_strike_count": 0,
+        "semantic_strike_count": 0,
+        "failed_attempts": [],
+        "trajectory": [],
+    }
+    ws = MagicMock()
+    ws.get_staged_diff.return_value = ""
+    gatekeeper = MagicMock()
+
+    result = node_gate(state, workspace=ws, gatekeeper=gatekeeper)
+    assert result["gate_status"] == "mechanical_failure"
+    assert result["mechanical_strike_count"] == 1
+    assert result["failed_attempts"][0]["outcome"] == "empty_diff"
+    assert result["failed_attempts"][0]["failure_evidence"]["failure_class"] == "empty_diff"
+    ws.run_mechanical_checks.assert_not_called()
+    gatekeeper.validate_subgoal.assert_not_called()
+
+
 # ==========================================
 # D. Typed semantic feedback
 # ==========================================

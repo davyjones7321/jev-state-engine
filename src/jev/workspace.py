@@ -784,17 +784,15 @@ class Workspace:
         norm_posix = raw_str.replace("\\", "/")
         worktree_root = self.worktree_dir.resolve()
 
-        p = Path(path)
-        if norm_posix.startswith("/") or re.match(r"^[a-zA-Z]:", raw_str) or p.is_absolute():
-            try:
-                resolved_p = p.resolve()
-                rel = resolved_p.relative_to(worktree_root)
-                norm_rel = posixpath.normpath(rel.as_posix())
-                if norm_rel == ".." or norm_rel.startswith("../"):
-                    raise ValueError(f"Path '{path}' traverses outside worktree.")
-                return worktree_root / norm_rel
-            except (ValueError, RuntimeError):
-                raise ValueError(f"Absolute path '{path}' is not allowed within worktree.")
+        # Paths are an untrusted, platform-independent relative-path
+        # contract. Never resolve an absolute path and accept it merely
+        # because it happens to point below the worktree.
+        if (
+            norm_posix.startswith("/")
+            or re.match(r"^[a-zA-Z]:", raw_str)
+            or Path(path).is_absolute()
+        ):
+            raise ValueError(f"Absolute path '{path}' is not allowed within worktree.")
 
         if norm_posix.startswith("./"):
             stripped = norm_posix[2:]
@@ -823,39 +821,33 @@ class Workspace:
         Traversal using '..' (e.g. node_modules/../../x) is strictly blocked.
         """
         import posixpath
+        raw_str = str(path).strip()
+        norm_posix = raw_str.replace("\\", "/")
         try:
             return self.resolve_in_worktree(path)
         except (ValueError, PermissionError) as original_err:
-            raw_str = str(path).strip()
-            norm_posix = raw_str.replace("\\", "/")
-            nm_dir = self.repo_dir / "node_modules"
-
-            if not nm_dir.exists():
+            # A subgoal worktree may expose repository node_modules through a
+            # symlink. Keep that read-only exception, but not for absolute or
+            # traversing paths.
+            if (
+                norm_posix.startswith("/")
+                or re.match(r"^[a-zA-Z]:", raw_str)
+                or Path(path).is_absolute()
+            ):
                 raise original_err
 
-            nm_root = nm_dir.resolve()
-            p = Path(path)
-            if norm_posix.startswith("/") or re.match(r"^[a-zA-Z]:", raw_str) or p.is_absolute():
-                try:
-                    resolved_p = p.resolve()
-                    resolved_p.relative_to(nm_root)
-                    return resolved_p
-                except ValueError:
-                    raise original_err
-
-            if norm_posix.startswith("./"):
-                stripped = norm_posix[2:]
-            else:
-                stripped = norm_posix
-
+            stripped = norm_posix[2:] if norm_posix.startswith("./") else norm_posix
             normalized = posixpath.normpath(stripped)
             parts = normalized.split("/")
             if ".." in parts or normalized == ".." or normalized.startswith("../"):
                 raise ValueError(f"Path '{path}' traverses outside workspace.")
 
-            candidate = (self.repo_dir / normalized).resolve()
+            nm_dir = self.repo_dir / "node_modules"
+            if not nm_dir.exists():
+                raise original_err
+            candidate = (self.worktree_dir / normalized).resolve()
             try:
-                candidate.relative_to(nm_root)
+                candidate.relative_to(nm_dir.resolve())
                 return candidate
             except ValueError:
                 raise original_err

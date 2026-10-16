@@ -2,6 +2,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock
+import subprocess
 import pytest
 
 _src_path = str(Path(__file__).resolve().parent.parent / "src")
@@ -9,8 +10,8 @@ if _src_path not in sys.path:
     sys.path.insert(0, _src_path)
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
-from jev.engine import node_implement
-from jev.models import MechanicalCheckResult, State, Subgoal, TestOutcome
+from jev.engine import MAX_SELF_CHECK_OUTPUT_CHARS, node_gate, node_implement
+from jev.models import MechanicalCheckResult, State, Subgoal, TestOutcome, ValidationVerdict
 
 
 class ScriptedChatModel:
@@ -59,6 +60,29 @@ class MockWorkspace:
 
     def commit_subgoal(self) -> None:
         pass
+
+
+class SelfCheckWorkspace(MockWorkspace):
+    def __init__(self, root: Path, diff: str):
+        super().__init__()
+        self.worktree_dir = root
+        self.repo_dir = root
+        self.diff = diff
+
+    def stage_file_mutation(self, path: str, content: str) -> None:
+        super().stage_file_mutation(path, content)
+        target = self.worktree_dir / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+
+    def get_staged_diff(self) -> str:
+        return self.diff
+
+
+class SelfCheckGatekeeper:
+    def __init__(self):
+        self.validate_subgoal = MagicMock(return_value=ValidationVerdict(valid=True, probability=0.99))
+        self.escalate_deadlock = MagicMock()
 
 
 # 1. Multi-turn scripted tool calls: stage_file_mutation then submit_subgoal
@@ -119,6 +143,77 @@ def test_node_implement_with_fake_llm_multi_turn():
     assert len(result_state["trajectory"]) == 1
     assert result_state["trajectory"][0]["node"] == "implement"
     assert result_state["trajectory"][0]["current_subgoal"]["description"] == subgoal.description
+
+
+def _self_check_state() -> State:
+    return {
+        "ticket": "Check Python change",
+        "plan_queue": [],
+        "current_subgoal": Subgoal(description="Check Python change", scope=["changed.py"]),
+        "mechanical_strike_count": 0,
+        "semantic_strike_count": 0,
+        "trajectory": [],
+    }
+
+
+def test_validate_changes_returns_diagnostics_and_submission_reaches_gate(tmp_path):
+    workspace = SelfCheckWorkspace(tmp_path, "diff --git a/changed.py b/changed.py\n")
+    responses = [
+        AIMessage(content="", tool_calls=[{
+            "name": "stage_file_mutation", "args": {"path": "changed.py", "content": "def broken(:\n"}, "id": "write"
+        }]),
+        AIMessage(content="", tool_calls=[{
+            "name": "validate_changes", "args": {"paths": ["changed.py"]}, "id": "check"
+        }]),
+        AIMessage(content="", tool_calls=[{"name": "submit_subgoal", "args": {}, "id": "submit"}]),
+    ]
+    state = node_implement(_self_check_state(), workspace=workspace, llm=ScriptedChatModel(responses))
+    check = next(call for call in state["trajectory"][0]["tool_calls"] if call["name"] == "validate_changes")
+    assert "Self-check: failed" in check["result"]
+
+    gatekeeper = SelfCheckGatekeeper()
+    gated = node_gate(state, workspace=workspace, gatekeeper=gatekeeper)
+    assert gated["gate_status"] == "passed"
+    gatekeeper.validate_subgoal.assert_called_once()
+
+
+def test_validate_changes_caps_diagnostics_output(tmp_path, monkeypatch):
+    workspace = SelfCheckWorkspace(tmp_path, "diff --git a/changed.py b/changed.py\n")
+    (tmp_path / "changed.py").write_text("x = 1\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "jev.engine.subprocess.run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 1, "x" * (MAX_SELF_CHECK_OUTPUT_CHARS * 2), ""),
+    )
+    responses = [
+        AIMessage(content="", tool_calls=[{"name": "validate_changes", "args": {"paths": ["changed.py"]}, "id": "check"}]),
+        AIMessage(content="", tool_calls=[{"name": "submit_subgoal", "args": {}, "id": "submit"}]),
+    ]
+    state = node_implement(_self_check_state(), workspace=workspace, llm=ScriptedChatModel(responses))
+    result = next(call["result"] for call in state["trajectory"][0]["tool_calls"] if call["name"] == "validate_changes")
+    assert len(result) <= MAX_SELF_CHECK_OUTPUT_CHARS + 100
+    assert "truncated" in result
+
+
+def test_validate_changes_reports_timeout_and_failure(tmp_path, monkeypatch):
+    workspace = SelfCheckWorkspace(tmp_path, "diff --git a/changed.py b/changed.py\n")
+    (tmp_path / "changed.py").write_text("x = 1\n", encoding="utf-8")
+    monkeypatch.setattr("jev.engine.subprocess.run", MagicMock(side_effect=subprocess.TimeoutExpired("python", 5)))
+    timeout_state = node_implement(
+        _self_check_state(), workspace=workspace,
+        llm=ScriptedChatModel([AIMessage(content="", tool_calls=[{"name": "validate_changes", "args": {}, "id": "check"}])]),
+    )
+    timeout_result = timeout_state["trajectory"][0]["tool_calls"][0]["result"]
+    assert "timeout" in timeout_result
+
+    monkeypatch.setattr(
+        "jev.engine.subprocess.run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 2, "", "SyntaxError: bad"),
+    )
+    failure_state = node_implement(
+        _self_check_state(), workspace=workspace,
+        llm=ScriptedChatModel([AIMessage(content="", tool_calls=[{"name": "validate_changes", "args": {}, "id": "check"}])]),
+    )
+    assert "Self-check: failed" in failure_state["trajectory"][0]["tool_calls"][0]["result"]
 
 
 # 2. Single-turn parallel tool calls: stage_file_mutation AND submit_subgoal in 1 turn
@@ -588,6 +683,92 @@ def test_stage_file_mutation_allows_in_scope_files():
 
     assert len(ws.staged_mutations) == 1
     assert ws.staged_mutations[0]["path"] == "src/math_utils.py"
+
+
+def test_node_implement_reads_neighboring_file_before_staging(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "src").mkdir()
+    (repo / "src" / "neighbor.py").write_text("VALUE = 42\n", encoding="utf-8")
+
+    class WorktreeWorkspace(MockWorkspace):
+        worktree_dir = repo
+        repo_dir = repo
+
+    ws = WorktreeWorkspace()
+    state: State = {"current_subgoal": Subgoal(description="Use neighbor", scope=["src/main.py"]), "trajectory": []}
+    response = AIMessage(content="", tool_calls=[
+        {"name": "read_file", "args": {"path": "src/neighbor.py"}, "id": "read-1"},
+        {"name": "stage_file_mutation", "args": {"path": "src/main.py", "content": "from .neighbor import VALUE\n"}, "id": "write-1"},
+    ])
+
+    fake_llm = ScriptedChatModel([response, AIMessage(content="", tool_calls=[{"name": "submit_subgoal", "args": {}, "id": "submit-1"}])])
+    result = node_implement(state, workspace=ws, llm=fake_llm)
+
+    read_message = next(m for m in fake_llm.invocations[1] if isinstance(m, ToolMessage) and m.name == "read_file")
+    assert "VALUE = 42" in read_message.content
+    assert ws.staged_mutations[0]["content"] == "from .neighbor import VALUE\n"
+    assert any(call["name"] == "read_file" for call in result["trajectory"][0]["tool_calls"])
+
+
+def test_node_implement_read_tools_reject_outside_and_preserve_scope(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    outside = tmp_path / "outside.py"
+    outside.write_text("SECRET = True\n", encoding="utf-8")
+
+    class WorktreeWorkspace(MockWorkspace):
+        worktree_dir = repo
+        repo_dir = repo
+
+    ws = WorktreeWorkspace()
+    state: State = {"current_subgoal": Subgoal(description="Bounded reads", scope=["src/main.py"]), "trajectory": []}
+    response = AIMessage(content="", tool_calls=[
+        {"name": "read_file", "args": {"path": "../outside.py"}, "id": "read-1"},
+        {"name": "stage_file_mutation", "args": {"path": "../outside.py", "content": "changed"}, "id": "write-1"},
+    ])
+
+    fake_llm = ScriptedChatModel([response, AIMessage(content="", tool_calls=[{"name": "submit_subgoal", "args": {}, "id": "submit-1"}])])
+    node_implement(state, workspace=ws, llm=fake_llm)
+
+    tool_messages = [
+        m for invocation in fake_llm.invocations for m in invocation if isinstance(m, ToolMessage)
+    ]
+    assert "outside workspace" in tool_messages[0].content.lower()
+    assert (
+        "not within declared scope" in tool_messages[1].content.lower()
+        or "access denied" in tool_messages[1].content.lower()
+        or "outside workspace" in tool_messages[1].content.lower()
+    )
+    assert outside.read_text(encoding="utf-8") == "SECRET = True\n"
+    assert ws.staged_mutations == []
+
+
+def test_node_implement_read_tools_cap_output_and_calls(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "large.txt").write_text("x" * 25_000, encoding="utf-8")
+
+    class WorktreeWorkspace(MockWorkspace):
+        worktree_dir = repo
+        repo_dir = repo
+
+    ws = WorktreeWorkspace()
+    state: State = {"current_subgoal": Subgoal(description="Bounded reads", scope=["main.py"]), "trajectory": []}
+    calls = [
+        {"name": "read_file", "args": {"path": "large.txt"}, "id": f"read-{i}"}
+        for i in range(13)
+    ]
+    fake_llm = ScriptedChatModel([AIMessage(content="", tool_calls=calls), AIMessage(content="", tool_calls=[{"name": "submit_subgoal", "args": {}, "id": "submit-1"}])])
+    result = node_implement(state, workspace=ws, llm=fake_llm)
+
+    tool_messages = [
+        m for invocation in fake_llm.invocations for m in invocation if isinstance(m, ToolMessage)
+    ]
+    assert "truncated" in tool_messages[0].content
+    assert any("budget exhausted" in message.content for message in tool_messages)
+    read_calls = [call for call in result["trajectory"][0]["tool_calls"] if call["name"] == "read_file"]
+    assert len(read_calls) == 13
 
 
 

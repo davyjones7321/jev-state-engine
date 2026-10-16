@@ -12,6 +12,20 @@ from typing import Any, Dict, List, Optional, Protocol, Union
 from jev.evidence import weakest
 from jev.models import Subgoal
 
+MAX_EVIDENCE_CHARS = 64_000
+
+
+def _bounded_text(value: Any, limit: int = MAX_EVIDENCE_CHARS) -> Optional[str]:
+    """Serialize evidence without allowing one diagnostic to consume the ledger."""
+    if value is None:
+        return None
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+    return text if len(text) <= limit else text[:limit] + "\n[truncated]"
+
+
+def _bounded_json(value: Any) -> Optional[str]:
+    return _bounded_text(value)
+
 
 def get_jev_home() -> Path:
     """Returns the JEV_HOME directory (defaults to ~/.jev)."""
@@ -58,6 +72,14 @@ class Recorder(Protocol):
         repo_profile: Optional[str] = None,
         profile_chars: Optional[int] = None,
         dep_delta_jev: Optional[str] = None,
+        provenance: Optional[str] = None,
+        model_version: Optional[str] = None,
+        failure_evidence: Optional[Any] = None,
+        retry_metadata: Optional[Any] = None,
+        tool_evidence: Optional[Any] = None,
+        read_evidence: Optional[Any] = None,
+        self_check_evidence: Optional[Any] = None,
+        hypothesis_change: Optional[Any] = None,
     ) -> None: ...
 
 
@@ -119,6 +141,17 @@ class Recorder(Protocol):
         evidence_level: Optional[str] = None,
         dependency_delta: Optional[str] = None,
         jev_state_keys: Optional[str] = None,
+        provenance: Optional[str] = None,
+        model_version: Optional[str] = None,
+        retry_number: Optional[int] = None,
+        evidence_added: Optional[bool] = None,
+        hypothesis_changed: Optional[bool] = None,
+        hypothesis_change: Optional[Any] = None,
+        failure_evidence: Optional[Any] = None,
+        tool_evidence: Optional[Any] = None,
+        read_evidence: Optional[Any] = None,
+        self_check_evidence: Optional[Any] = None,
+        retry_metadata: Optional[Any] = None,
     ) -> None: ...
 
     def has_run(self, run_id: str) -> bool: ...
@@ -146,6 +179,14 @@ class NullRecorder:
         repo_profile: Optional[str] = None,
         profile_chars: Optional[int] = None,
         dep_delta_jev: Optional[str] = None,
+        provenance: Optional[str] = None,
+        model_version: Optional[str] = None,
+        failure_evidence: Optional[Any] = None,
+        retry_metadata: Optional[Any] = None,
+        tool_evidence: Optional[Any] = None,
+        read_evidence: Optional[Any] = None,
+        self_check_evidence: Optional[Any] = None,
+        hypothesis_change: Optional[Any] = None,
     ) -> None:
         pass
 
@@ -212,6 +253,17 @@ class NullRecorder:
         evidence_level: Optional[str] = None,
         dependency_delta: Optional[str] = None,
         jev_state_keys: Optional[str] = None,
+        provenance: Optional[str] = None,
+        model_version: Optional[str] = None,
+        retry_number: Optional[int] = None,
+        evidence_added: Optional[bool] = None,
+        hypothesis_changed: Optional[bool] = None,
+        hypothesis_change: Optional[Any] = None,
+        failure_evidence: Optional[Any] = None,
+        tool_evidence: Optional[Any] = None,
+        read_evidence: Optional[Any] = None,
+        self_check_evidence: Optional[Any] = None,
+        retry_metadata: Optional[Any] = None,
     ) -> None:
         pass
 
@@ -270,9 +322,17 @@ class SqliteLedger:
                   status TEXT,
                   started_at TEXT,
                   ended_at TEXT,
-                  notes_chars INTEGER,
-                  dependency_delta TEXT,
-                  dep_delta_jev TEXT DEFAULT NULL
+                   notes_chars INTEGER,
+                   dependency_delta TEXT,
+                   dep_delta_jev TEXT DEFAULT NULL,
+                   provenance TEXT,
+                   model_version TEXT,
+                   failure_evidence TEXT,
+                   retry_metadata TEXT,
+                   tool_evidence TEXT,
+                   read_evidence TEXT,
+                   self_check_evidence TEXT,
+                   hypothesis_change TEXT
                 );
                 """
             )
@@ -292,6 +352,9 @@ class SqliteLedger:
                 conn.execute("ALTER TABLE runs ADD COLUMN dependency_delta TEXT DEFAULT NULL")
             if "dep_delta_jev" not in cols:
                 conn.execute("ALTER TABLE runs ADD COLUMN dep_delta_jev TEXT DEFAULT NULL")
+            for name in ("provenance", "model_version", "failure_evidence", "retry_metadata", "tool_evidence", "read_evidence", "self_check_evidence", "hypothesis_change"):
+                if name not in cols:
+                    conn.execute(f"ALTER TABLE runs ADD COLUMN {name} TEXT DEFAULT NULL")
 
             conn.execute(
                 """
@@ -334,10 +397,21 @@ class SqliteLedger:
                   tokens_in INTEGER,
                   tokens_out INTEGER,
                   created_at TEXT,
-                  evidence_level TEXT,
-                  dependency_delta TEXT,
-                  jev_state_keys TEXT DEFAULT NULL,
-                  PRIMARY KEY (run_id, subgoal_id, attempt_no)
+                   evidence_level TEXT,
+                   dependency_delta TEXT,
+                   jev_state_keys TEXT DEFAULT NULL,
+                   provenance TEXT,
+                   model_version TEXT,
+                   retry_number INTEGER,
+                   evidence_added INTEGER,
+                   hypothesis_changed INTEGER,
+                   hypothesis_change TEXT,
+                   failure_evidence TEXT,
+                   tool_evidence TEXT,
+                   read_evidence TEXT,
+                   self_check_evidence TEXT,
+                   retry_metadata TEXT,
+                   PRIMARY KEY (run_id, subgoal_id, attempt_no)
                 );
                 """
             )
@@ -348,6 +422,9 @@ class SqliteLedger:
                 conn.execute("ALTER TABLE attempts ADD COLUMN dependency_delta TEXT DEFAULT NULL")
             if "jev_state_keys" not in att_cols:
                 conn.execute("ALTER TABLE attempts ADD COLUMN jev_state_keys TEXT DEFAULT NULL")
+            for name, definition in (("provenance", "TEXT"), ("model_version", "TEXT"), ("retry_number", "INTEGER"), ("evidence_added", "INTEGER"), ("hypothesis_changed", "INTEGER"), ("hypothesis_change", "TEXT"), ("failure_evidence", "TEXT"), ("tool_evidence", "TEXT"), ("read_evidence", "TEXT"), ("self_check_evidence", "TEXT"), ("retry_metadata", "TEXT")):
+                if name not in att_cols:
+                    conn.execute(f"ALTER TABLE attempts ADD COLUMN {name} {definition} DEFAULT NULL")
 
     def has_run(self, run_id: str) -> bool:
         with self._get_connection() as conn:
@@ -368,6 +445,14 @@ class SqliteLedger:
         repo_profile: Optional[str] = None,
         profile_chars: Optional[int] = None,
         dep_delta_jev: Optional[str] = None,
+        provenance: Optional[str] = None,
+        model_version: Optional[str] = None,
+        failure_evidence: Optional[Any] = None,
+        retry_metadata: Optional[Any] = None,
+        tool_evidence: Optional[Any] = None,
+        read_evidence: Optional[Any] = None,
+        self_check_evidence: Optional[Any] = None,
+        hypothesis_change: Optional[Any] = None,
     ) -> None:
         start_time = started_at or datetime.now(timezone.utc).isoformat()
         if not isinstance(dep_delta_jev, str):
@@ -377,8 +462,9 @@ class SqliteLedger:
                 """
                 INSERT INTO runs (
                   run_id, thread_id, ticket, base_commit, engine_commit,
-                  worker_model, test_policy, retry_intel, repo_profile, profile_chars, status, started_at, dep_delta_jev
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', ?, ?)
+                   worker_model, test_policy, retry_intel, repo_profile, profile_chars, status, started_at, dep_delta_jev,
+                   provenance, model_version, failure_evidence, retry_metadata, tool_evidence, read_evidence, self_check_evidence, hypothesis_change
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(run_id) DO UPDATE SET
                   thread_id=excluded.thread_id,
                   ticket=excluded.ticket,
@@ -390,8 +476,16 @@ class SqliteLedger:
                   repo_profile=excluded.repo_profile,
                   profile_chars=excluded.profile_chars,
                   status='in_progress',
-                  started_at=excluded.started_at,
-                  dep_delta_jev=excluded.dep_delta_jev
+                   started_at=excluded.started_at,
+                   dep_delta_jev=excluded.dep_delta_jev,
+                   provenance=excluded.provenance,
+                   model_version=excluded.model_version,
+                   failure_evidence=excluded.failure_evidence,
+                   retry_metadata=excluded.retry_metadata,
+                   tool_evidence=excluded.tool_evidence,
+                   read_evidence=excluded.read_evidence,
+                   self_check_evidence=excluded.self_check_evidence,
+                   hypothesis_change=excluded.hypothesis_change
                 """,
                 (
                     run_id,
@@ -406,6 +500,14 @@ class SqliteLedger:
                     profile_chars,
                     start_time,
                     dep_delta_jev or "off",
+                    provenance,
+                    model_version or worker_model,
+                    _bounded_text(failure_evidence),
+                    _bounded_json(retry_metadata),
+                    _bounded_json(tool_evidence),
+                    _bounded_json(read_evidence),
+                    _bounded_json(self_check_evidence),
+                    _bounded_json(hypothesis_change),
                 ),
             )
 
@@ -551,6 +653,17 @@ class SqliteLedger:
         evidence_level: Optional[str] = None,
         dependency_delta: Optional[str] = None,
         jev_state_keys: Optional[str] = None,
+        provenance: Optional[str] = None,
+        model_version: Optional[str] = None,
+        retry_number: Optional[int] = None,
+        evidence_added: Optional[bool] = None,
+        hypothesis_changed: Optional[bool] = None,
+        hypothesis_change: Optional[Any] = None,
+        failure_evidence: Optional[Any] = None,
+        tool_evidence: Optional[Any] = None,
+        read_evidence: Optional[Any] = None,
+        self_check_evidence: Optional[Any] = None,
+        retry_metadata: Optional[Any] = None,
     ) -> None:
         now_ts = created_at or datetime.now(timezone.utc).isoformat()
         if not isinstance(jev_state_keys, str):
@@ -561,7 +674,7 @@ class SqliteLedger:
         files_json = json.dumps(files if files is not None else [])
         compile_json = None
         if compile_errors is not None:
-            compile_json = json.dumps(compile_errors) if not isinstance(compile_errors, str) else compile_errors
+            compile_json = _bounded_text(compile_errors)
 
         int_jev_valid = None
         if jev_valid is not None:
@@ -583,8 +696,14 @@ class SqliteLedger:
                   jev_valid, jev_probability, jev_model, jev_raw,
                   jev_tokens_in, jev_tokens_out,
                   feedback_sent, tokens_in, tokens_out, created_at,
-                  evidence_level, dependency_delta, jev_state_keys
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  evidence_level, dependency_delta, jev_state_keys, provenance, model_version, retry_number,
+                  evidence_added, hypothesis_changed, hypothesis_change, failure_evidence, tool_evidence,
+                  read_evidence, self_check_evidence, retry_metadata
+                 ) VALUES (
+                   ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                   ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                   ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                 )
                 """,
                 (
                     run_id,
@@ -593,7 +712,7 @@ class SqliteLedger:
                     tier,
                     outcome,
                     failed_check,
-                    diff,
+                    _bounded_text(diff) or "",
                     diff_sha,
                     files_json,
                     compile_json,
@@ -602,16 +721,27 @@ class SqliteLedger:
                     int_jev_valid,
                     jev_probability,
                     jev_model,
-                    jev_raw,
+                    _bounded_text(jev_raw),
                     jev_tokens_in,
                     jev_tokens_out,
-                    feedback_sent,
+                    _bounded_text(feedback_sent),
                     tokens_in,
                     tokens_out,
                     now_ts,
                     evidence_level,
                     dependency_delta,
                     jev_state_keys,
+                    provenance,
+                    model_version or jev_model,
+                    retry_number,
+                    None if evidence_added is None else (1 if evidence_added else 0),
+                    None if hypothesis_changed is None else (1 if hypothesis_changed else 0),
+                    _bounded_json(hypothesis_change),
+                    _bounded_text(failure_evidence),
+                    _bounded_json(tool_evidence),
+                    _bounded_json(read_evidence),
+                    _bounded_json(self_check_evidence),
+                    _bounded_json(retry_metadata),
                 ),
             )
 

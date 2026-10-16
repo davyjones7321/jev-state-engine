@@ -36,6 +36,7 @@ from jev.ledger import NullRecorder, Recorder
 
 from jev.models import (
     CompileOutcome,
+    JevFeedback,
     MechanicalCheckResult,
     State,
     Subgoal,
@@ -51,11 +52,23 @@ from jev.workspace import (
 )
 
 MAX_IMPLEMENT_FILE_CHARS = 80_000
+MAX_IMPLEMENT_READ_CHARS = 20_000
+MAX_IMPLEMENT_READ_CALLS = 12
+SELF_CHECK_TIMEOUT_SECONDS = 5
+MAX_SELF_CHECK_OUTPUT_CHARS = 4_000
 
 
 def _cap_read_text(text: str) -> str:
     if len(text) > MAX_READ_CHARS:
         return text[:MAX_READ_CHARS] + f"\n[truncated: showing first {MAX_READ_CHARS} of {len(text)} characters]"
+    return text
+
+
+def _cap_self_check_output(text: str) -> str:
+    if len(text) > MAX_SELF_CHECK_OUTPUT_CHARS:
+        return text[:MAX_SELF_CHECK_OUTPUT_CHARS] + (
+            f"\n[truncated: showing first {MAX_SELF_CHECK_OUTPUT_CHARS} of {len(text)} characters]"
+        )
     return text
 
 logger = logging.getLogger(__name__)
@@ -168,6 +181,141 @@ def _extract_diff_excerpt(diff: Any, max_lines: int = 40, max_chars: int = 3000)
     return excerpt
 
 
+def _attempt_evidence(
+    state: State,
+    *,
+    failure_class: str,
+    failed_check: Optional[str],
+    diff: str,
+    detail: str = "",
+    compile_info: Optional[Dict[str, Any]] = None,
+    test_info: Optional[Dict[str, Any]] = None,
+    subgoal: Optional[Subgoal] = None,
+    tests_ran: bool = False,
+) -> Dict[str, Any]:
+    """Build a bounded, deterministic repair packet for a failed attempt."""
+    compile_info = compile_info if isinstance(compile_info, dict) else {}
+    test_info = test_info if isinstance(test_info, dict) else {}
+    touched: List[str] = []
+    try:
+        touched = sorted(Workspace._extract_files_from_diff(diff)) if diff else []
+    except Exception:
+        touched = []
+    previous = []
+    for attempt in (state.get("failed_attempts") or [])[-2:]:
+        previous.append({
+            "hash": attempt.get("diff_sha", ""),
+            "excerpt": _extract_diff_excerpt(attempt.get("diff_excerpt", ""), max_chars=1200),
+        })
+    new_errors = compile_info.get("new_errors") or []
+    baseline_errors = compile_info.get("base_errors") or []
+    output = test_info.get("output_tail") or compile_info.get("output_tail") or detail
+    known_facts = [
+        f"failure class is {failure_class}",
+        f"declared scope: {list(subgoal.scope) if subgoal else []}",
+        f"touched files: {touched}",
+        f"tests ran: {tests_ran}",
+    ]
+    unknowns = ["root cause is not established by deterministic checks"]
+    if not new_errors and not baseline_errors:
+        unknowns.append("no compiler baseline/new-error comparison is available")
+    required = ["inspect the affected files and relevant tests before retrying"]
+    constraints = ["do not repeat a prior diff hash", "preserve declared write scope", "pass Tier 0 before semantic validation"]
+    return {
+        "failure_class": failure_class,
+        "failed_check": failed_check,
+        "files": touched,
+        "baseline_errors": baseline_errors[:20],
+        "new_errors": new_errors[:20],
+        "output_excerpt": _cap_self_check_output(str(output or "")),
+        "known_facts": known_facts,
+        "unknowns": unknowns,
+        "required_inspection": required,
+        "prior_attempts": previous,
+        "retry_constraints": constraints,
+    }
+
+
+def _feedback_packet(evidence: Dict[str, Any]) -> str:
+    """Render structured metadata compactly; diagnostics remain in the packet."""
+    compact = {key: value for key, value in evidence.items() if key != "output_excerpt"}
+    return json.dumps(compact, sort_keys=True)
+
+
+def _feedback_items(value: Any) -> List[str]:
+    """Normalize question/diagnostic-like values without rejecting legacy data."""
+    if value is None:
+        return []
+    values = value if isinstance(value, list) else [value]
+    items: List[str] = []
+    for item in values:
+        if isinstance(item, str):
+            text = item.strip()
+        elif isinstance(item, dict):
+            text = str(item.get("question") or item.get("message") or item.get("text") or item)
+        else:
+            text = str(item)
+        if text and text not in items:
+            items.append(text)
+    return items
+
+
+def normalize_jev_feedback(response: Any) -> JevFeedback:
+    """Convert structured, JSON-like, and legacy Jev feedback to one shape.
+
+    Parsing is deliberately best-effort. A malformed or legacy string is kept
+    as a diagnostic rather than being allowed to alter the gate decision.
+    """
+    if isinstance(response, JevFeedback):
+        return response.model_copy(deep=True)
+    if isinstance(response, ValidationVerdict):
+        diagnostics = _feedback_items(response.reason)
+        if response.kind:
+            diagnostics.append(f"kind: {response.kind}")
+        return JevFeedback(
+            verdict=response.valid,
+            confidence=response.probability,
+            diagnostics=diagnostics,
+            questions=list((response.extra_answers or {}).keys()),
+        )
+
+    data: Any = response
+    if isinstance(response, str):
+        text = response.strip()
+        try:
+            data = json.loads(text) if text else {}
+        except (TypeError, ValueError):
+            return JevFeedback(diagnostics=_feedback_items(text))
+    if not isinstance(data, dict):
+        return JevFeedback(diagnostics=_feedback_items(data))
+
+    answers = data.get("answers") if isinstance(data.get("answers"), dict) else {}
+    verdict = data.get("verdict", data.get("valid"))
+    valid_answer = answers.get("valid")
+    if verdict is None and isinstance(valid_answer, dict):
+        verdict = valid_answer.get("value")
+        if not isinstance(verdict, bool) and isinstance(valid_answer.get("noul"), (int, float)):
+            verdict = float(valid_answer["noul"]) >= 0.5
+    if not isinstance(verdict, bool):
+        verdict = None
+    confidence = data.get("confidence", data.get("probability"))
+    if confidence is None and isinstance(valid_answer, dict):
+        confidence = valid_answer.get("probability", valid_answer.get("noul"))
+    if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
+        confidence = None
+    diagnostics = _feedback_items(data.get("diagnostics", data.get("reason")))
+    diagnostics.extend(_feedback_items(data.get("issues")))
+    if not diagnostics and isinstance(valid_answer, dict):
+        diagnostics.extend(_feedback_items(valid_answer.get("reason")))
+    return JevFeedback(
+        verdict=verdict,
+        confidence=float(confidence) if confidence is not None else None,
+        diagnostics=diagnostics,
+        questions=_feedback_items(data.get("questions")),
+        unknowns=_feedback_items(data.get("unknowns", data.get("uncertainties"))),
+    )
+
+
 def _record_failed_attempt_in_state(
     state: State,
     tier: str,
@@ -175,6 +323,7 @@ def _record_failed_attempt_in_state(
     failed_check: Optional[str],
     diff: Any,
     compile_info: Optional[Dict[str, Any]] = None,
+    failure_evidence: Optional[Dict[str, Any]] = None,
 ) -> None:
     if "failed_attempts" not in state or state["failed_attempts"] is None:
         state["failed_attempts"] = []
@@ -207,6 +356,10 @@ def _record_failed_attempt_in_state(
         "diff_sha": diff_sha,
         "diff_excerpt": diff_excerpt,
     }
+    if failure_evidence:
+        entry["failure_evidence"] = failure_evidence
+        for key in ("failure_class", "known_facts", "unknowns", "required_inspection", "prior_attempts", "retry_constraints", "jev_feedback"):
+            entry[key] = failure_evidence.get(key)
 
     state["failed_attempts"].append(entry)
     if len(state["failed_attempts"]) > 2:
@@ -1753,6 +1906,204 @@ def node_implement(
 
     if llm is not None and subgoal is not None and workspace is not None:
         submitted = False
+        implementation_read_calls = 0
+
+        raw_worktree = getattr(workspace, "worktree_dir", None) or getattr(workspace, "repo_dir", None)
+        implementation_root = Path(raw_worktree).resolve() if raw_worktree else None
+
+        def _resolve_implementation_read_path(path: str, expect_directory: Optional[bool] = None) -> Tuple[Optional[Path], str]:
+            if implementation_root is None:
+                return None, "Workspace unavailable; read tools require a worktree."
+            if not path:
+                path = "."
+            candidate = Path(path)
+            target = (implementation_root / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
+            try:
+                target.relative_to(implementation_root)
+            except ValueError:
+                return None, f"Error: Access denied for path outside workspace: {path}"
+            if not target.exists():
+                return None, f"Path not found: {path}"
+            if expect_directory is True and not target.is_dir():
+                return None, f"Not a directory: {path}"
+            if expect_directory is False and not target.is_file():
+                return None, f"Not a file: {path}"
+            return target, ""
+
+        def _consume_implementation_read_budget(tool_name: str) -> Optional[str]:
+            nonlocal implementation_read_calls
+            if implementation_read_calls >= MAX_IMPLEMENT_READ_CALLS:
+                return (
+                    f"Error: implementation read-tool call budget exhausted ({MAX_IMPLEMENT_READ_CALLS} calls)."
+                )
+            implementation_read_calls += 1
+            return None
+
+        def _cap_implementation_output(output: Any) -> str:
+            text = str(output)
+            if len(text) > MAX_IMPLEMENT_READ_CHARS:
+                return text[:MAX_IMPLEMENT_READ_CHARS] + (
+                    f"\n[truncated: showing first {MAX_IMPLEMENT_READ_CHARS} of {len(text)} characters]"
+                )
+            return text
+
+        def _validate_changes(paths: Optional[List[str]] = None) -> str:
+            """Run a bounded, read-only syntax check on scoped changed Python files."""
+            if implementation_root is None:
+                return "Self-check: failed\nReason: implementation worktree is unavailable."
+
+            scope_paths = {
+                Path(scope_path).as_posix().lstrip("./")
+                for scope_path in (subgoal.scope or [])
+            }
+            requested = paths or []
+            candidates = requested
+            if not candidates:
+                try:
+                    diff = workspace.get_staged_diff() if hasattr(workspace, "get_staged_diff") else ""
+                    candidates = sorted(Workspace._extract_files_from_diff(str(diff or "")))
+                except Exception:
+                    candidates = []
+            if not candidates:
+                candidates = list(scope_paths)
+
+            safe_python_files: List[str] = []
+            for raw_path in candidates:
+                normalized = Path(str(raw_path).replace("\\", "/")).as_posix().lstrip("./")
+                if scope_paths and normalized not in scope_paths:
+                    return _cap_self_check_output(
+                        f"Self-check: failed\nReason: path '{raw_path}' is outside declared scope."
+                    )
+                if Path(normalized).suffix.lower() != ".py":
+                    continue
+                target = (implementation_root / normalized).resolve()
+                try:
+                    target.relative_to(implementation_root)
+                except ValueError:
+                    return _cap_self_check_output(
+                        f"Self-check: failed\nReason: path '{raw_path}' escapes the implementation worktree."
+                    )
+                if not target.is_file():
+                    return _cap_self_check_output(
+                        f"Self-check: failed\nReason: Python file '{normalized}' was not found."
+                    )
+                safe_python_files.append(normalized)
+
+            safe_python_files = sorted(set(safe_python_files))
+            if not safe_python_files:
+                return "Self-check: skipped\nReason: no changed Python files require a syntax check."
+
+            checker = (
+                "import ast, pathlib, sys\n"
+                "for name in sys.argv[1:]:\n"
+                "    source = pathlib.Path(name).read_text(encoding='utf-8')\n"
+                "    ast.parse(source, filename=name)\n"
+                "    print(f'OK: {name}')\n"
+            )
+            try:
+                completed = subprocess.run(
+                    [sys.executable, "-c", checker, *safe_python_files],
+                    cwd=str(implementation_root),
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=SELF_CHECK_TIMEOUT_SECONDS,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                return _cap_self_check_output(
+                    f"Self-check: timeout after {SELF_CHECK_TIMEOUT_SECONDS} seconds\n"
+                    f"Check: Python syntax ({', '.join(safe_python_files)})"
+                )
+            except Exception as exc:
+                return _cap_self_check_output(f"Self-check: failed\nReason: {type(exc).__name__}")
+
+            output = "\n".join(part for part in (completed.stdout, completed.stderr) if part).strip()
+            status = "passed" if completed.returncode == 0 else "failed"
+            return _cap_self_check_output(
+                f"Self-check: {status}\nCheck: Python syntax\nFiles: {', '.join(safe_python_files)}"
+                + (f"\nDiagnostics:\n{output}" if output else "")
+            )
+
+        @tool
+        def validate_changes(paths: Optional[List[str]] = None) -> str:
+            """Run a bounded, read-only check on changed files before submission.
+
+            This is advisory worker feedback; authoritative Tier 0 still runs in node_gate.
+            """
+            return _validate_changes(paths)
+
+        @tool
+        def list_dir(path: str = ".") -> str:
+            """List a directory in the implementation worktree without modifying it."""
+            budget_error = _consume_implementation_read_budget("list_dir")
+            if budget_error:
+                return budget_error
+            target, error = _resolve_implementation_read_path(path, expect_directory=True)
+            if target is None:
+                return error
+            try:
+                ignored = {".git", "__pycache__", ".pytest_cache", ".venv", "venv", ".mypy_cache"}
+                entries = [
+                    f"{child.name}/" if child.is_dir() else child.name
+                    for child in sorted(target.iterdir())
+                    if child.name not in ignored
+                ]
+                return _cap_implementation_output("\n".join(entries) if entries else "(empty directory)")
+            except OSError as exc:
+                return _cap_implementation_output(f"Error listing directory {path}: {exc}")
+
+        @tool
+        def read_file(path: str) -> str:
+            """Read a file in the implementation worktree without modifying it."""
+            budget_error = _consume_implementation_read_budget("read_file")
+            if budget_error:
+                return budget_error
+            target, error = _resolve_implementation_read_path(path, expect_directory=False)
+            if target is None:
+                return error
+            try:
+                return _cap_implementation_output(target.read_text(encoding="utf-8", errors="replace"))
+            except OSError as exc:
+                return _cap_implementation_output(f"Error reading file {path}: {exc}")
+
+        @tool
+        def grep(query: str, path: Optional[str] = None) -> str:
+            """Search files in the implementation worktree without modifying it."""
+            budget_error = _consume_implementation_read_budget("grep")
+            if budget_error:
+                return budget_error
+            if not query:
+                return "Error: query parameter is required for grep."
+            target, error = _resolve_implementation_read_path(path or ".")
+            if target is None:
+                return error
+            try:
+                pattern = re.compile(query, re.IGNORECASE)
+            except re.error:
+                pattern = re.compile(re.escape(query), re.IGNORECASE)
+            ignored = {".git", "__pycache__", ".pytest_cache", ".venv", "venv", ".mypy_cache"}
+            files = [target] if target.is_file() else [
+                item for item in target.rglob("*")
+                if item.is_file() and not any(part in ignored for part in item.relative_to(implementation_root).parts)
+            ]
+            matches: List[str] = []
+            for item in files:
+                try:
+                    resolved_item = item.resolve()
+                    resolved_item.relative_to(implementation_root)
+                    relative = item.relative_to(implementation_root).as_posix()
+                    for line_no, line in enumerate(resolved_item.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+                        if pattern.search(line):
+                            matches.append(f"{relative}:{line_no}:{line}")
+                            if len(matches) >= 50:
+                                break
+                except (OSError, ValueError):
+                    continue
+                if len(matches) >= 50:
+                    break
+            return _cap_implementation_output("\n".join(matches) if matches else "No matches found.")
 
         def _execute_stage_file_mutation(path: str, content: str) -> str:
             if not path:
@@ -1812,7 +2163,7 @@ def node_implement(
             submitted = True
             return "Subgoal submitted."
 
-        tools = [stage_file_mutation, submit_subgoal]
+        tools = [list_dir, read_file, grep, stage_file_mutation, validate_changes, submit_subgoal]
 
         prompt_lines = []
         if state.get("ticket"):
@@ -1947,7 +2298,9 @@ def node_implement(
             "3. When creating or modifying UI components, align with the project's export and import conventions (e.g. if root layouts and surrounding components use default exports such as `export default function Component`, provide default exports so default imports resolve cleanly).\n"
             "4. Stage all necessary code changes using the `stage_file_mutation` tool.\n"
             "   Only mutate files within the declared scope.\n"
-            "5. When all changes are staged and you are done, call the `submit_subgoal` tool to submit your work for gate verification."
+            "5. Use `list_dir`, `read_file`, and `grep` only for bounded, read-only inspection; they are limited to the worktree and a per-attempt call budget.\n"
+            "6. Before submission, you may call `validate_changes` for bounded, read-only diagnostics. It never replaces authoritative Tier 0.\n"
+            "7. When all changes are staged and you are done, call the `submit_subgoal` tool to submit your work for gate verification."
         )
         prompt_text = "\n\n".join(prompt_lines)
 
@@ -2014,11 +2367,36 @@ def node_implement(
                         "content_sha": hashlib.sha256(c_str.encode("utf-8")).hexdigest(),
                         "content_chars": len(c_str),
                     }
+                elif name in ("list_dir", "read_file", "grep"):
+                    if name == "list_dir":
+                        read_path = args.get("path") or args.get("directory") or "."
+                        result = list_dir.invoke({"path": read_path})
+                        stored_args = {"path": read_path}
+                    elif name == "read_file":
+                        read_path = args.get("path") or args.get("file_path") or args.get("filename") or ""
+                        result = read_file.invoke({"path": read_path})
+                        stored_args = {"path": read_path}
+                    else:
+                        read_query = args.get("query") or args.get("pattern") or args.get("search_term") or ""
+                        read_path = args.get("path") or args.get("directory") or args.get("file_path")
+                        grep_args = {"query": read_query}
+                        if read_path:
+                            grep_args["path"] = read_path
+                        result = grep.invoke(grep_args)
+                        stored_args = grep_args
+                elif name in ("validate_changes", "self_check"):
+                    check_paths = args.get("paths") or args.get("files")
+                    if isinstance(check_paths, str):
+                        check_paths = [check_paths]
+                    result = validate_changes.invoke({"paths": check_paths})
+                    stored_args = {"paths": check_paths} if check_paths else {}
                 else:
-                    result = f"Unknown tool: {name}. Available tools: stage_file_mutation, submit_subgoal."
+                    result = f"Unknown tool: {name}. Available tools: list_dir, read_file, grep, stage_file_mutation, validate_changes, submit_subgoal."
                     stored_args = args
 
-                executed_tools.append({"name": name, "args": stored_args, "result": str(result)[:200]})
+                result_text = str(result)
+                result_cap = (MAX_SELF_CHECK_OUTPUT_CHARS + 200) if name in ("validate_changes", "self_check") else 200
+                executed_tools.append({"name": name, "args": stored_args, "result": result_text[:result_cap]})
 
                 messages.append(
                     ToolMessage(
@@ -2162,6 +2540,8 @@ def _snapshot_attempt(
     evidence_level: Optional[str] = None,
     dependency_delta: Optional[str] = None,
     jev_state_keys: Optional[str] = None,
+    failure_evidence: Optional[Any] = None,
+    retry_metadata: Optional[Any] = None,
 ) -> None:
     """Helper to snapshot an attempt row to the ledger."""
     if not recorder:
@@ -2202,6 +2582,22 @@ def _snapshot_attempt(
         jev_tokens_in = jev_usage.get("tokens_in") or jev_usage.get("prompt_tokens") or jev_usage.get("input_tokens")
         jev_tokens_out = jev_usage.get("tokens_out") or jev_usage.get("completion_tokens") or jev_usage.get("output_tokens")
 
+    implementation_tools: List[Dict[str, Any]] = []
+    read_evidence: List[Dict[str, Any]] = []
+    self_check_evidence: List[Dict[str, Any]] = []
+    for entry in reversed(state.get("trajectory", [])):
+        if entry.get("node") != "implement":
+            continue
+        for tool_call in entry.get("tool_calls", []):
+            if not isinstance(tool_call, dict):
+                continue
+            implementation_tools.append(tool_call)
+            if tool_call.get("name") in {"list_dir", "read_file", "grep"}:
+                read_evidence.append(tool_call)
+            if tool_call.get("name") in {"validate_changes", "self_check"}:
+                self_check_evidence.append(tool_call)
+        break
+
     safe_rec.record_attempt(
         run_id=run_id,
         subgoal_id=subgoal_id,
@@ -2226,6 +2622,11 @@ def _snapshot_attempt(
         evidence_level=evidence_level,
         dependency_delta=dependency_delta,
         jev_state_keys=jev_state_keys,
+        failure_evidence=failure_evidence,
+        tool_evidence=implementation_tools or None,
+        read_evidence=read_evidence or None,
+        self_check_evidence=self_check_evidence or None,
+        retry_metadata=retry_metadata,
     )
 
 
@@ -2304,9 +2705,22 @@ def node_gate(
 
             prev_att_no = matching_fa.get("attempt_no", 1)
             prev_reason = matching_fa.get("failed_check") or matching_fa.get("outcome") or "failure"
+            duplicate_evidence = _attempt_evidence(
+                state,
+                failure_class="duplicate_diff",
+                failed_check=matching_fa.get("failed_check"),
+                diff=diff,
+                detail=f"Identical to attempt {prev_att_no}.",
+                subgoal=subgoal,
+            )
+            duplicate_evidence["prior_attempts"] = [{
+                "hash": matching_fa.get("diff_sha", diff_sha),
+                "excerpt": _extract_diff_excerpt(matching_fa.get("diff_excerpt", ""), max_chars=1200),
+            }]
             feedback_msg = (
                 f"Duplicate diff detected: identical to attempt {prev_att_no} which failed ({prev_reason}). "
-                "Do not submit identical diffs."
+                "Do not submit identical diffs.\n"
+                f"Failure evidence: {_feedback_packet(duplicate_evidence)}"
             )
             state["last_feedback"] = feedback_msg
 
@@ -2316,6 +2730,7 @@ def node_gate(
                 outcome="duplicate_diff",
                 failed_check=matching_fa.get("failed_check"),
                 diff=diff,
+                failure_evidence=duplicate_evidence,
             )
             _snapshot_attempt(
                 safe_rec,
@@ -2326,6 +2741,7 @@ def node_gate(
                 failed_check=matching_fa.get("failed_check"),
                 diff=diff,
                 feedback_sent=feedback_msg,
+                failure_evidence=duplicate_evidence,
             )
             _teardown_worktree(state, workspace)
 
@@ -2353,6 +2769,48 @@ def node_gate(
                     thread_id=state.get("thread_id"),
                 )
             return state
+
+    # An empty implementation is a deterministic mechanical failure.  It is
+    # not a semantic question: there is no candidate for the judge to assess.
+    if not diff.strip():
+        evidence = _attempt_evidence(
+            state,
+            failure_class="empty_diff",
+            failed_check="empty_diff",
+            diff=diff,
+            detail="Implementation produced no diff.",
+            subgoal=subgoal,
+        )
+        state["mechanical_strike_count"] = state.get("mechanical_strike_count", 0) + 1
+        state["gate_status"] = "mechanical_failure"
+        state["last_feedback"] = (
+            "Implementation diff is empty; semantic validation was skipped.\n"
+            f"Failure evidence: {_feedback_packet(evidence)}"
+        )
+        if retry_intel != "off":
+            _record_failed_attempt_in_state(
+                state, "mechanical", "empty_diff", "empty_diff", diff,
+                failure_evidence=evidence,
+            )
+        _snapshot_attempt(
+            safe_rec, state, subgoal_id, "mechanical", "empty_diff",
+            failed_check="empty_diff", diff=diff,
+            feedback_sent=state["last_feedback"], failure_evidence=evidence,
+        )
+        _teardown_worktree(state, workspace)
+        state["trajectory"].append({
+            "node": "gate", "gate_status": "empty_diff",
+            "failure_evidence": evidence, "jev_request": None, "jev_verdict": None,
+        })
+        if state["mechanical_strike_count"] >= 3:
+            subgoal.status = "failed"
+            state["current_subgoal"] = subgoal
+            _safe_escalate_deadlock(
+                gatekeeper, state.get("trajectory", []), "mechanical",
+                integration_branch=state.get("integration_branch"),
+                thread_id=state.get("thread_id"),
+            )
+        return state
 
     # Tier 0: Mechanical checks
     subgoal_base_commit = state.get("subgoal_base_commit")
@@ -2425,11 +2883,28 @@ def node_gate(
             "outcome": "PASSED" if mech_result.passed or mech_result.failed_check not in ("compile", "no_compile_command", "env_not_ready") else "FAILED",
         }
 
+    mechanical_evidence = _attempt_evidence(
+        state,
+        failure_class=mech_result.failed_check or "mechanical_failure",
+        failed_check=mech_result.failed_check,
+        diff=diff,
+        detail=mech_result.detail,
+        compile_info=compile_telemetry,
+        test_info=test_runner_telemetry,
+        subgoal=subgoal,
+        tests_ran=tests_ran,
+    )
+
     if not mech_result.passed:
         if mech_result.failed_check in ("no_compile_command", "env_not_ready"):
             state["status"] = "escalated"
             state["gate_status"] = mech_result.failed_check
-            state["last_feedback"] = mech_result.detail
+            state["last_feedback"] = _cap_self_check_output(
+                (
+                f"{mech_result.detail}\nFailure evidence: "
+                f"{_feedback_packet(mechanical_evidence)}"
+                )
+            )
 
             if retry_intel != "off":
                 _record_failed_attempt_in_state(
@@ -2439,6 +2914,7 @@ def node_gate(
                     failed_check=mech_result.failed_check,
                     diff=diff,
                     compile_info=compile_telemetry,
+                    failure_evidence=mechanical_evidence,
                 )
             _snapshot_attempt(
                 safe_rec,
@@ -2451,7 +2927,8 @@ def node_gate(
                 compile_info=compile_telemetry,
                 tests_ran=tests_ran,
                 test_outcome=test_runner_telemetry.get("outcome") if isinstance(test_runner_telemetry, dict) else None,
-                feedback_sent=mech_result.detail,
+                feedback_sent=state["last_feedback"],
+                failure_evidence=mechanical_evidence,
             )
             _teardown_worktree(state, workspace)
             subgoal.status = "failed"
@@ -2466,6 +2943,7 @@ def node_gate(
                 "tier0_result": tier0_telemetry,
                 "compile": compile_telemetry,
                 "test_runner": test_runner_telemetry,
+                "failure_evidence": mechanical_evidence,
                 "jev_request": None,
                 "jev_verdict": None,
             })
@@ -2505,6 +2983,14 @@ def node_gate(
         else:
             state["last_feedback"] = mech_result.detail
 
+        mechanical_feedback = (
+            f"{state.get('last_feedback') or 'Mechanical validation failed.'}\n"
+            f"Failure evidence: {_feedback_packet(mechanical_evidence)}"
+        )
+        # Preserve a complete test tail when it already consumes the feedback budget.
+        if len(mechanical_feedback) <= MAX_SELF_CHECK_OUTPUT_CHARS:
+            state["last_feedback"] = mechanical_feedback
+
         if retry_intel != "off":
             _record_failed_attempt_in_state(
                 state,
@@ -2513,6 +2999,7 @@ def node_gate(
                 failed_check=mech_result.failed_check,
                 diff=diff,
                 compile_info=compile_telemetry,
+                failure_evidence=mechanical_evidence,
             )
         _snapshot_attempt(
             safe_rec,
@@ -2526,6 +3013,7 @@ def node_gate(
             tests_ran=tests_ran,
             test_outcome=test_runner_telemetry.get("outcome") if isinstance(test_runner_telemetry, dict) else None,
             feedback_sent=state.get("last_feedback"),
+            failure_evidence=mechanical_evidence,
         )
         _teardown_worktree(state, workspace)
 
@@ -2536,6 +3024,7 @@ def node_gate(
             "tier0_result": tier0_telemetry,
             "compile": compile_telemetry,
             "test_runner": test_runner_telemetry,
+            "failure_evidence": mechanical_evidence,
             "jev_request": None,
             "jev_verdict": None,
         })
@@ -2607,7 +3096,25 @@ def node_gate(
         "valid": verdict.valid,
         "probability": getattr(verdict, "probability", 1.0),
         "reason": getattr(verdict, "reason", None),
+        "feedback": normalize_jev_feedback(verdict).model_dump(),
     }
+    semantic_evidence = _attempt_evidence(
+        state,
+        failure_class="semantic_rejection",
+        failed_check="jev_rejection",
+        diff=diff,
+        detail=getattr(verdict, "reason", None) or "Gatekeeper rejected the candidate.",
+        test_info=test_runner_telemetry,
+        subgoal=subgoal,
+        tests_ran=tests_ran,
+    )
+    semantic_evidence["known_facts"].extend([
+        f"semantic validity probability: {getattr(verdict, 'probability', None)}",
+        f"declared scope versus touched files: {list(subgoal.scope)} versus {semantic_evidence['files']}",
+        f"evidence level: {ev_level}",
+    ])
+    semantic_evidence["unknowns"] = ["the judge did not provide a deterministic repair location"]
+    semantic_evidence["jev_feedback"] = normalize_jev_feedback(verdict).model_dump()
 
     if verdict.valid:
         wt_path = state.get("current_worktree_path")
@@ -2795,6 +3302,13 @@ def node_gate(
                    "Ensure changes strictly adhere to the application's actual domain, product identity, and branding documented in Investigation Notes, without introducing conflicting domain concepts, alternate sports/business models, or fabricated external entities."
             )
 
+        state["last_feedback"] = _cap_self_check_output(
+            (
+            f"{state['last_feedback']}\nFailure evidence: "
+            f"{_feedback_packet(semantic_evidence)}"
+            )
+        )
+
         if retry_intel != "off":
             _record_failed_attempt_in_state(
                 state,
@@ -2802,6 +3316,7 @@ def node_gate(
                 outcome="semantic_failure",
                 failed_check="jev_rejection",
                 diff=diff,
+                failure_evidence=semantic_evidence,
             )
         _snapshot_attempt(
             safe_rec,
@@ -2817,6 +3332,7 @@ def node_gate(
             evidence_level=ev_level,
             dependency_delta=attempt_dep_delta,
             jev_state_keys=jev_keys,
+            failure_evidence=semantic_evidence,
         )
         _teardown_worktree(state, workspace)
 
@@ -2835,6 +3351,7 @@ def node_gate(
             "test_runner": test_runner_telemetry,
             "jev_request": jev_request_telemetry,
             "jev_verdict": jev_verdict_telemetry,
+            "failure_evidence": semantic_evidence,
         })
 
         if current_sem_strikes >= 3:

@@ -1,333 +1,637 @@
-# Jev State Engine 2.0 — Plan
+# Jev State Engine 2.0 — Evidence-First Reliability Plan
 
-**Baseline:** `master` @ `d09d618` (after `--test-policy`).
-**Method:** read `engine.py`, `workspace.py`, `gatekeeper.py`, `models.py`, `main.py` and `docs/`; ran the test suite on Linux (260 passed, 3 failed; the three `test_live_substep_*` files excluded; failures explained in §3).
-**Evidence tags:** **ran** = executed and observed · **read** = from reading code only.
-**Enforcement tags:** **[M]** mechanically enforced · **[P]** prompt-only · **[P+M]** prompt with a mechanical backstop.
+**Status:** Revised planning document. This file specifies implementation order and evaluation gates; it does not itself authorize source-code changes.
 
----
+**Baseline:** `master` at `d09d618` (after `--test-policy`).
 
-## 1. Thesis
+**Evidence convention:** `ran` means executed and observed; `read` means inferred from source or documentation only.
 
-The core is sound: a deterministic FSM, one git worktree per subgoal, an integration branch that `main` only fast-forwards to after final verification, and a two-tier gate (mechanical, then Jev). 2.0 does not need a bigger machine. It needs the engine to **remember its own attempts**.
-
-Today a failed attempt is destroyed on rollback (only `diff_size` is logged), the semantic gate returns no reason, and every ticket starts from zero. Everything valuable in the old plan (dead-end injection, calibration, cross-ticket memory, smarter re-planning, the eval) needs that record first.
-
-Order of work: **close the holes → record everything → use the record to make retries smarter → add cross-ticket memory → only then change control flow (re-planning) and thresholds (calibration)**, because those two cannot be set honestly without data.
+**Enforcement convention:** `[M]` mechanically enforced; `[P]` prompt-only; `[P+M]` prompt guidance with a mechanical backstop.
 
 ---
 
-## 2. Where the engine stands
+## 1. Decision summary
 
-- **FSM:** `investigate → plan → implement → gate → (implement | verify | escalate)`, then `verify → END | escalate`. *read*
-- **Isolation:** each subgoal runs in its own worktree branched from `jev-ticket-<thread_id>`, merged by fast-forward on pass, discarded on fail. `main` moves only in `fast_forward_main` after verify, and that refuses on a dirty tree or a diverged `main`. *read*
-- **Tier 0:** build → compile (table-driven: JS/TS, Go, Rust, Maven, Gradle, Java/Kotlin, Python; baseline-worktree comparison) → tests (per `--test-policy`) → scope. Fails closed on `ENV_NOT_READY` and `NO_COMPILE_COMMAND`. *read*
-- **Tier 1:** one Noul question to Jev. The probability is already parsed and stored in `trajectory[].jev_verdict.probability`. *read*
-- **Proven live (your runs):** About page, multi-file Contact page, forced-failure escalation with `main` untouched.
-- **Not proven live yet:** main diverged, dirty tree, interrupt/resume (Appendix A).
+The engine should not become a larger, more autonomous machine before it becomes more observable and evidence-driven.
+
+The revised order is:
+
+```text
+close security holes
+  -> record complete trajectories
+  -> give the worker bounded read access
+  -> add bounded pre-submit validation
+  -> normalize failure evidence
+  -> expose structured Jev feedback
+  -> add selective DeepSeek diagnosis
+  -> enforce evidence-changing retries
+  -> add structure-aware retrieval
+  -> calibrate Laya and Jev
+  -> add re-planning and memory only after measurement
+```
+
+### Authority model
+
+- **Tier 0:** deterministic local checks. It is authoritative for build, compile, test, scope, and environment facts.
+- **Jev:** paid authoritative semantic judge in production.
+- **Laya:** local/open-source semantic replacement mode or shadow judge; never silently mixed with Jev authority.
+- **DeepSeek:** advisory diagnostician. It explains evidence and likely root causes; it does not approve diffs or write patches.
+- **Worker LLM:** untrusted generator and repair actor operating inside tool, scope, and worktree boundaries.
+
+### Central design rule
+
+```text
+Read broadly enough to understand.
+Write only within declared scope.
+Validate before submission.
+Never let an advisory model override a deterministic gate.
+```
 
 ---
 
-## 3. What the code told us
+## 2. Problem statement
 
-| # | Finding | Evidence | Impact → addressed in |
+The current engine has a blind retry failure mode:
+
+```text
+worker writes a candidate
+  -> compiler, tests, or Jev rejects it
+  -> worktree is rolled back
+  -> worker receives textual feedback
+  -> worker cannot necessarily inspect the missing repository evidence
+  -> worker guesses again
+  -> repeated strike or escalation
+```
+
+The problem is not solved by adding raw chain-of-thought alone. It requires:
+
+1. demand-driven implementation-time repository inspection;
+2. bounded self-validation before submission;
+3. structured, language-agnostic failure evidence;
+4. semantic failure categories from Jev where supported;
+5. selective DeepSeek diagnosis when deterministic evidence is insufficient;
+6. retry rules that require a changed hypothesis or new evidence;
+7. trajectory data that proves whether each change helps.
+
+The worker must not receive the entire repository by default. Context should be retrieved on demand and capped.
+
+---
+
+## 3. Current baseline and known findings
+
+- **FSM:** `investigate -> plan -> implement -> gate -> implement | verify | escalate`, then `verify -> END | escalate`. *read*
+- **Isolation:** subgoal worktrees branch from `jev-ticket-<thread_id>`; successful subgoals advance the integration branch; `main` moves only after final verification. *read*
+- **Tier 0:** build, suppression, unresolved-import, compile, tests, and scope checks are deterministic; policy controls test execution. *read*
+- **Tier 1:** Jev currently receives a Noul validity question and a probability; semantic reasons are limited unless additional typed questions are used. *read*
+- **Proven live:** About-page, multi-file Contact-page, and forced-failure scenarios with `main` untouched. *read*
+- **Not proven live:** all main-divergence, dirty-tree, interrupt/re-run, and cross-ecosystem scenarios. *read*
+
+### Findings that block safe expansion
+
+| ID | Finding | Evidence | Priority |
 |---|---|---|---|
-| F1 | **A worker write can escape its worktree.** The scope guard in `node_implement` normalizes with `lstrip("./")`, which strips *characters*: `../../x` becomes `x` and passes a scope of `x` (`.env` also becomes `env`). `Workspace.stage_file_mutation` then joins the raw path onto the worktree with no containment check. I confirmed the second half: `stage_file_mutation("../escape.txt", …)` created `.jev-worktrees/escape.txt`, and it was **absent from the staged diff**, so Tier 0's scope check cannot see it. | **ran** (workspace half) + **read** (guard half); not run through the LLM tool wrapper | High. Breaks the isolation invariant; matters before open-sourcing → Phase 0 |
-| F2 | `Workspace.run_read_tool` blocks `..` traversal only inside the Windows fallback (when `cat` is missing). On Linux/Mac a real `cat ../outside.txt` runs, and your own test fails there. The LLM-facing `read_file` has its own guard, so the exposure is one layer down. | **ran** | Medium. Blocks Mac testing → Phase 0 |
-| F3 | Jev's `reason` is always `None` **by design** (a Noul answer has no text; `docs/TASK.md` says so). On a semantic rejection the worker gets a canned paragraph plus the probability, so semantic retries are nearly blind. | **read** | High leverage → Phase 3 |
-| F4 | Failed attempts leave no record: the worktree is discarded and the trajectory keeps `diff_size`, not the diff. No dead-ends, no calibration set, no fix examples. | **read** | High leverage → Phase 1 |
-| F5 | `execute()` always starts from a fresh state and runs `branch -D` on the integration branch before recreating it, so partial progress from an earlier run on that thread id is deleted; the checkpointer is not providing resume. (How LangGraph treats an interrupted thread was not tested.) The default `--thread-id` is the constant `main-thread`. | **read** | Medium → Phase 0 |
-| F6 | `escalate_deadlock` writes `escalation.log` to the current directory, overwritten on every escalation, not keyed by run. | **read** | Low–medium → Phase 0 |
-| F7 | A final-verify rejection escalates the whole ticket even though every subgoal passed. There is no repair attempt. | **read** | Design gap → Phase 5 |
-| F8 | The worker has **no shell** (tools: `list_dir`, `grep`, `read_file`, `stage_file_mutation`, `submit_subgoal`). The old Pillar 3 problem "runs npm in a bun repo" cannot happen; the engine runs the commands. What a profile fixes is convention drift (ESM vs CJS, wrong runner assumptions in plans) and prompt bloat. | **read** | Shapes Phase 2 |
-| F9 | The old Pillar 2 hazard (a file-level rollback wiping an earlier subgoal) does not exist: failure discards a whole worktree and the integration branch only fast-forwards. What is missing is recording the SHAs. | **read** | Shrinks Phase 1 |
-| F10 | When no tests run (no script, `verify-only`, `never`), the gate is compile + Jev only. Any "mechanical evidence overrides doubt" rule must check that tests actually ran. | **read** | Design constraint → Phases 2, 6 |
-| F11 | `test_compile_failure_after_subgoal_that_ran_tests_telemetry_not_leaked` fails on Linux (`mechanical_failure` instead of `passed`). Cause undiagnosed; may be environmental. `test_live_jev_api_call` also fails without `JEV_API_KEY`, as expected for a live test. | **ran** | Triage → Phase 0 |
+| F1 | A mutation path can escape the worktree if path normalization strips characters rather than only a leading `./`. | `ran` + `read` in the prior investigation. | Critical; Phase 0 |
+| F2 | Read-command containment was historically platform-dependent. | `ran` on the prior Linux path. | High; Phase 0 |
+| F3 | Jev’s base Noul result may contain probability without a useful textual reason. | `read` and live API observations recorded in the prior plan. | High; Phase 5 |
+| F4 | Failed attempts and useful diffs must survive rollback to support repair and calibration. | `read`. | High; Phase 1 |
+| F5 | Existing thread IDs restart rather than resume; this must remain explicit. | `read`. | Medium; Phase 0 |
+| F6 | Escalation artifacts must be per-run, not overwritten in a shared location. | `read`. | Medium; Phase 0 |
+| F7 | Final verification rejection currently escalates rather than attempting bounded repair. | `read`. | Later; Phase 9 |
+| F8 | Implementation-time worker context is narrower than investigation context. | `read`. | High; Phase 2 |
+| F9 | Worktree-per-subgoal already prevents the old file-level rollback hazard. | `read`. | Preserve; Phase 1 records lineage |
+| F10 | Compile-only or semantic-only outcomes must never be mislabeled as test-backed evidence. | `read`. | High; Phase 1/4 |
+| F11 | At least one telemetry test failure was observed and remains to be diagnosed before claiming parity. | `ran`. | High; Phase 0 |
 
 ---
 
-## 4. Invariants (never traded away)
+## 4. Non-negotiable invariants
 
-1. **Inversion of control.** The engine receives workspace, gatekeeper, llm, recorder, profiler and memory through its constructor. Nothing global.
-2. **Isolation.** Worker writes are confined to a subgoal worktree (now enforced by path containment, not assumed). `main` moves only by the final fast-forward after verify.
-3. **Mechanical evidence outranks semantic opinion when it exists**, and every result states which evidence existed (evidence level, Phase 2).
-4. **Every state-changing git action is recorded with SHAs** in the ledger.
-5. **Memory is derived, provenance-tagged and disposable.** It never overrides a mechanical check.
-6. **New behavior ships off, or in shadow mode, until the ledger shows it helps.**
-7. **Every fix declares its enforcement** ([M], [P] or [P+M]). Where a prompt-only fix has already failed once, it gets a mechanical backstop.
-
----
-
-## 5. What happened to the old eight pillars
-
-| Old pillar | Verdict | Why |
-|---|---|---|
-| 1. Dynamic re-planning | **Keep, reshaped → Phase 5** | Engine-initiated first; re-planning replaces an escalation, never a live attempt. Worker-initiated tool deferred. |
-| 2. Git-commit lineage & delta rollbacks | **Mostly already built → Phase 1** | Worktree-per-subgoal + fast-forward already gives clean rollback (F9). Only SHA recording remains. |
-| 3. Structured repo profile | **Keep → Phase 2** | Reuse the existing handlers; value is convention facts and evidence level, not preventing shell misuse (F8). |
-| 4. Domain-grouped state | **Defer** | No behavior change; touches every node and most of the 260 tests. Add one typed sub-dict per new feature instead. |
-| 5. Tri-level graph memory | **Split** | Level 3 (episodic) → Phase 4. Level 2 (execution DAG) dropped: git + ledger already are that graph. Level 1 (code graph) deferred with a trigger. |
-| 6. Run & failure ledger | **Keep → Phases 1 and 3** | The foundation. DPO export deferred until something can consume it. |
-| 7. Uncertainty band | **Keep, data-gated → Phase 6** | Shadow mode first; edges from data, not the assumed 0.30/0.70; mechanical override only when tests ran. |
-| 8. Process-reward interceptors | **Mostly exists; fix the hole** | Scope confinement exists (and is broken, F1 → Phase 0). Dependency hygiene becomes evidence (Phase 2). Interface check deferred. |
+1. **Inversion of control:** workspace, worker, judge, recorder, profile, and memory are injected; no hidden global authority.
+2. **Worktree isolation:** worker writes remain inside the active worktree and declared mutation scope.
+3. **Deterministic primacy:** mechanical checks cannot be overridden by Jev, Laya, DeepSeek, or the worker.
+4. **Semantic authority clarity:** Jev, Laya, and DeepSeek roles are explicit in every run.
+5. **Evidence provenance:** every diagnosis identifies whether it came from deterministic checks, Jev, Laya, DeepSeek, or inference.
+6. **Complete attempt recording:** failed attempts are recorded before rollback, including diff hash and relevant diagnostics.
+7. **Evidence-changing retries:** a retry must add evidence, change its hypothesis, or change its implementation strategy.
+8. **Bounded context:** read output, tool calls, turns, validation cycles, and model calls have hard limits.
+9. **Advisory memory:** memory can suggest; it cannot override current repository facts or mechanical results.
+10. **Feature flags and shadow mode:** behavior-changing improvements are off by default until held-out evaluation shows benefit.
+11. **No raw CoT dependency:** internal reasoning from DeepSeek is not a required persisted protocol; use structured diagnostic summaries.
+12. **No OS-sandbox assumption:** Git worktrees are not equivalent to a process/container sandbox. This limitation remains explicit.
 
 ---
 
-## 6. Architecture 2.0
+## 5. Revised architecture
 
 ```mermaid
 flowchart LR
     S([start]) --> investigate --> plan
-    plan -->|planning failed| escalate
-    plan --> implement --> gate
-    gate -->|"pass, more subgoals"| implement
-    gate -->|"strike 1-2: retry"| implement
-    gate -->|"pass, queue empty"| verify
-    gate -->|"3rd strike (Phase 5)"| replan
-    gate -->|"env or merge failure"| escalate
+    plan -->|invalid or empty mutation plan| escalate
+    plan --> implement
+    implement -->|read, mutate, bounded self-check| implement
+    implement --> gate
+    gate -->|Tier 0 pass| semantic
+    gate -->|Tier 0 fail| repair
+    semantic -->|Jev or Laya pass| next
+    semantic -->|semantic rejection| repair
+    repair -->|deterministic packet, optional DeepSeek| implement
+    next -->|more subgoals| implement
+    next -->|queue empty| verify
     verify -->|verified| E([end])
-    verify -->|"rejected (Phase 5)"| replan
-    replan -->|"new queue"| implement
-    replan -->|"budget spent or invalid"| escalate
+    verify -->|bounded repair available| replan
+    verify -->|budget exhausted or unsafe| escalate
+    replan -->|validated remaining queue| implement
+    replan -->|invalid or exhausted| escalate
     escalate --> E
 ```
 
-Today the 3rd strike and a verify rejection go straight to `escalate`; `replan` arrives in Phase 5. Three side channels attach to the existing nodes and add no new states:
+`repair` is a bounded recovery operation. It may be implemented as an internal loop or a graph node, but it must not weaken the existing state-machine authority.
 
-- **Recorder** (Phase 1): every node writes facts to `ledger.db`.
-- **Profile** (Phase 2): plan and implement prompts get hard repo facts; the gate gets the evidence level.
-- **Memory** (Phase 4): plan and implement prompts get a few verified hints.
+### Worker interaction model
 
-```python
-engine = JevEngine(
-    workspace=workspace, gatekeeper=gatekeeper, llm=llm,
-    recorder=SqliteLedger(...),    # Phase 1  (default: NullRecorder)
-    profiler=RepoProfiler(...),    # Phase 2  (default: none)
-    memory=KnowledgeStore(...),    # Phase 4  (default: NullMemory)
-)
+During implementation the worker receives:
+
+- ticket and current subgoal;
+- declared write scope;
+- bounded relevant file context;
+- investigation notes and hard repository profile;
+- previous structured failure packet;
+- read-only repository tools;
+- scoped mutation tool;
+- controlled validation tool;
+- submit action.
+
+The worker may read outside write scope, but every mutation remains subject to scope and containment checks.
+
+### Failure path model
+
+```text
+deterministic failure or semantic rejection
+  -> capture evidence before teardown
+  -> classify failure
+  -> provide targeted read actions
+  -> call DeepSeek only when policy says diagnosis is worthwhile
+  -> produce bounded repair brief
+  -> retry with evidence-change requirement
 ```
 
 ---
 
-## 7. Roadmap
+## 6. Phased implementation roadmap
 
-| Phase | Name | Size | Needs | Changes current behavior? |
-|---|---|---|---|---|
-| 0 | Close the holes | S | — | Yes (bug fixes) |
-| 1 | Ledger & lineage | M | 0 | No |
-| 2 | Repo profile & evidence level | M | 0 | Prompts only |
-| 3 | Retry intelligence | M | 1 | Retries only |
-| 4 | Episodic memory | L | 1, 2 | Off by default |
-| 5 | Re-planning | L | 1, 3 | Only where it used to escalate |
-| 6 | Calibrated gate | M | 1 (data) | Shadow first |
+### Phase 0 — Close security and lifecycle holes
 
-Phases 2 and 3 are independent and can be built in either order after Phase 1. Phase 6's offline analysis can start as soon as Phase 1 has produced runs.
+**Goal:** make current behavior safe and reproducible before adding intelligence.
 
-### Working agreement (every phase)
+Plan:
 
-One branch per phase (`phase-<n>-<name>`). Antigravity implements in the **D: repo**; live runs happen from the **Desktop clone** against jp-bat reset to `baseline-clean`. `git fetch` before `git pull`. The agent lists every unrequested change separately. Claims are checked against real test output, not the agent's summary. Hardening tests are written first and shown failing on the old code.
+- Centralize strict worktree containment for mutation and read paths `[M]`.
+- Reject absolute paths, parent traversal, drive/UNC paths, symlink escapes, and junction escapes `[M]`.
+- Preserve dotfiles such as `.env` and `.github`; never normalize by character stripping `[M]`.
+- Apply read guards uniformly across platforms `[M]`.
+- Diagnose the known telemetry failure F11.
+- Mark live API tests so missing credentials produce a skip, not a misleading failure.
+- Store escalation artifacts under `$JEV_HOME/runs/<thread_id>/`.
+- Keep restart semantics explicit: an existing thread warns and restarts; no implicit resume.
+- Verify dirty-tree and main-divergence behavior live in disposable repositories.
+
+Tests/exit criteria:
+
+- traversal, absolute path, dotfile, backslash, symlink, junction, and worktree escape fixtures;
+- Windows and Linux parity; macOS when available;
+- no writes outside the active worktree;
+- `main` remains untouched on escalation;
+- all existing non-live tests pass.
+
+### Phase 1 — Ledger, lineage, and trajectory evidence
+
+**Goal:** preserve enough evidence to diagnose failures and evaluate later phases.
+
+Plan:
+
+- Keep stable run, subgoal, attempt, parent-SHA, and commit-SHA records.
+- Snapshot every gate outcome before rollback or teardown.
+- Store full or bounded diff evidence, diff hash, touched files, diagnostics, test result, compile result, Jev response, model version, usage, and feedback sent.
+- Record worker tool calls, read paths, self-checks, and retry number.
+- Add explicit provenance fields: `deterministic`, `jev`, `laya`, `deepseek`, or `inferred`.
+- Record whether the retry added new evidence or changed its hypothesis.
+- Keep `NullRecorder` behavior-compatible and make recorder failure non-fatal.
+- Provide a read-only report for runs, subgoals, attempts, lineage, and failure packets.
+
+Tests/exit criteria:
+
+- exactly one attempt row per outcome;
+- rows survive rollback;
+- recorded SHAs match Git;
+- failed diffs are inspectable;
+- tool traces and model versions are attached to the correct attempt;
+- About and forced-failure tickets produce complete reports.
+
+### Phase 2 — Demand-driven implementation context
+
+**Goal:** eliminate blind retries without flooding the context window.
+
+Plan:
+
+- Add bounded read-only implementation tools:
+  - `list_dir`;
+  - `read_file`;
+  - `grep`;
+  - optional manifest/export inspection where deterministic.
+- Enforce path containment, ignored directories, output caps, per-attempt call budgets, and total-turn budgets `[M]`.
+- Keep mutation tools limited to declared scope `[M]`.
+- Give the worker a clear instruction to inspect relevant evidence after import, type, test, or semantic failures `[P]`.
+- Record tool calls and results in the trajectory `[M]`.
+- Do not inject the entire repository by default.
+
+Tests/exit criteria:
+
+- cross-file import fixtures for TypeScript, Python, Go, Rust, and JVM;
+- worker can discover an actual module/export boundary using read tools;
+- no read or write escapes containment;
+- output and call budgets are enforced;
+- initial prompt size remains bounded.
+
+### Phase 3 — Bounded same-turn validation
+
+**Goal:** catch cheap failures before a candidate consumes a gate strike.
+
+Plan:
+
+- Add a controlled validation action selected from the repository profile.
+- Prefer the smallest meaningful check:
+  - parse/syntax;
+  - targeted compile/typecheck;
+  - targeted test or test selection where safely discoverable.
+- Allow a bounded write -> check -> read-result -> revise loop before submission.
+- Return structured diagnostics to the worker.
+- Keep authoritative Tier 0 independent; self-check success never guarantees gate success.
+- Record every self-check and its latency/output.
+
+Tests/exit criteria:
+
+- common syntax/import/type failures are repaired before submission;
+- self-check cannot bypass scope or containment;
+- timeout and environment errors are classified separately;
+- self-check budgets are enforced;
+- final Tier 0 still runs on every submitted candidate.
+
+### Phase 4 — Structured repair evidence and retry guards
+
+**Goal:** turn raw errors into compact, language-agnostic repair context.
+
+Every failure packet should contain:
+
+- failure class;
+- check/command;
+- affected files and locations;
+- baseline versus new errors;
+- bounded output excerpt;
+- declared versus touched scope;
+- tests/compile evidence level;
+- known facts;
+- unknowns;
+- evidence the worker must inspect;
+- prior attempt hashes and diff excerpt;
+- retry constraints;
+- provenance and confidence.
+
+Add mechanical guards:
+
+- identical diff short-circuit before expensive checks `[M]`;
+- repeated-hypothesis detection using changed files, diagnostics, read paths, and failure class `[M]`;
+- empty implementation diff classification at planning/gate level;
+- no semantic call after a mechanical failure;
+- no mechanical override by a semantic model.
+
+Tests/exit criteria:
+
+- retries receive compact packets rather than only raw stderr;
+- repeated identical diffs call neither tests nor Jev;
+- different diffs repeating the same unsupported assumption are detected where possible;
+- empty “read-only” subgoals are rejected or routed as investigation work.
+
+### Phase 5 — Structured Jev semantic feedback
+
+**Goal:** obtain authoritative semantic signals before asking DeepSeek to infer them.
+
+Where the provider supports typed questions, collect on rejection:
+
+- incomplete;
+- wrong behavior;
+- exceeds scope;
+- contradicts ticket;
+- contradicts repository conventions/notes;
+- missing validation;
+- unnecessary change;
+- low quality;
+- primary failure category.
+
+Record:
+
+- raw response;
+- model/version;
+- probabilities/confidence;
+- question set;
+- state keys;
+- whether the signal came directly from Jev or was inferred.
+
+If the API returns only validity and probability, label the reason as unavailable rather than inventing one.
+
+Exit criteria:
+
+- semantic retries receive typed evidence when supported;
+- fallback behavior works when extra questions are rejected;
+- no compatibility shim silently changes the authority contract.
+
+### Phase 6 — Selective DeepSeek diagnostic advisor
+
+**Goal:** use reasoning where deterministic evidence is insufficient.
+
+DeepSeek is called only for selected cases:
+
+- repeated mechanical failure;
+- ambiguous compiler/test diagnostics;
+- semantic rejection with weak Jev feedback;
+- repeated failure of the same hypothesis.
+
+DeepSeek receives only a bounded packet:
+
+- ticket and subgoal;
+- relevant diff excerpt;
+- deterministic diagnostics;
+- Jev typed verdict when available;
+- selected repository evidence;
+- prior attempt summaries.
+
+DeepSeek returns a structured repair brief:
+
+- confirmed facts;
+- likely root cause;
+- alternative hypotheses;
+- evidence still required;
+- retry constraints;
+- confidence.
+
+DeepSeek must not write files, approve a diff, override Tier 0, or be treated as knowing Jev’s private reasoning. Timeouts and malformed responses fall back to deterministic feedback.
+
+Exit criteria:
+
+- DeepSeek-assisted retries reduce repeated guesses or escalations;
+- no increase in false passes, scope violations, or latency beyond the defined budget;
+- DeepSeek’s inferred diagnosis is visibly distinguished from Jev’s direct signal.
+
+### Phase 7 — Evidence-driven retry policy
+
+**Goal:** ensure each retry is meaningfully different.
+
+Policy:
+
+- First failure: deterministic packet plus targeted inspection.
+- Repeated same-class failure: DeepSeek may be invoked; worker must perform a new evidence-gathering action.
+- Identical diff: immediate mechanical/semantic strike of the original tier, no repeated expensive evaluation.
+- Repeated hypothesis without new evidence: classify as a dead-end and escalate or re-plan according to budget.
+- Never solve the problem by merely increasing the strike limit.
+
+Track whether each retry:
+
+- read new relevant files;
+- changed its hypothesis;
+- changed its diff materially;
+- addressed the failure class;
+- changed its validation result.
+
+Exit criteria:
+
+- retry resolution rate improves;
+- repeated-guess rate decreases;
+- escalation rate falls without increasing final-verification rejection.
+
+### Phase 8 — Repository profile and structure-aware retrieval
+
+**Goal:** reduce context volume while improving relevance across ecosystems.
+
+Keep the hard repository profile for:
+
+- ecosystem/root;
+- manifest and package manager;
+- module system;
+- compile and test commands;
+- framework signals;
+- evidence level.
+
+Add optional structure-aware retrieval only after Phases 2–7 are measured:
+
+- JavaScript/TypeScript exports/imports;
+- Python definitions/imports;
+- Go packages/symbols;
+- Rust modules/use statements;
+- Java/Kotlin classes/packages;
+- test-to-symbol relationships.
+
+Use compiler/test locations to rank retrieval targets. Return minimal source slices with paths and line ranges. Fall back to plain search when parsing fails; parser failure must never block read access.
+
+Exit criteria:
+
+- prompt size or repair attempts decrease on a multi-language fixture set;
+- successful fixes do not decrease;
+- parser failures remain recoverable.
+
+### Phase 9 — Laya replacement calibration and evaluation
+
+**Goal:** make open-source semantic judging measurable and explicit.
+
+Provide distinct modes:
+
+- Jev authority;
+- Laya authority;
+- Jev authority with Laya shadow;
+- diagnostic-only.
+
+Create a labeled, versioned dataset from ledger diffs. Use pilot labels first, then a larger held-out set stratified by:
+
+- ecosystem;
+- task type;
+- evidence level;
+- failure category;
+- repository size;
+- test availability.
+
+Compare Jev, Laya, and human labels on:
+
+- false pass;
+- false reject;
+- semantic completeness;
+- scope correctness;
+- final-verification correlation;
+- calibration by model/version.
+
+Passing tests alone is insufficient evidence of correctness.
+
+Exit criteria:
+
+- Laya can run as a documented local replacement with measured limitations;
+- shadow decisions are evaluated on held-out cases;
+- no authority ambiguity remains in reports.
+
+### Phase 10 — Episodic memory
+
+**Goal:** reuse verified failure/fix patterns without making memory authoritative.
+
+Build memory only from ledger evidence:
+
+- compile traps;
+- test traps;
+- environment facts;
+- later successful repair hints.
+
+Rules:
+
+- provenance points to run, attempt, and commit;
+- evidence hashes invalidate stale facts;
+- retrieval is exact and budgeted before embeddings are considered;
+- memory is `off` by default;
+- facts are labeled as hints and rechecked against current code;
+- `list`, `forget`, and `rebuild` remain available.
+
+Exit criteria:
+
+- A/B memory-on versus memory-off runs show no regression;
+- stale facts are not injected;
+- memory reduces repeated failures without overriding current checks.
+
+### Phase 11 — Engine-initiated re-planning
+
+**Goal:** recover from bad decomposition only after retry evidence is available.
+
+Triggers:
+
+- subgoal approaching strike limit;
+- final verification rejection;
+- oversized or incorrectly decomposed remaining queue.
+
+Rules:
+
+- committed subgoals are immutable;
+- only the remaining queue can be replaced;
+- invalid plans reuse existing schema and grounding checks;
+- hard re-plan budget defaults to one and has a small maximum;
+- new subgoals have a count cap;
+- dropped work is marked `pruned`;
+- worker-initiated scope widening remains disabled.
+
+Exit criteria:
+
+- recoverable failures complete with bounded re-planning;
+- unrecoverable failures escalate deterministically;
+- re-planning does not increase scope creep or repeat committed work.
+
+### Phase 12 — Calibrated semantic gate
+
+**Goal:** tune decision thresholds only after the ledger and labels justify them.
+
+Plan:
+
+- label a versioned, stratified diff set;
+- separate calibration from held-out evaluation;
+- analyze Jev probabilities by model version and evidence level;
+- compare validity questions with structured choice alternatives;
+- run shadow decisions before enforcement;
+- handle ambiguous cases by escalation;
+- never let mechanical primacy override missing test evidence;
+- use stricter policy for critical files such as manifests, lockfiles, and CI configuration.
+
+Exit criteria:
+
+- shadow policy beats the existing threshold on held-out data;
+- no increase in final-verification false passes;
+- only then enable enforcement behind a flag.
 
 ---
 
-### Phase 0 — Close the holes (S)
+## 7. Evaluation program
 
-*Why first:* F1 breaks the isolation invariant; F2 and F11 block Mac testing; F5 and F6 make runs collide.
+Before claiming improvement, evaluate a fixed disposable task set across JavaScript/TypeScript, Python, Go, Rust, and JVM repositories.
 
-- **0.1 Path containment [M].** Add `Workspace.resolve_in_worktree(path)`: normalize with `posixpath.normpath`; reject absolute paths, `..` segments, drive letters, and anything whose resolved path (symlinks followed) leaves the worktree. Use it in `stage_file_mutation`, `run_read_tool` and the `node_implement` tool guard. Delete `lstrip("./")`; strip only a leading `./`.
-- **0.2 Platform parity.** Apply the read guard on every platform. Get the suite green on Linux and Mac. Diagnose F11. Put `test_live_jev_api_call` behind a `live` marker that skips without `JEV_API_KEY`.
-- **0.3 Per-run artifacts.** Introduce `JEV_HOME` (default `~/.jev`). Escalation output goes to `$JEV_HOME/runs/<thread_id>/escalation.json`. The default thread id becomes `run-<utc-timestamp>-<4 hex>` unless `--thread-id` is passed.
-- **0.4 Resume semantics.** Make today's behavior explicit: if the thread already has a checkpoint, print that this run restarts and deletes `jev-ticket-<id>`. A real `--resume` is out of scope (§11, decision 1).
-- **Tests:** `../x`, `../../x`, `.env` ≠ `env`, `.github/…`, absolute path, symlink pointing out, backslash form.
-- **Exit:** suite green on Windows and Mac; Appendix A scenarios 1–3 run live.
+Required variants:
 
-### Phase 1 — Ledger & lineage (M)
+| Variant | Read tools | Self-check | Structured packet | DeepSeek | Structure retrieval | Purpose |
+|---|---:|---:|---:|---:|---:|---|
+| Baseline | no | no | no | no | no | Current behavior |
+| A | yes | no | no | no | no | Context access |
+| B | yes | yes | no | no | no | Pre-submit validation |
+| C | yes | yes | yes | no | no | Evidence formatting |
+| D | yes | yes | yes | selective | no | Diagnostic advisor |
+| E | yes | yes | yes | selective | yes | Structure retrieval |
+| F | yes | yes | yes | selective | yes | Laya authority mode |
 
-*Why now:* it is the prerequisite for Phases 3–6 and for the eval, and it changes no behavior.
+Record:
 
-- `Subgoal.id` (stable, e.g. `sg-1`) and `Subgoal.status` ∈ `pending | in_progress | committed | failed | pruned`, both defaulted so the existing tests keep passing.
-- `src/jev/ledger.py`: a `Recorder` protocol, `NullRecorder` (default), `SqliteLedger` (schema in Appendix B), injected into `JevEngine`.
-- **Capture points:** run start/end; the plan; every gate outcome (**read the diff before the worktree is discarded**); Jev's raw response (with the model version it reports and its token usage); verify. Lineage: `parent_sha` and `commit_sha` per committed subgoal (`get_branch_commit` before and after merge). Also token usage when the LLM response carries it, and the length of `investigation_notes` so Phase 2 can size a cap from data.
-- **Refactor note:** `node_gate` repeats its worktree teardown in four branches. Extract one `_snapshot_attempt()` and one `_teardown_worktree()` so the recorder is called once per outcome.
-- `scripts/ledger_report.py` (read-only): prints a run's subgoals, attempts, outcomes, probabilities and SHAs.
-- **Tests:** exactly one attempt row per gate outcome; rows survive rollback; `NullRecorder` leaves behavior identical; recorded SHAs equal `git rev-parse`.
-- **Exit:** the About and forced-failure tickets on jp-bat each produce a complete ledger report.
+- completion and first-attempt success;
+- mechanical and semantic strikes;
+- repeated-diff and repeated-hypothesis rates;
+- escalations by cause;
+- final-verification rejection;
+- false passes and false rejects;
+- scope violations;
+- read/self-check/DeepSeek calls and latency;
+- token and monetary cost;
+- cross-ecosystem performance;
+- model and judge versions.
 
-### Phase 2 — Repo profile & evidence level (M)
+### Success criteria
 
-- **`RepositoryProfile`** (Pydantic, small by design; aim for ~150 tokens, to be measured): per ecosystem, the root, manifest, package manager (from the lockfile), module system (`"type"` in `package.json`, `tsconfig` `module`), compile command, test command or `none`, and major frameworks from dependencies. Built from manifests with zero LLM tokens, **reusing the existing compile and test handlers' detection** (no second detector), cached by manifest hashes. Table-driven so Python, Go, Rust and JVM repos get the same treatment as JS/TS.
-- Injected into plan and implement prompts **[P]**. The mechanical backstops already exist: the compile gate and `ENV_NOT_READY`.
-- Investigation stays for soft conventions (product identity, naming, styling). Profile = hard facts; notes = judgment. Cap the notes using the lengths Phase 1 recorded.
-- **Evidence level [M]** on every result and ledger row: `tests+compile` · `compile-only` · `semantic-only`, derived from what Tier 0 actually ran. Closes F10 and makes "no tests ran" visible instead of implied.
-- **Dependency delta [M]:** parse manifest diffs into `{added, removed}`, pass it to Jev as structured evidence in `state`, and print it in the final summary. It is evidence, not a blocker (Tier 0 scope already rejects manifests that are not in scope).
-- **Tests:** fixtures per ecosystem (JS with bun/pnpm/npm, Python, Rust, Go, Maven); profile output is deterministic; evidence level matches each `--test-policy`.
-- **Exit:** jp-bat profile is correct; the evidence label is correct under `--test-policy never`.
+The plan is successful only if held-out evaluation shows:
 
-### Phase 3 — Retry intelligence (M)
-
-*Why:* F3 + F4. The highest quality gain per line of code.
-
-- **Dead-end block [P+M].** On a retry, the implement prompt gets up to 2 prior failed attempts of the same subgoal, rendered from the ledger by template (files touched, failure kind, normalized compile/test error keys, a short diff excerpt) with "do not repeat". **Backstop [M]:** if the new diff's SHA equals an earlier failed attempt of the same subgoal, fail it immediately without running tests or calling Jev, counted as a strike of the original tier.
-- **Typed semantic rejection [P+M].** Verified live (`jev-1.13.0`): one request carries several named questions and Jev returns typed answers only, with no explanation text. Send the extra questions in the **same request every time** (questions cannot see each other's answers) and use them only when `valid` is false: yes/no checks (e.g. `exceeds_scope`, `incomplete`, `contradicts_notes`) plus a `choice` over failure kinds, which returns the chosen option, a `confidence` and per-option `probabilities`. Feed the strongest findings plus deterministic facts (files touched vs scope, lines changed, evidence level) back to the worker instead of the canned paragraph. Still one Jev call per gate. Mechanical part: getting the findings. Prompt-only part: the worker acting on them, backed by the duplicate-diff guard and the strike counter.
-- **Tests:** dead-end block contents; the duplicate-diff short-circuit calls neither tests nor Jev; fallback path when the API rejects the second question.
-- **Exit:** on the forced-failure ticket and one hard ticket, retries differ from the failed diffs and the typed reason appears in the feedback.
-
-### Phase 4 — Episodic memory (L)
-
-Design in §8.
-
-- `src/jev/memory.py` (`KnowledgeStore`, `NullMemory`); an extractor that derives facts from the ledger; retrieval and injection into plan/implement prompts; `--memory off|read|readwrite`; `scripts/memory.py list | forget | rebuild`.
-- Default `off`. Flip to `readwrite` only after the A/B in §9 shows no regression.
-- **Tests:** extraction from ledger fixtures; invalidation when an evidence hash changes; budget cap; with memory `off`, prompts are byte-identical to today's.
-- **Exit:** an A/B run (memory on vs off) on a fixed ticket set, recorded in the ledger.
-
-### Phase 5 — Re-planning (L)
-
-*Key design choice:* re-planning **replaces an escalation, never an attempt that might have succeeded.** Triggers: **T1** a subgoal about to take its 3rd strike; **T2** a final-verify rejection (F7). So the worst case equals today's behavior.
-
-- New `replan` node. It calls the existing planning path with extra context (committed subgoals, failed attempts from the ledger, the verify feedback), so the **existing schema validation and grounding checks apply unchanged**. Its output replaces only the *remaining* queue; committed subgoals are never rewritten; dropped ones are marked `pruned`.
-- **Mechanical caps [M]:** `replan_budget` default 1 (max 2) as a hard counter in state; at most 4 new subgoals; budget exhausted or an invalid plan → escalate.
-- **Before building,** query the ledger: of subgoals that took a 2nd strike, how many passed on the 3rd attempt? If most do, T1 stays at the 3rd strike; if almost none do, consider moving it to the 2nd.
-- **Not in this phase:** the worker-initiated `request_plan_modification` tool. It lets the model widen its own scope; revisit after this proves safe.
-- **Tests:** budget consumption; exhausted → escalate; invalid re-plan → escalate; committed lineage untouched; the T2 path.
-- **Exit:** a recoverable forced failure completes via one re-plan live; an unrecoverable one escalates having used exactly one.
-
-### Phase 6 — Calibrated gate (M, data-gated)
-
-*Why last:* thresholds need data. Also, false passes are partly backstopped by `verify_ticket`, while false strikes cost retries. So the band's main job is to cut wasted retries on near-50% rejections, not to stop bad merges.
-
-- **6.0 Offline analysis.** Label a set of ledger diffs ("would a human merge this?"; target ≥ 50) and tabulate Jev probability against the label. Mine proxies too: Jev-passed subgoals that later failed final verify, and Jev-rejected subgoals the worker later fixed without material change. A live call showed noul answers carry only a probability (no boolean `value`), so the `≥ 0.5` cut-off in `_parse_noul_verdict` is ours and the band edges are fully ours to set. `choice` answers also carry a `confidence`; test an accept/reject `choice` as an alternative gate. Calibration is tied to the model version (a `jev-latest` request came back as `jev-1.13.0`), so the ledger records the version and a version change means re-checking.
-- **6.1 Shadow mode.** Compute, log and store what the band *would* have decided. No behavior change.
-- **6.2 Enforce, behind flags (default off).** Band edges come from 6.0, not from assumed 0.30/0.70. (a) *Inverse consistency probe:* ask Jev "does this diff violate the requirements?" and treat two high answers as inconsistent. (b) *Mechanical primacy only when tests ran* (evidence level `tests+compile`), never on `compile-only`. (c) *Criticality* via configurable path globs (manifests, lockfiles, CI) with a stricter pass bar. (d) *True ambiguity* → the existing `escalate` node with `triggering_tier="uncertain"`.
-- **Exit:** on the labeled set, shadow decisions beat plain `P ≥ 0.5` (fewer wasted retries, no more verify-caught false passes) before anything is enforced.
+1. fewer repeated mechanical failures;
+2. fewer repeated guesses and identical diffs;
+3. fewer context-related escalations;
+4. no increase in scope violations;
+5. no increase in semantic false passes;
+6. no bypass of Tier 0;
+7. measurable benefit beyond JavaScript/TypeScript;
+8. DeepSeek failure remains non-fatal;
+9. Laya/Jev disagreement is measured;
+10. final verification remains the landing authority.
 
 ---
 
-## 8. Memory design
+## 8. Explicit non-goals for the first implementation cycle
 
-| Layer | What it holds | Authority | Lifetime |
-|---|---|---|---|
-| **Ledger** (`ledger.db`) | Append-only facts of what happened | Source of truth | Permanent |
-| **Profile** | Hard repo facts, cached by manifest hash | Re-derived every run, so not really "memory" | Recomputed |
-| **Knowledge** (`knowledge.db`) | Derived hints | Advisory only | Disposable; rebuildable from the ledger |
+Do not initially add:
 
-**Five rules**
-
-1. **Mechanical origin.** Facts come from ledger events (compile or test failure signatures, and what fixed them), rendered by template. No LLM-authored "lessons".
-2. **Provenance.** Every fact points to a run, attempt and commit.
-3. **Self-invalidating.** Each fact stores hashes of its evidence (`package.json`, the lockfile, the file concerned). They are rechecked on retrieval; a mismatch marks the fact `stale` and it is not injected. A TTL applies on top.
-4. **Budgeted and labeled.** At most 5 facts / ~400 tokens, ranked deterministically (scope-file overlap, then recency, then proven usefulness), labeled "hints from earlier runs; verify against the code".
-5. **Disposable and inspectable.** `memory list | forget | rebuild`; `--memory off | read | readwrite`.
-
-**What is stored**
-
-- **`compile_trap` / `test_trap`:** signature = `(code, file, normalized message)`, statement from a template, plus a **fix hint** when a later attempt of the same subgoal passed (the ≤ 40-line diff that did it). Only errors Tier 0 already classifies as *new* against the baseline worktree are recorded, so pre-existing breakage is never learned as a trap. These same pairs are the "chosen / rejected" data a future fine-tuning export would need, so one mechanism feeds memory, dead-end injection and that export.
-- **`env`:** causes of `ENV_NOT_READY` (missing runner, missing install).
-- Hand-written conventions: out of scope for now.
-
-**Retrieval:** plain SQL on `(repo_key, scope file/dir overlap, error code)`. No embeddings: they add a nondeterministic dependency, and facts keyed by file and error code are small and exact.
-
-**Repo identity:** `repo_key` = hash of the root commit(s), stable across clones, so the D: repo and the Desktop clone share one memory.
-
-**Later (not now):** split investigation into a ticket-independent repo map, cacheable and validated by `git rev-parse HEAD:<dir>` tree hashes (an exact, mechanical test), plus a ticket-specific delta. Today's notes mix both, so caching them as-is across tickets would be unsafe.
+- whole-repository prompt injection;
+- unrestricted worker shell access;
+- DeepSeek as a judge or patch writer;
+- raw hidden CoT as a required persisted artifact;
+- automatic patch application by the diagnostic model;
+- embeddings/vector retrieval before exact retrieval is insufficient;
+- larger strike budgets without evidence-change enforcement;
+- model fine-tuning before trajectory labels are stable;
+- a claim of state-of-the-art performance based only on tests or Jev agreement;
+- OS-level sandboxing as an implied property of Git worktrees.
 
 ---
 
-## 9. Measuring success
+## 9. Research basis
 
-The ledger gives per-run metrics with no extra instrumentation: subgoals, attempts per subgoal, strikes by tier, Jev calls, escalation rate and reason, evidence level, wall time, tokens.
+The ordering is informed by:
 
-- Use a **fixed ticket set on jp-bat** (define it together with the eval project).
-- Each phase from 3 on ships with an off switch, so the same ticket can run both ways.
-- **2.0 is better if** escalation rate and attempts per subgoal fall **without** more final-verify rejections.
+- SWE-agent and mini-SWE-agent: agent-computer interfaces, bounded environment interaction, and inspectable trajectories — https://arxiv.org/abs/2405.15793
+- AutoCodeRover: structure-aware retrieval and test-guided localization — https://arxiv.org/abs/2404.05427
+- Agentless: staged localization, repair, and validation — https://arxiv.org/abs/2407.01489
+- OpenHands: separation of agent, workspace, orchestration, and sandbox placement — https://github.com/OpenHands/OpenHands
+- SWE-smith: repository-specific environments and trajectory data — https://arxiv.org/abs/2504.21798
+- Agentic Program Repair from Test Failures at Scale: symbolic feedback plus iterative repair — https://arxiv.org/abs/2507.18755
+- Thought-Action-Result Trajectories: measurable feedback integration and anti-patterns — https://arxiv.org/abs/2506.18824
+- SWE-Bench+: benchmark leakage and weak-test warnings — https://arxiv.org/abs/2410.06992
 
----
+The research does not prove that any one design is universally best. It supports the engineering principle used here:
 
-## 10. Deferred, with triggers
-
-| Item | Why not now | Revisit when |
-|---|---|---|
-| Code graph (old L1) | One parser per language; the worker already has `grep` and `read_file` | The ledger shows repeated "broke a caller" failures the compile gate missed (likely untyped JS) |
-| Execution DAG (old L2) | Git + ledger `parent_sha` already are the DAG | — (dropped) |
-| Domain-grouped `State` | No behavior change; touches every node and most tests | `State` passes ~30 keys, or serialization warnings become errors |
-| Interface-preservation guard | Needs the code graph | Same as code graph |
-| Worker-initiated plan modification | Lets the model widen its own scope | Engine-initiated re-planning has proven safe |
-| DPO export script | Pairs are captured from Phase 1, but hosted Gemini cannot be fine-tuned, so nothing consumes them yet | There is an open-weight worker to train |
-| OS-level sandbox, license, CI, MCP tool gating | Deferred by you; Phase 0.1 is the cheap partial | As planned |
-| Mac/Linux testing | Moves **up** into Phase 0 | — |
-
----
-
-## 11. Open decisions
-
-1. **Resume or restart?** (F5) **Decided: restart** with a loud warning; add `--resume` only if runs get long enough to matter. Every attempt is kept in the ledger either way.
-2. **`JEV_HOME` default:** **Decided: `~/.jev`** (clean target repos, keyed per repo).
-3. **Can Jev return a reason, and can one request carry several questions?** **Confirmed by a live call:** no explanation text; several typed questions per request work, including `choice` (with `confidence` and per-option `probabilities`). It was one obvious test case, so it proves the mechanics, not answer quality (Phase 3 and 6 measure that).
-4. **Who labels diffs for Phase 6?** **Open** (you, teammates). Not needed before Phase 6.
-5. **Memory default:** **Decided: built in Phase 4, off by default.** Flip to on only after the A/B in §9.
-
----
-
-## Appendix A — Live proof checklist
-
-Run from the **Desktop clone**, target jp-bat reset to `baseline-clean`, with a ticket that produces 2+ subgoals.
-
-1. **Main diverged.** While the run is in progress, commit a trivial change to jp-bat's default branch. *Expected (from code):* the final fast-forward is refused, `gate_status = main_diverged`, status `escalated`, `jev-ticket-<id>` kept, and the default branch contains only your commit.
-2. **Dirty tree.** Before the final step, edit a tracked jp-bat file without committing. *Expected:* `tracked_modifications`, status `escalated`, nothing merged.
-3. **Interrupt and rerun.** Press Ctrl-C after the first subgoal commits, then rerun with the same `--thread-id`. *Expected from code reading, not yet observed:* it restarts from planning and recreates the integration branch, so the first subgoal's commit is gone from it. What you observe settles §11 decision 1.
-
----
-
-## Appendix B — Schemas
-
-`$JEV_HOME/repos/<repo_key>/ledger.db`
-
-```sql
-CREATE TABLE runs (
-  run_id TEXT PRIMARY KEY, thread_id TEXT, ticket TEXT,
-  base_commit TEXT, final_commit TEXT, engine_commit TEXT,
-  worker_model TEXT, test_policy TEXT, evidence_level TEXT,
-  status TEXT, started_at TEXT, ended_at TEXT
-);
-
-CREATE TABLE subgoals (
-  run_id TEXT, subgoal_id TEXT, ordinal INTEGER,
-  description TEXT, scope_json TEXT, expects_tests INTEGER,
-  status TEXT,                 -- pending|in_progress|committed|failed|pruned
-  parent_sha TEXT, commit_sha TEXT,
-  PRIMARY KEY (run_id, subgoal_id)
-);
-
-CREATE TABLE attempts (
-  run_id TEXT, subgoal_id TEXT, attempt_no INTEGER,
-  tier TEXT,                   -- mechanical|semantic
-  outcome TEXT,                -- passed|mechanical_failure|semantic_failure|...
-  failed_check TEXT,
-  diff TEXT, diff_sha TEXT, files_json TEXT,
-  compile_errors_json TEXT,    -- normalized (file, code, message) keys
-  tests_ran INTEGER, test_outcome TEXT,
-  jev_valid INTEGER, jev_probability REAL, jev_model TEXT, jev_raw TEXT,
-  jev_tokens_in INTEGER, jev_tokens_out INTEGER,
-  feedback_sent TEXT, tokens_in INTEGER, tokens_out INTEGER,
-  created_at TEXT,
-  PRIMARY KEY (run_id, subgoal_id, attempt_no)
-);
+```text
+targeted context
+  -> executable feedback
+  -> evidence-driven repair
+  -> independent validation
+  -> transparent trajectory
 ```
-
-`$JEV_HOME/repos/<repo_key>/knowledge.db`
-
-```sql
-CREATE TABLE facts (
-  id INTEGER PRIMARY KEY,
-  kind TEXT,                   -- compile_trap|test_trap|env
-  signature TEXT,              -- e.g. 'TS2305|src/components/Footer.tsx|<normalized msg>'
-  statement TEXT,              -- rendered from a template, never free LLM text
-  fix_hint TEXT,               -- <= 40-line diff, optional
-  evidence_run_id TEXT, evidence_attempt INTEGER, learned_at_commit TEXT,
-  valid_if_json TEXT,          -- {"package.json": "<sha>", "<lockfile>": "<sha>"}
-  hits INTEGER DEFAULT 0, avoided INTEGER DEFAULT 0,
-  state TEXT DEFAULT 'active', -- active|stale|retired
-  created_at TEXT, last_checked TEXT
-);
-```
-
-`checkpoints.db` stays exactly as LangGraph manages it today.

@@ -49,6 +49,13 @@ def test_resolve_in_worktree_rejects_absolute_paths(tmp_path):
     with pytest.raises((ValueError, PermissionError)):
         ws.resolve_in_worktree("C:\\Windows\\System32\\calc.exe")
 
+    # Absolute paths remain invalid even when they name a file inside the
+    # worktree; callers must use worktree-relative names exclusively.
+    inside = tmp_path / "inside.txt"
+    inside.write_text("safe", encoding="utf-8")
+    with pytest.raises((ValueError, PermissionError)):
+        ws.resolve_in_worktree(str(inside))
+
 
 def test_resolve_in_worktree_preserves_dot_files_and_dot_github(tmp_path):
     """0.1: .env must not be stripped to env; .github paths must remain valid within worktree."""
@@ -194,6 +201,66 @@ def test_run_read_tool_blocks_traversal_even_if_cat_installed(tmp_path, monkeypa
     # Must block before subprocess is ever invoked
     assert not mock_run.called, "subprocess.run should not be called for path escaping workspace"
     assert "Access denied" in output or "outside" in output.lower() or "escapes" in output.lower()
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "..\\secret_outside.txt",
+        "node_modules\\..\\..\\secret_outside.txt",
+        "/etc/passwd",
+        "C:/Windows/System32/calc.exe",
+        "C:\\Windows\\System32\\calc.exe",
+    ],
+)
+def test_run_read_tool_blocks_windows_style_traversal_before_subprocess(tmp_path, monkeypatch, path):
+    """Read guards apply Windows separators even when running on POSIX."""
+    outside_file = tmp_path.parent / "secret_outside.txt"
+    outside_file.write_text("super_secret", encoding="utf-8")
+    ws = Workspace(repo_dir=tmp_path)
+    mock_run = MagicMock()
+    monkeypatch.setattr("subprocess.run", mock_run)
+    monkeypatch.setattr("shutil.which", lambda cmd: "/bin/cat" if cmd == "cat" else None)
+
+    output = ws.run_read_tool("cat", [path])
+
+    assert not mock_run.called
+    assert "Access denied" in output or "outside" in output.lower()
+    assert "super_secret" not in output
+
+
+def test_run_read_tool_rejects_absolute_path_inside_worktree(tmp_path, monkeypatch):
+    """Read access does not bypass the relative-path contract for local files."""
+    target = tmp_path / "inside.txt"
+    target.write_text("safe", encoding="utf-8")
+    ws = Workspace(repo_dir=tmp_path)
+    mock_run = MagicMock()
+    monkeypatch.setattr("subprocess.run", mock_run)
+    monkeypatch.setattr("shutil.which", lambda cmd: "/bin/cat" if cmd == "cat" else None)
+
+    output = ws.run_read_tool("cat", [str(target)])
+
+    assert not mock_run.called
+    assert "Access denied" in output
+    assert "safe" not in output
+
+
+def test_resolve_in_worktree_rejects_symlinked_parent_escape(tmp_path):
+    """Containment checks resolve existing parent links before mutation."""
+    outside = tmp_path.parent / "outside-dir"
+    outside.mkdir(exist_ok=True)
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    ws = Workspace(repo_dir=tmp_path, worktree_dir=worktree)
+    link = worktree / "linked"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("Symlink creation not supported in this environment")
+
+    with pytest.raises((ValueError, PermissionError)):
+        ws.stage_file_mutation("linked/created.txt", "must not write")
+    assert not (outside / "created.txt").exists()
 
 
 # ==============================================================================

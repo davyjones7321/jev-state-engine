@@ -181,17 +181,14 @@ def test_check_build_ignores_syntax_error_in_staged_out_of_scope_file(git_repo):
 def test_stage_file_mutation_with_absolute_path(git_repo):
     ws = Workspace(repo_dir=git_repo)
     abs_path = git_repo / "subdir" / "abs_file.py"
-    ws.stage_file_mutation(abs_path, "y = 99\n")
-
-    assert abs_path.exists()
-    status = subprocess.run(["git", "status", "--porcelain"], cwd=git_repo, capture_output=True, text=True)
-    assert "subdir/abs_file.py" in status.stdout.replace("\\", "/")
+    with pytest.raises(ValueError, match="Absolute path"):
+        ws.stage_file_mutation(abs_path, "y = 99\n")
 
 
 def test_node_gate_handles_dict_current_subgoal():
     fake_ws = MagicMock()
     fake_ws.run_mechanical_checks.return_value = MechanicalCheckResult(passed=True)
-    fake_ws.get_staged_diff.return_value = ""
+    fake_ws.get_staged_diff.return_value = "diff --git a/foo.py b/foo.py\n+value = 1\n"
 
     fake_gk = MagicMock()
     fake_gk.validate_subgoal.return_value = ValidationVerdict(valid=True)
@@ -335,7 +332,7 @@ def test_node_gate_raises_type_error_without_fallback_on_legacy_signature():
     confirming no fallback branches exist."""
     fake_ws = MagicMock()
     fake_ws.run_mechanical_checks.return_value = MechanicalCheckResult(passed=True)
-    fake_ws.get_staged_diff.return_value = ""
+    fake_ws.get_staged_diff.return_value = "diff --git a/foo.py b/foo.py\n+value = 1\n"
 
     class LegacyGatekeeper:
         def validate_subgoal(self, subgoal, diff, detail=None):
