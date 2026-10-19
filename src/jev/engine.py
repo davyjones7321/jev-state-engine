@@ -80,12 +80,16 @@ def _role_metadata(role: str, component: Any, *, provider: Optional[str] = None,
     """Return non-secret provenance for a role without changing its authority."""
     model = None
     if component is not None:
-        model = getattr(component, "model", None) or getattr(component, "model_name", None)
+        candidate_model = getattr(component, "model", None) or getattr(component, "model_name", None)
+        model = candidate_model if isinstance(candidate_model, str) else None
         if not model and hasattr(component, "provider"):
             provider_obj = component.provider
-            model = getattr(provider_obj, "model", None)
+            candidate_model = getattr(provider_obj, "model", None)
+            model = candidate_model if isinstance(candidate_model, str) else None
             provider = provider or provider_obj.__class__.__name__
-        provider = provider or component.__class__.__name__
+        provider = provider if isinstance(provider, str) else component.__class__.__name__
+    if not isinstance(provider, str):
+        provider = None
     return {
         "role": role,
         "provider": provider,
@@ -113,7 +117,8 @@ def build_role_provenance(worker: Any, judge: Any, advisory: Any) -> Dict[str, D
             advisory_url += f":{port}"
     judge_metadata = _role_metadata("judge", judge, provider="JevGatekeeper", capabilities=["validate", "gate"])
     if judge is not None:
-        judge_metadata["model"] = getattr(judge, "model", None) or "jev-latest"
+        judge_model = getattr(judge, "model", None)
+        judge_metadata["model"] = judge_model if isinstance(judge_model, str) else "jev-latest"
     return {
         "worker": _role_metadata("worker", worker, capabilities=["investigate", "plan", "implement"]),
         "judge": judge_metadata,
