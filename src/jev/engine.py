@@ -31,6 +31,7 @@ from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from jev.dependency_delta import compute_dependency_delta
+from jev.advisory import AdvisoryErrorCode, AdvisoryRequest, AdvisoryResult, RepairBrief
 from jev.evidence import evidence_level
 from jev.ledger import NullRecorder, Recorder
 
@@ -72,6 +73,57 @@ def _cap_self_check_output(text: str) -> str:
     return text
 
 logger = logging.getLogger(__name__)
+
+
+def _role_metadata(role: str, component: Any, *, provider: Optional[str] = None,
+                   base_url_origin: Optional[str] = None, capabilities: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Return non-secret provenance for a role without changing its authority."""
+    model = None
+    if component is not None:
+        model = getattr(component, "model", None) or getattr(component, "model_name", None)
+        if not model and hasattr(component, "provider"):
+            provider_obj = component.provider
+            model = getattr(provider_obj, "model", None)
+            provider = provider or provider_obj.__class__.__name__
+        provider = provider or component.__class__.__name__
+    return {
+        "role": role,
+        "provider": provider,
+        "model": model,
+        "base_url_origin": base_url_origin,
+        "capabilities": sorted(set(capabilities or [])),
+        "configured": component is not None,
+    }
+
+
+def build_role_provenance(worker: Any, judge: Any, advisory: Any) -> Dict[str, Dict[str, Any]]:
+    """Describe selected roles for state, trajectory, and ledger auditability."""
+    advisory_provider = getattr(getattr(advisory, "provider", None), "__class__", None)
+    provider_obj = getattr(advisory, "provider", None)
+    advisory_url = getattr(provider_obj, "base_url", None)
+    if advisory_url:
+        from urllib.parse import urlsplit
+        parsed = urlsplit(str(advisory_url))
+        advisory_url = f"{parsed.scheme}://{parsed.hostname}" if parsed.scheme and parsed.hostname else None
+        try:
+            port = parsed.port
+        except ValueError:
+            port = None
+        if advisory_url and port:
+            advisory_url += f":{port}"
+    judge_metadata = _role_metadata("judge", judge, provider="JevGatekeeper", capabilities=["validate", "gate"])
+    if judge is not None:
+        judge_metadata["model"] = getattr(judge, "model", None) or "jev-latest"
+    return {
+        "worker": _role_metadata("worker", worker, capabilities=["investigate", "plan", "implement"]),
+        "judge": judge_metadata,
+        "advisory": _role_metadata(
+            "advisory", advisory,
+            provider=advisory_provider.__name__ if advisory_provider else None,
+            base_url_origin=advisory_url,
+            capabilities=["repair_guidance"] if advisory is not None else [],
+        ),
+    }
 
 
 STATE_CUSTOM_TYPES = [
@@ -135,6 +187,9 @@ class SafeRecorder(NullRecorder):
 
     def get_run_dependency_delta(self, *args: Any, **kwargs: Any) -> Optional[str]:
         return self._call("get_run_dependency_delta", *args, **kwargs)
+
+    def get_run_provenance(self, *args: Any, **kwargs: Any) -> Optional[str]:
+        return self._call("get_run_provenance", *args, **kwargs)
 
 
 def _get_engine_commit() -> Optional[str]:
@@ -221,6 +276,23 @@ def _attempt_evidence(
         unknowns.append("no compiler baseline/new-error comparison is available")
     required = ["inspect the affected files and relevant tests before retrying"]
     constraints = ["do not repeat a prior diff hash", "preserve declared write scope", "pass Tier 0 before semantic validation"]
+    selected_trajectory = []
+    selected_read_evidence = []
+    for entry in reversed(state.get("trajectory") or []):
+        if entry.get("node") not in {"implement", "gate"}:
+            continue
+        selected_trajectory.append({
+            "node": entry.get("node"),
+            "gate_status": entry.get("gate_status"),
+        })
+        for call in entry.get("tool_calls", []) or []:
+            if isinstance(call, dict) and call.get("name") in {"read_file", "grep", "list_dir"}:
+                selected_read_evidence.append({
+                    "name": call.get("name"),
+                    "args": str(call.get("args", ""))[:1000],
+                })
+        if len(selected_trajectory) >= 3:
+            break
     return {
         "failure_class": failure_class,
         "failed_check": failed_check,
@@ -233,6 +305,8 @@ def _attempt_evidence(
         "required_inspection": required,
         "prior_attempts": previous,
         "retry_constraints": constraints,
+        "selected_trajectory": selected_trajectory[:3],
+        "selected_read_evidence": selected_read_evidence[-6:],
     }
 
 
@@ -240,6 +314,88 @@ def _feedback_packet(evidence: Dict[str, Any]) -> str:
     """Render structured metadata compactly; diagnostics remain in the packet."""
     compact = {key: value for key, value in evidence.items() if key != "output_excerpt"}
     return json.dumps(compact, sort_keys=True)
+
+
+def _format_repair_brief(brief: RepairBrief) -> str:
+    """Render bounded advisory output as retry guidance, never as a verdict."""
+    actions = "\n".join(f"- {action}" for action in brief.actions)
+    return f"Advisory repair brief: {brief.summary}\nCause: {brief.cause}\nActions:\n{actions}"
+
+
+def _format_advisory_failure(result: Any) -> str:
+    """Render advisory failures with a stable, human-readable error code."""
+    code = getattr(getattr(result, "error_code", None), "value", None) or "unknown_error"
+    message = str(getattr(result, "error_message", None) or "advisory did not return a repair brief").strip()
+    return (
+        f"Advisory unavailable ({code}): {message}. "
+        f"Advisory model is not available, error code = {code}. "
+        "Continuing without advisory diagnosis."
+    )
+
+
+def _invoke_advisory(advisory: Optional[Any], evidence: Dict[str, Any]) -> Dict[str, Any]:
+    """Call an optional advisory and return bounded telemetry without raising."""
+    if advisory is None:
+        return {"status": "not_configured", "result": None}
+    if getattr(advisory, "enabled", True) is False:
+        return {"status": "disabled", "result": None}
+
+    packet = {key: value for key, value in evidence.items() if key != "output_excerpt"}
+    packet["output_excerpt"] = _cap_self_check_output(str(evidence.get("output_excerpt", "")))
+    try:
+        serialized_packet = json.dumps(packet, sort_keys=True)
+        request = AdvisoryRequest(
+            prompt=serialized_packet[:19_500],
+            system_prompt="Provide non-authoritative retry guidance. Do not decide gate validity.",
+            json_mode=True,
+        )
+        if hasattr(advisory, "request_repair_brief"):
+            result = advisory.request_repair_brief(
+                request.prompt, system_prompt=request.system_prompt, json_mode=True
+            )
+        elif hasattr(advisory, "advise"):
+            result = advisory.advise(request)
+        else:
+            result = AdvisoryResult(
+                ok=False,
+                error_code=AdvisoryErrorCode.CONFIGURATION,
+                error_message="advisory does not implement the advisory contract",
+            )
+    except Exception as exc:
+        result = AdvisoryResult(
+            ok=False,
+            error_code=AdvisoryErrorCode.UNKNOWN,
+            error_message=str(exc)[:500],
+        )
+
+    if not isinstance(result, AdvisoryResult):
+        result = AdvisoryResult(
+            ok=False,
+            error_code=AdvisoryErrorCode.MALFORMED_RESPONSE,
+            error_message="advisory returned an invalid result",
+        )
+    if result.ok and result.brief is not None:
+        return {
+            "status": "success",
+            "result": result.model_dump(mode="json"),
+            "feedback": _format_repair_brief(result.brief),
+        }
+    return {
+        "status": "error",
+        "result": result.model_dump(mode="json"),
+        "feedback": _format_advisory_failure(result),
+    }
+
+
+def _apply_advisory(
+    advisory: Optional[Any], evidence: Dict[str, Any], state: State
+) -> Dict[str, Any]:
+    telemetry = _invoke_advisory(advisory, evidence)
+    evidence["advisory"] = telemetry
+    feedback = telemetry.get("feedback")
+    if feedback:
+        state["last_feedback"] = f"{feedback}\n\n{state.get('last_feedback') or ''}".strip()
+    return telemetry
 
 
 def _feedback_items(value: Any) -> List[str]:
@@ -358,7 +514,7 @@ def _record_failed_attempt_in_state(
     }
     if failure_evidence:
         entry["failure_evidence"] = failure_evidence
-        for key in ("failure_class", "known_facts", "unknowns", "required_inspection", "prior_attempts", "retry_constraints", "jev_feedback"):
+        for key in ("failure_class", "known_facts", "unknowns", "required_inspection", "prior_attempts", "retry_constraints", "jev_feedback", "advisory"):
             entry[key] = failure_evidence.get(key)
 
     state["failed_attempts"].append(entry)
@@ -2635,6 +2791,7 @@ def node_gate(
     workspace: Optional[Any] = None,
     gatekeeper: Optional[Any] = None,
     recorder: Optional[Any] = None,
+    advisory: Optional[Any] = None,
 ) -> State:
     """The Two-Tier Gate Router.
 
@@ -2717,9 +2874,12 @@ def node_gate(
                 "hash": matching_fa.get("diff_sha", diff_sha),
                 "excerpt": _extract_diff_excerpt(matching_fa.get("diff_excerpt", ""), max_chars=1200),
             }]
+            advisory_telemetry = _apply_advisory(advisory, duplicate_evidence, state)
+            advisory_feedback = advisory_telemetry.get("feedback", "")
             feedback_msg = (
                 f"Duplicate diff detected: identical to attempt {prev_att_no} which failed ({prev_reason}). "
                 "Do not submit identical diffs.\n"
+                f"{advisory_feedback}\n"
                 f"Failure evidence: {_feedback_packet(duplicate_evidence)}"
             )
             state["last_feedback"] = feedback_msg
@@ -2754,6 +2914,7 @@ def node_gate(
                 "test_runner": None,
                 "jev_request": None,
                 "jev_verdict": None,
+                "advisory": advisory_telemetry,
             })
 
             if current_strikes >= 3:
@@ -2787,6 +2948,10 @@ def node_gate(
             "Implementation diff is empty; semantic validation was skipped.\n"
             f"Failure evidence: {_feedback_packet(evidence)}"
         )
+        advisory_telemetry = _apply_advisory(advisory, evidence, state)
+        state["last_feedback"] = _cap_self_check_output(
+            f"{state.get('last_feedback') or ''}\nFailure evidence: {_feedback_packet(evidence)}"
+        )
         if retry_intel != "off":
             _record_failed_attempt_in_state(
                 state, "mechanical", "empty_diff", "empty_diff", diff,
@@ -2799,7 +2964,7 @@ def node_gate(
         )
         _teardown_worktree(state, workspace)
         state["trajectory"].append({
-            "node": "gate", "gate_status": "empty_diff",
+            "node": "gate", "gate_status": "empty_diff", "advisory": advisory_telemetry,
             "failure_evidence": evidence, "jev_request": None, "jev_verdict": None,
         })
         if state["mechanical_strike_count"] >= 3:
@@ -2899,6 +3064,7 @@ def node_gate(
         if mech_result.failed_check in ("no_compile_command", "env_not_ready"):
             state["status"] = "escalated"
             state["gate_status"] = mech_result.failed_check
+            advisory_telemetry = _apply_advisory(advisory, mechanical_evidence, state)
             state["last_feedback"] = _cap_self_check_output(
                 (
                 f"{mech_result.detail}\nFailure evidence: "
@@ -2946,6 +3112,7 @@ def node_gate(
                 "failure_evidence": mechanical_evidence,
                 "jev_request": None,
                 "jev_verdict": None,
+                "advisory": advisory_telemetry,
             })
 
             _safe_escalate_deadlock(
@@ -2983,6 +3150,11 @@ def node_gate(
         else:
             state["last_feedback"] = mech_result.detail
 
+        mechanical_feedback = (
+            f"{state.get('last_feedback') or 'Mechanical validation failed.'}\n"
+            f"Failure evidence: {_feedback_packet(mechanical_evidence)}"
+        )
+        advisory_telemetry = _apply_advisory(advisory, mechanical_evidence, state)
         mechanical_feedback = (
             f"{state.get('last_feedback') or 'Mechanical validation failed.'}\n"
             f"Failure evidence: {_feedback_packet(mechanical_evidence)}"
@@ -3027,6 +3199,7 @@ def node_gate(
             "failure_evidence": mechanical_evidence,
             "jev_request": None,
             "jev_verdict": None,
+            "advisory": advisory_telemetry,
         })
 
         if current_mech_strikes >= 3:
@@ -3115,6 +3288,9 @@ def node_gate(
     ])
     semantic_evidence["unknowns"] = ["the judge did not provide a deterministic repair location"]
     semantic_evidence["jev_feedback"] = normalize_jev_feedback(verdict).model_dump()
+    advisory_telemetry = _apply_advisory(advisory, semantic_evidence, state) if not verdict.valid else {
+        "status": "not_applicable", "result": None
+    }
 
     if verdict.valid:
         wt_path = state.get("current_worktree_path")
@@ -3274,6 +3450,7 @@ def node_gate(
             "test_runner": test_runner_telemetry,
             "jev_request": jev_request_telemetry,
             "jev_verdict": jev_verdict_telemetry,
+            "advisory": advisory_telemetry,
         })
         return state
     else:
@@ -3299,11 +3476,13 @@ def node_gate(
                 or f"Semantic validation rejected by Gatekeeper{prob_str}. "
                    "Diff contradicted project conventions, exceeded declared scope, or failed to implement the required subgoal. "
                    "Ensure changes match the project architecture, dependencies, and styling in Investigation Notes. "
-                   "Ensure changes strictly adhere to the application's actual domain, product identity, and branding documented in Investigation Notes, without introducing conflicting domain concepts, alternate sports/business models, or fabricated external entities."
+                "Ensure changes strictly adhere to the application's actual domain, product identity, and branding documented in Investigation Notes, without introducing conflicting domain concepts, alternate sports/business models, or fabricated external entities."
             )
 
+        advisory_feedback = advisory_telemetry.get("feedback", "")
         state["last_feedback"] = _cap_self_check_output(
             (
+            f"{advisory_feedback}\n"
             f"{state['last_feedback']}\nFailure evidence: "
             f"{_feedback_packet(semantic_evidence)}"
             )
@@ -3352,6 +3531,7 @@ def node_gate(
             "jev_request": jev_request_telemetry,
             "jev_verdict": jev_verdict_telemetry,
             "failure_evidence": semantic_evidence,
+            "advisory": advisory_telemetry,
         })
 
         if current_sem_strikes >= 3:
@@ -3845,6 +4025,8 @@ class JevEngine:
         retry_intel: str = "on",
         repo_profile: str = "off",
         dep_delta_jev: str = "off",
+        advisory: Optional[Any] = None,
+        role_provenance: Optional[Dict[str, Dict[str, Any]]] = None,
     ):
         self.workspace = workspace
         self.gatekeeper = gatekeeper
@@ -3853,6 +4035,8 @@ class JevEngine:
         self.retry_intel = retry_intel
         self.repo_profile = repo_profile
         self.dep_delta_jev = dep_delta_jev
+        self.advisory = advisory
+        self.role_provenance = role_provenance or build_role_provenance(llm, gatekeeper, advisory)
         if recorder is None:
             self.recorder = SafeRecorder(NullRecorder())
         elif isinstance(recorder, SafeRecorder):
@@ -3879,7 +4063,10 @@ class JevEngine:
         return node_implement(state, workspace=self.workspace, llm=self.llm, gatekeeper=self.gatekeeper)
 
     def node_gate(self, state: State) -> State:
-        return node_gate(state, workspace=self.workspace, gatekeeper=self.gatekeeper, recorder=self.recorder)
+        return node_gate(
+            state, workspace=self.workspace, gatekeeper=self.gatekeeper,
+            recorder=self.recorder, advisory=self.advisory,
+        )
 
     def _node_verify(self, state: State) -> State:
         return node_verify(state, workspace=self.workspace, gatekeeper=self.gatekeeper, recorder=self.recorder)
@@ -4027,6 +4214,7 @@ class JevEngine:
             repo_profile=self.repo_profile,
             profile_chars=profile_chars,
             dep_delta_jev=self.dep_delta_jev,
+            provenance=json.dumps(self.role_provenance, sort_keys=True),
         )
 
         initial_state: State = {
@@ -4050,10 +4238,14 @@ class JevEngine:
             "gate_status": None,
             "last_feedback": None,
             "status": None,
+            "role_provenance": self.role_provenance,
         }
 
         config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
         final_state = self.app.invoke(initial_state, config=config)
+        for entry in final_state.get("trajectory", []) or []:
+            if isinstance(entry, dict):
+                entry.setdefault("role_provenance", self.role_provenance)
 
         final_status = final_state.get("status") or "unknown"
         final_commit = None

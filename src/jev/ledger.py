@@ -160,6 +160,8 @@ class Recorder(Protocol):
 
     def get_run_dependency_delta(self, run_id: str) -> Optional[str]: ...
 
+    def get_run_provenance(self, run_id: str) -> Optional[str]: ...
+
 
 
 class NullRecorder:
@@ -274,6 +276,9 @@ class NullRecorder:
         return None
 
     def get_run_dependency_delta(self, run_id: str) -> Optional[str]:
+        return None
+
+    def get_run_provenance(self, run_id: str) -> Optional[str]:
         return None
 
 
@@ -753,5 +758,10 @@ class SqliteLedger:
     def get_run_dependency_delta(self, run_id: str) -> Optional[str]:
         with self._get_connection() as conn:
             row = conn.execute("SELECT dependency_delta FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            return row[0] if row else None
+
+    def get_run_provenance(self, run_id: str) -> Optional[str]:
+        with self._get_connection() as conn:
+            row = conn.execute("SELECT provenance FROM runs WHERE run_id = ?", (run_id,)).fetchone()
             return row[0] if row else None
 

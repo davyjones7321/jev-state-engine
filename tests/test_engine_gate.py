@@ -3,6 +3,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from jev.engine import node_gate
+from jev.advisory import AdvisoryErrorCode, AdvisoryResult, RepairBrief
 from jev.models import (
     MechanicalCheckResult,
     Subgoal,
@@ -38,6 +39,16 @@ class FakeGatekeeper:
 
     def _validate_subgoal(self, subgoal, diff, mechanical_detail=""):
         return self.verdict
+
+
+class FakeAdvisor:
+    def __init__(self, result):
+        self.result = result
+        self.calls = []
+
+    def request_repair_brief(self, prompt, **kwargs):
+        self.calls.append((prompt, kwargs))
+        return self.result
 
 
 @pytest.fixture
@@ -281,4 +292,49 @@ def test_node_gate_enriches_feedback_when_verdict_reason_none(base_state):
     assert "domain" in res["last_feedback"].lower()
 
 
+def test_advisory_success_enriches_retry_and_evidence(base_state):
+    advisor = FakeAdvisor(AdvisoryResult(
+        ok=True, brief=RepairBrief(summary="Repair summary", cause="Bad assertion", actions=["Fix test"])
+    ))
+    state = node_gate(
+        {**base_state, "retry_intel": "on", "failed_attempts": []}, workspace=FakeWorkspace(mechanical_result=MechanicalCheckResult(
+            passed=False, failed_check="tests", detail="Tests failed"
+        )), gatekeeper=FakeGatekeeper(), advisory=advisor,
+    )
+    assert len(advisor.calls) == 1
+    assert "Repair summary" in state["last_feedback"]
+    assert state["trajectory"][-1]["advisory"]["status"] == "success"
+    assert state["failed_attempts"][-1]["failure_evidence"]["advisory"]["status"] == "success"
+    assert state["mechanical_strike_count"] == 1
+
+
+def test_advisory_error_is_human_readable_and_not_a_strike(base_state):
+    advisor = FakeAdvisor(AdvisoryResult(
+        ok=False, error_code=AdvisoryErrorCode.TIMEOUT, error_message="offline"
+    ))
+    state = node_gate(
+        base_state, workspace=FakeWorkspace(mechanical_result=MechanicalCheckResult(
+            passed=False, failed_check="tests", detail="Tests failed"
+        )), gatekeeper=FakeGatekeeper(), advisory=advisor,
+    )
+    assert "timeout" in state["last_feedback"]
+    assert "Advisory unavailable" in state["last_feedback"]
+    assert state["mechanical_strike_count"] == 1
+    assert state["trajectory"][-1]["advisory"]["status"] == "error"
+
+
+def test_advisory_runs_on_each_failure_but_three_strikes_still_escalate(base_state):
+    advisor = FakeAdvisor(AdvisoryResult(
+        ok=True, brief=RepairBrief(summary="Try again", cause="failure", actions=["Inspect"])
+    ))
+    workspace = FakeWorkspace(mechanical_result=MechanicalCheckResult(
+        passed=False, failed_check="build", detail="Build error"
+    ))
+    gatekeeper = FakeGatekeeper()
+    state = base_state
+    for _ in range(3):
+        state = node_gate(state, workspace=workspace, gatekeeper=gatekeeper, advisory=advisor)
+    assert len(advisor.calls) == 3
+    assert state["mechanical_strike_count"] == 3
+    assert gatekeeper.escalate_deadlock.call_count == 1
 

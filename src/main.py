@@ -11,6 +11,8 @@ from jev.engine import JevEngine
 from jev.evidence import format_evidence_summary
 from jev.gatekeeper import Gatekeeper
 from jev.ledger import NullRecorder, SqliteLedger
+from jev.advisory import AdvisoryService
+from jev.providers import OpenAICompatibleProvider
 from jev.workspace import Workspace
 
 
@@ -98,7 +100,20 @@ def build_parser() -> argparse.ArgumentParser:
         default="off",
         help="Send dependency delta to Jev as state evidence (on, off; defaults to off).",
     )
+    parser.add_argument("--advisory-base-url", default=None, help="Optional OpenAI-compatible advisory API base URL")
+    parser.add_argument("--advisory-model", default=None, help="Optional advisory model name")
+    parser.add_argument("--advisory-api-key", default=None, help="Optional advisory API key (never recorded)")
     return parser
+
+
+def build_advisory_service(base_url: Optional[str], model: Optional[str], api_key: Optional[str] = None):
+    """Build the optional advisory adapter; incomplete configuration stays disabled."""
+    if not base_url or not model:
+        return None
+    try:
+        return AdvisoryService(OpenAICompatibleProvider(base_url, model, api_key=api_key))
+    except (TypeError, ValueError):
+        return None
 
 
 
@@ -115,6 +130,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         engine_env = Path(__file__).resolve().parent.parent / ".env"
     env_file = engine_env if engine_env.exists() else ((repo_dir / ".env") if (repo_dir / ".env").exists() else None)
     gatekeeper = Gatekeeper(env_file=env_file)
+
+    parsed_env = dotenv_values(env_file) if env_file and env_file.exists() else {}
+    advisory_base_url = args.advisory_base_url or os.environ.get("ADVISORY_BASE_URL") or parsed_env.get("ADVISORY_BASE_URL")
+    advisory_model = args.advisory_model or os.environ.get("ADVISORY_MODEL") or parsed_env.get("ADVISORY_MODEL")
+    advisory_key = args.advisory_api_key or os.environ.get("ADVISORY_API_KEY") or parsed_env.get("ADVISORY_API_KEY")
+    advisory = build_advisory_service(advisory_base_url, advisory_model, advisory_key)
 
     if args.no_ledger:
         recorder = NullRecorder()
@@ -155,6 +176,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         retry_intel=args.retry_intel,
         repo_profile=args.repo_profile,
         dep_delta_jev=args.dep_delta_jev,
+        advisory=advisory,
     )
 
 
