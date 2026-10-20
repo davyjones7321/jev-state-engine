@@ -34,6 +34,7 @@ from jev.dependency_delta import compute_dependency_delta
 from jev.advisory import AdvisoryErrorCode, AdvisoryRequest, AdvisoryResult, RepairBrief
 from jev.evidence import evidence_level
 from jev.ledger import NullRecorder, Recorder
+from jev.retrieval import AstWorkspaceRetriever, RetrievalLimits
 
 from jev.models import (
     CompileOutcome,
@@ -55,6 +56,8 @@ from jev.workspace import (
 MAX_IMPLEMENT_FILE_CHARS = 80_000
 MAX_IMPLEMENT_READ_CHARS = 20_000
 MAX_IMPLEMENT_READ_CALLS = 12
+MAX_IMPLEMENT_RETRIEVAL_FILES = 100
+MAX_IMPLEMENT_RETRIEVAL_ITEMS = 200
 SELF_CHECK_TIMEOUT_SECONDS = 5
 MAX_SELF_CHECK_OUTPUT_CHARS = 4_000
 
@@ -2208,6 +2211,18 @@ def node_implement(
                 )
             return text
 
+        def _scope_path(path: str) -> str:
+            return Path(str(path).replace("\\", "/")).as_posix().lstrip("./")
+
+        def _path_in_declared_scope(path: str) -> bool:
+            """Allow inspection only in the active subgoal's declared scope."""
+            normalized = _scope_path(path)
+            scopes = {_scope_path(scope) for scope in (subgoal.scope or [])}
+            return not scopes or any(
+                normalized == scope or normalized.startswith(f"{scope}/")
+                for scope in scopes
+            )
+
         def _validate_changes(paths: Optional[List[str]] = None) -> str:
             """Run a bounded, read-only syntax check on scoped changed Python files."""
             if implementation_root is None:
@@ -2366,6 +2381,54 @@ def node_implement(
                     break
             return _cap_implementation_output("\n".join(matches) if matches else "No matches found.")
 
+        @tool
+        def inspect_structure(
+            path: Optional[str] = None,
+            symbol: Optional[str] = None,
+            query: Optional[str] = None,
+        ) -> str:
+            """Retrieve bounded Python symbols, definitions, imports, and references.
+
+            Inspection is read-only and limited to the implementation worktree and
+            the active subgoal scope. It consumes the same read-call budget as the
+            other implementation inspection tools.
+            """
+            budget_error = _consume_implementation_read_budget("inspect_structure")
+            if budget_error:
+                return budget_error
+            requested_path = path or "."
+            target, error = _resolve_implementation_read_path(requested_path)
+            if target is None:
+                return error
+            relative_path = target.relative_to(implementation_root).as_posix() if implementation_root else "."
+            if not _path_in_declared_scope(relative_path):
+                return (
+                    f"Error: Access denied for path outside declared scope: {requested_path}"
+                )
+            try:
+                retriever = AstWorkspaceRetriever(
+                    implementation_root,
+                    limits=RetrievalLimits(
+                        max_files=MAX_IMPLEMENT_RETRIEVAL_FILES,
+                        max_items=MAX_IMPLEMENT_RETRIEVAL_ITEMS,
+                    ),
+                )
+                result = retriever.retrieve(path=relative_path, symbol=symbol, query=query)
+                payload = {
+                    "symbols": [item.__dict__ for item in result.symbols],
+                    "definitions": [item.__dict__ for item in result.definitions],
+                    "imports": [item.__dict__ for item in result.imports],
+                    "references": [item.__dict__ for item in result.references],
+                    "issues": [item.__dict__ for item in result.issues],
+                    "files_scanned": result.files_scanned,
+                    "truncated": result.truncated,
+                }
+                return _cap_implementation_output(json.dumps(payload, sort_keys=True))
+            except (ValueError, PermissionError) as exc:
+                return f"Error: Access denied for path {requested_path}: {exc}"
+            except OSError as exc:
+                return _cap_implementation_output(f"Error inspecting structure: {exc}")
+
         def _execute_stage_file_mutation(path: str, content: str) -> str:
             if not path:
                 return "Error: path is required for stage_file_mutation."
@@ -2424,7 +2487,7 @@ def node_implement(
             submitted = True
             return "Subgoal submitted."
 
-        tools = [list_dir, read_file, grep, stage_file_mutation, validate_changes, submit_subgoal]
+        tools = [list_dir, read_file, grep, inspect_structure, stage_file_mutation, validate_changes, submit_subgoal]
 
         prompt_lines = []
         if state.get("ticket"):
@@ -2559,7 +2622,7 @@ def node_implement(
             "3. When creating or modifying UI components, align with the project's export and import conventions (e.g. if root layouts and surrounding components use default exports such as `export default function Component`, provide default exports so default imports resolve cleanly).\n"
             "4. Stage all necessary code changes using the `stage_file_mutation` tool.\n"
             "   Only mutate files within the declared scope.\n"
-            "5. Use `list_dir`, `read_file`, and `grep` only for bounded, read-only inspection; they are limited to the worktree and a per-attempt call budget.\n"
+            "5. Use `list_dir`, `read_file`, `grep`, and `inspect_structure` only for bounded, read-only inspection; they are limited to the worktree and a per-attempt call budget. `inspect_structure` is limited to the declared scope.\n"
             "6. Before submission, you may call `validate_changes` for bounded, read-only diagnostics. It never replaces authoritative Tier 0.\n"
             "7. When all changes are staged and you are done, call the `submit_subgoal` tool to submit your work for gate verification."
         )
@@ -2645,6 +2708,14 @@ def node_implement(
                             grep_args["path"] = read_path
                         result = grep.invoke(grep_args)
                         stored_args = grep_args
+                elif name == "inspect_structure":
+                    inspect_args = {
+                        key: args.get(key)
+                        for key in ("path", "symbol", "query")
+                        if args.get(key) is not None
+                    }
+                    result = inspect_structure.invoke(inspect_args)
+                    stored_args = inspect_args
                 elif name in ("validate_changes", "self_check"):
                     check_paths = args.get("paths") or args.get("files")
                     if isinstance(check_paths, str):
@@ -2652,11 +2723,11 @@ def node_implement(
                     result = validate_changes.invoke({"paths": check_paths})
                     stored_args = {"paths": check_paths} if check_paths else {}
                 else:
-                    result = f"Unknown tool: {name}. Available tools: list_dir, read_file, grep, stage_file_mutation, validate_changes, submit_subgoal."
+                    result = f"Unknown tool: {name}. Available tools: list_dir, read_file, grep, inspect_structure, stage_file_mutation, validate_changes, submit_subgoal."
                     stored_args = args
 
                 result_text = str(result)
-                result_cap = (MAX_SELF_CHECK_OUTPUT_CHARS + 200) if name in ("validate_changes", "self_check") else 200
+                result_cap = (MAX_SELF_CHECK_OUTPUT_CHARS + 200) if name in ("validate_changes", "self_check") else (2_000 if name == "inspect_structure" else 200)
                 executed_tools.append({"name": name, "args": stored_args, "result": result_text[:result_cap]})
 
                 messages.append(

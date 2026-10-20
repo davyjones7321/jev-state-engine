@@ -771,5 +771,80 @@ def test_node_implement_read_tools_cap_output_and_calls(tmp_path):
     assert len(read_calls) == 13
 
 
+def test_node_implement_inspect_structure_retrieves_scoped_symbols(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    source = repo / "src" / "main.py"
+    source.parent.mkdir()
+    source.write_text("class Service:\n    def run(self):\n        return helper()\n\ndef helper():\n    return 1\n", encoding="utf-8")
+
+    class WorktreeWorkspace(MockWorkspace):
+        worktree_dir = repo
+        repo_dir = repo
+
+    state: State = {"current_subgoal": Subgoal(description="Inspect symbols", scope=["src/main.py"]), "trajectory": []}
+    responses = [
+        AIMessage(content="", tool_calls=[{"name": "inspect_structure", "args": {"path": "src/main.py", "symbol": "helper"}, "id": "inspect-1"}]),
+        AIMessage(content="", tool_calls=[{"name": "submit_subgoal", "args": {}, "id": "submit-1"}]),
+    ]
+
+    result = node_implement(state, workspace=WorktreeWorkspace(), llm=ScriptedChatModel(responses))
+
+    inspect_call = next(call for call in result["trajectory"][0]["tool_calls"] if call["name"] == "inspect_structure")
+    assert "helper" in inspect_call["result"]
+
+
+def test_node_implement_inspect_structure_rejects_traversal_and_scope_escape(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "src").mkdir()
+    outside = tmp_path / "outside.py"
+    outside.write_text("SECRET = True\n", encoding="utf-8")
+
+    class WorktreeWorkspace(MockWorkspace):
+        worktree_dir = repo
+        repo_dir = repo
+
+    state: State = {"current_subgoal": Subgoal(description="Bounded structure", scope=["src/main.py"]), "trajectory": []}
+    response = AIMessage(content="", tool_calls=[
+        {"name": "inspect_structure", "args": {"path": "../outside.py"}, "id": "traversal"},
+        {"name": "inspect_structure", "args": {"path": "src"}, "id": "scope-escape"},
+    ])
+    fake_llm = ScriptedChatModel([response, AIMessage(content="", tool_calls=[{"name": "submit_subgoal", "args": {}, "id": "submit"}])])
+    result = node_implement(state, workspace=WorktreeWorkspace(), llm=fake_llm)
+
+    messages = [message for invocation in fake_llm.invocations for message in invocation if isinstance(message, ToolMessage)]
+    assert "outside workspace" in messages[0].content.lower()
+    assert "declared scope" in messages[1].content.lower()
+    assert "SECRET" not in "\n".join(message.content for message in messages)
+    assert any(call["name"] == "inspect_structure" for call in result["trajectory"][0]["tool_calls"])
+
+
+def test_node_implement_inspect_structure_caps_output_and_consumes_read_budget(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    source = repo / "main.py"
+    source.write_text("\n".join(f"def function_{index}(): pass" for index in range(250)), encoding="utf-8")
+
+    class WorktreeWorkspace(MockWorkspace):
+        worktree_dir = repo
+        repo_dir = repo
+
+    state: State = {"current_subgoal": Subgoal(description="Bounded structure", scope=["main.py"]), "trajectory": []}
+    calls = [
+        {"name": "inspect_structure", "args": {"path": "main.py"}, "id": f"inspect-{index}"}
+        for index in range(13)
+    ]
+    fake_llm = ScriptedChatModel([AIMessage(content="", tool_calls=calls), AIMessage(content="", tool_calls=[{"name": "submit_subgoal", "args": {}, "id": "submit"}])])
+    result = node_implement(state, workspace=WorktreeWorkspace(), llm=fake_llm)
+
+    messages = [message for invocation in fake_llm.invocations for message in invocation if isinstance(message, ToolMessage)]
+    assert "truncated" in messages[0].content
+    assert any("budget exhausted" in message.content for message in messages)
+    inspect_calls = [call for call in result["trajectory"][0]["tool_calls"] if call["name"] == "inspect_structure"]
+    assert len(inspect_calls) == 13
+    assert "function_0" in inspect_calls[0]["result"]
+
+
 
 
