@@ -485,6 +485,7 @@ def _record_failed_attempt_in_state(
     diff: Any,
     compile_info: Optional[Dict[str, Any]] = None,
     failure_evidence: Optional[Dict[str, Any]] = None,
+    retry_metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
     if "failed_attempts" not in state or state["failed_attempts"] is None:
         state["failed_attempts"] = []
@@ -521,10 +522,109 @@ def _record_failed_attempt_in_state(
         entry["failure_evidence"] = failure_evidence
         for key in ("failure_class", "known_facts", "unknowns", "required_inspection", "prior_attempts", "retry_constraints", "jev_feedback", "advisory"):
             entry[key] = failure_evidence.get(key)
+    if isinstance(retry_metadata, dict):
+        entry["retry_metadata"] = retry_metadata
+        entry["retry_number"] = retry_metadata.get("retry_number")
+        entry["evidence_added"] = retry_metadata.get("evidence_added")
+        entry["hypothesis_changed"] = retry_metadata.get("hypothesis_changed")
+        entry["hypothesis_change"] = retry_metadata.get("hypothesis_change")
 
     state["failed_attempts"].append(entry)
     if len(state["failed_attempts"]) > 2:
         state["failed_attempts"] = state["failed_attempts"][-2:]
+
+
+def _implement_attempt(state: State) -> Optional[Dict[str, Any]]:
+    """Return the latest worker trajectory entry, if one is available."""
+    for entry in reversed(state.get("trajectory") or []):
+        if isinstance(entry, dict) and entry.get("node") == "implement":
+            return entry
+    return None
+
+
+def _read_facts(entry: Optional[Dict[str, Any]]) -> List[str]:
+    facts: List[str] = []
+    for call in (entry or {}).get("tool_calls", []) or []:
+        if not isinstance(call, dict) or call.get("name") not in {"read_file", "grep", "list_dir"}:
+            continue
+        args = call.get("args") if isinstance(call.get("args"), dict) else {"value": call.get("args", "")}
+        fact = json.dumps({str(k): str(v) for k, v in sorted(args.items())}, sort_keys=True)
+        if fact not in facts:
+            facts.append(fact)
+    return facts
+
+
+def _worker_hypothesis(entry: Optional[Dict[str, Any]], state: State) -> Optional[str]:
+    values: List[Any] = []
+    if entry:
+        values.extend([entry.get("hypothesis"), entry.get("hypothesis_change"), entry.get("strategy")])
+        for call in entry.get("tool_calls", []) or []:
+            if isinstance(call, dict) and call.get("name") == "submit_subgoal":
+                args = call.get("args")
+                if isinstance(args, dict):
+                    values.extend([args.get("hypothesis"), args.get("hypothesis_change"), args.get("strategy"), args.get("notes")])
+    values.extend([state.get("hypothesis"), state.get("retry_hypothesis"), state.get("retry_strategy")])
+    for value in values:
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return None
+
+
+def _material_diff_sha(diff: str) -> str:
+    """Hash semantic diff content so whitespace-only rewrites are not progress."""
+    normalized = "\n".join(line.strip() for line in diff.splitlines() if line.strip())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _retry_progress_metadata(state: State, diff: str, failure_class: str, failed_check: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Build deterministic Phase 7 progress facts from the worker evidence trail."""
+    current_entry = _implement_attempt(state)
+    if current_entry is None:
+        return None
+    previous = (state.get("failed_attempts") or [])[-1:]
+    prior_meta = previous[0].get("retry_metadata") if previous else None
+    prior_meta = prior_meta if isinstance(prior_meta, dict) else {}
+    failure_class = str(current_entry.get("failure_class") or state.get("failure_class") or failure_class)
+    failed_check = current_entry.get("failed_check") or state.get("failed_check") or failed_check
+    current_reads = _read_facts(current_entry)
+    prior_reads = set(prior_meta.get("read_evidence") or [])
+    current_hypothesis = _worker_hypothesis(current_entry, state)
+    prior_hypothesis = prior_meta.get("hypothesis")
+    explicit_change = current_entry.get("hypothesis_changed") is True or current_entry.get("hypothesis_change") is not None
+    hypothesis_changed = bool(explicit_change or (current_hypothesis and prior_hypothesis and current_hypothesis != prior_hypothesis))
+    self_checks = [
+        str(call.get("result", ""))[:MAX_SELF_CHECK_OUTPUT_CHARS]
+        for call in current_entry.get("tool_calls", []) or []
+        if isinstance(call, dict) and call.get("name") in {"validate_changes", "self_check"}
+    ]
+    prior_validation = prior_meta.get("validation_results") or []
+    validation_changed = bool(self_checks and self_checks != prior_validation)
+    return {
+        "retry_number": len(state.get("failed_attempts") or []),
+        "read_evidence": current_reads,
+        "new_relevant_reads": sorted(set(current_reads) - prior_reads),
+        "evidence_added": bool(set(current_reads) - prior_reads),
+        "hypothesis": current_hypothesis,
+        "hypothesis_changed": hypothesis_changed,
+        "hypothesis_change": {"from": prior_hypothesis, "to": current_hypothesis} if hypothesis_changed else None,
+        "material_diff_sha": _material_diff_sha(diff),
+        "material_diff_changed": bool(prior_meta.get("material_diff_sha") and _material_diff_sha(diff) != prior_meta.get("material_diff_sha")),
+        "strategy_changed": bool(current_entry.get("strategy_changed") is True),
+        "failure_class": failure_class,
+        "failure_class_addressed": bool(prior_meta.get("failure_class") and failure_class != prior_meta.get("failure_class")),
+        "validation_results": self_checks,
+        "validation_result_changed": validation_changed,
+    }
+
+
+def _retry_is_dead_end(state: State, metadata: Optional[Dict[str, Any]]) -> bool:
+    """Reject a repeated hypothesis unless the worker supplied new evidence or strategy."""
+    if not metadata or not (state.get("failed_attempts") or []):
+        return False
+    return not any(metadata.get(key) for key in (
+        "evidence_added", "hypothesis_changed", "material_diff_changed",
+        "strategy_changed", "failure_class_addressed", "validation_result_changed",
+    ))
 
 
 def _format_typed_semantic_feedback(
@@ -2787,6 +2887,10 @@ def _snapshot_attempt(
         tool_evidence=implementation_tools or None,
         read_evidence=read_evidence or None,
         self_check_evidence=self_check_evidence or None,
+        retry_number=(retry_metadata or {}).get("retry_number") if isinstance(retry_metadata, dict) else None,
+        evidence_added=(retry_metadata or {}).get("evidence_added") if isinstance(retry_metadata, dict) else None,
+        hypothesis_changed=(retry_metadata or {}).get("hypothesis_changed") if isinstance(retry_metadata, dict) else None,
+        hypothesis_change=(retry_metadata or {}).get("hypothesis_change") if isinstance(retry_metadata, dict) else None,
         retry_metadata=retry_metadata,
     )
 
@@ -2936,6 +3040,35 @@ def node_gate(
                 )
             return state
 
+    # Phase 7: once retry metadata exists, a worker must change its evidence,
+    # hypothesis, validation, strategy, failure remediation, or material diff.
+    # Older states have no metadata and deliberately retain legacy behavior.
+    retry_progress = _retry_progress_metadata(
+        state, diff, failure_class=(state.get("failed_attempts") or [{}])[-1].get("failure_class", ""),
+        failed_check=(state.get("failed_attempts") or [{}])[-1].get("failed_check"),
+    )
+    if retry_intel != "off" and _retry_is_dead_end(state, retry_progress):
+        state["gate_status"] = "retry_dead_end"
+        state["status"] = "escalated"
+        state["last_feedback"] = (
+            "Retry rejected as a dead-end: no new relevant evidence, changed hypothesis, "
+            "material diff, validation result, or strategy was supplied."
+        )
+        _teardown_worktree(state, workspace)
+        subgoal.status = "failed"
+        state["current_subgoal"] = subgoal
+        state["trajectory"].append({
+            "node": "gate", "gate_status": "retry_dead_end", "retry_metadata": retry_progress,
+            "tier0_result": None, "jev_request": None, "jev_verdict": None,
+            "advisory": {"status": "not_applicable", "result": None},
+        })
+        _safe_escalate_deadlock(
+            gatekeeper, trajectory=state.get("trajectory", []),
+            triggering_tier="retry_policy", integration_branch=state.get("integration_branch"),
+            thread_id=state.get("thread_id"),
+        )
+        return state
+
     # An empty implementation is a deterministic mechanical failure.  It is
     # not a semantic question: there is no candidate for the judge to assess.
     if not diff.strip():
@@ -2961,16 +3094,19 @@ def node_gate(
             _record_failed_attempt_in_state(
                 state, "mechanical", "empty_diff", "empty_diff", diff,
                 failure_evidence=evidence,
+                retry_metadata=retry_progress,
             )
         _snapshot_attempt(
             safe_rec, state, subgoal_id, "mechanical", "empty_diff",
             failed_check="empty_diff", diff=diff,
             feedback_sent=state["last_feedback"], failure_evidence=evidence,
+            retry_metadata=retry_progress,
         )
         _teardown_worktree(state, workspace)
         state["trajectory"].append({
             "node": "gate", "gate_status": "empty_diff", "advisory": advisory_telemetry,
             "failure_evidence": evidence, "jev_request": None, "jev_verdict": None,
+            "retry_metadata": retry_progress,
         })
         if state["mechanical_strike_count"] >= 3:
             subgoal.status = "failed"
@@ -3086,6 +3222,7 @@ def node_gate(
                     diff=diff,
                     compile_info=compile_telemetry,
                     failure_evidence=mechanical_evidence,
+                    retry_metadata=retry_progress,
                 )
             _snapshot_attempt(
                 safe_rec,
@@ -3100,6 +3237,7 @@ def node_gate(
                 test_outcome=test_runner_telemetry.get("outcome") if isinstance(test_runner_telemetry, dict) else None,
                 feedback_sent=state["last_feedback"],
                 failure_evidence=mechanical_evidence,
+                retry_metadata=retry_progress,
             )
             _teardown_worktree(state, workspace)
             subgoal.status = "failed"
@@ -3115,6 +3253,7 @@ def node_gate(
                 "compile": compile_telemetry,
                 "test_runner": test_runner_telemetry,
                 "failure_evidence": mechanical_evidence,
+                "retry_metadata": retry_progress,
                 "jev_request": None,
                 "jev_verdict": None,
                 "advisory": advisory_telemetry,
@@ -3202,6 +3341,7 @@ def node_gate(
             "compile": compile_telemetry,
             "test_runner": test_runner_telemetry,
             "failure_evidence": mechanical_evidence,
+            "retry_metadata": retry_progress,
             "jev_request": None,
             "jev_verdict": None,
             "advisory": advisory_telemetry,
@@ -3501,6 +3641,7 @@ def node_gate(
                 failed_check="jev_rejection",
                 diff=diff,
                 failure_evidence=semantic_evidence,
+                retry_metadata=retry_progress,
             )
         _snapshot_attempt(
             safe_rec,
@@ -3517,6 +3658,7 @@ def node_gate(
             dependency_delta=attempt_dep_delta,
             jev_state_keys=jev_keys,
             failure_evidence=semantic_evidence,
+            retry_metadata=retry_progress,
         )
         _teardown_worktree(state, workspace)
 
@@ -3535,7 +3677,8 @@ def node_gate(
             "test_runner": test_runner_telemetry,
             "jev_request": jev_request_telemetry,
             "jev_verdict": jev_verdict_telemetry,
-            "failure_evidence": semantic_evidence,
+                "failure_evidence": semantic_evidence,
+                "retry_metadata": retry_progress,
             "advisory": advisory_telemetry,
         })
 
@@ -4234,6 +4377,11 @@ class JevEngine:
             "repo_profile": self.repo_profile,
             "repo_profile_text": profile_text,
             "dep_delta_jev": self.dep_delta_jev,
+            "replan_count": 0,
+            "replan_budget": 1,
+            "committed_subgoals": [],
+            "pruned_subgoals": [],
+            "replan_history": [],
             "failed_attempts": [],
             "plan_queue": [],
             "current_subgoal": None,

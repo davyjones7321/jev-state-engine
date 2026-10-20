@@ -6,9 +6,67 @@ from unittest.mock import MagicMock, patch
 from pathlib import Path
 
 from jev.models import Subgoal, MechanicalCheckResult, ValidationVerdict, State, TestOutcome
-from jev.engine import node_gate, node_implement, node_verify, JevEngine, _format_typed_semantic_feedback
+from jev.engine import (
+    node_gate, node_implement, node_verify, JevEngine, _format_typed_semantic_feedback,
+    _retry_progress_metadata, _retry_is_dead_end, _material_diff_sha,
+)
 from jev.gatekeeper import Gatekeeper
 from jev.ledger import SqliteLedger, NullRecorder
+
+
+def _progress_state(read_path="src/app.py", hypothesis="fix parser"):
+    return {
+        "failed_attempts": [{
+            "failure_class": "compile", "failed_check": "compile",
+            "retry_metadata": {
+                "read_evidence": [json.dumps({"path": "src/app.py"}, sort_keys=True)],
+                "hypothesis": "fix parser", "material_diff_sha": _material_diff_sha("old"),
+                "failure_class": "compile", "validation_results": [],
+            },
+        }],
+        "trajectory": [{"node": "implement", "tool_calls": [
+            {"name": "read_file", "args": {"path": read_path}, "result": "source"},
+            {"name": "submit_subgoal", "args": {"hypothesis": hypothesis}, "result": "submitted"},
+        ]}],
+    }
+
+
+def test_phase7_new_read_evidence_allows_retry():
+    state = _progress_state(read_path="tests/test_parser.py")
+    metadata = _retry_progress_metadata(state, "diff --git a/app.py b/app.py\n+fix\n", "compile", "compile")
+    assert metadata["evidence_added"] is True
+    assert _retry_is_dead_end(state, metadata) is False
+
+
+def test_phase7_changed_hypothesis_allows_retry():
+    state = _progress_state(read_path="src/app.py", hypothesis="replace parser")
+    metadata = _retry_progress_metadata(state, "diff --git a/app.py b/app.py\n+fix\n", "compile", "compile")
+    assert metadata["hypothesis_changed"] is True
+    assert _retry_is_dead_end(state, metadata) is False
+
+
+def test_phase7_unchanged_hypothesis_without_evidence_is_dead_end():
+    state = _progress_state(read_path="src/app.py", hypothesis="fix parser")
+    metadata = _retry_progress_metadata(state, "old", "compile", "compile")
+    assert metadata["evidence_added"] is False
+    assert metadata["material_diff_changed"] is False
+    assert _retry_is_dead_end(state, metadata) is True
+
+
+def test_phase7_advisory_outage_does_not_add_extra_strike():
+    subgoal = Subgoal(id="sg-advisory", description="Implement feature", scope=["a.py"])
+    state = {"current_subgoal": subgoal, "mechanical_strike_count": 0,
+             "semantic_strike_count": 0, "failed_attempts": [], "trajectory": []}
+    ws = MagicMock()
+    ws.get_staged_diff.return_value = "diff --git a/a.py b/a.py\n+bad\n"
+    ws.run_mechanical_checks.return_value = MechanicalCheckResult(
+        passed=False, failed_check="compile", detail="syntax error"
+    )
+    advisory = MagicMock()
+    advisory.request_repair_brief.side_effect = RuntimeError("offline")
+    result = node_gate(state, workspace=ws, gatekeeper=MagicMock(), advisory=advisory)
+    assert result["mechanical_strike_count"] == 1
+    assert result["semantic_strike_count"] == 0
 
 
 # ==========================================

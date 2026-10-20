@@ -104,6 +104,11 @@ class State(TypedDict, total=False):
     repo_profile: Optional[str]
     repo_profile_text: Optional[str]
     dep_delta_jev: Optional[str]
+    replan_count: int
+    replan_budget: int
+    committed_subgoals: List[Subgoal]
+    pruned_subgoals: List[Subgoal]
+    replan_history: List[Dict[str, Any]]
 
 
 
