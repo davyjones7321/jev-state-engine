@@ -109,6 +109,7 @@ class State(TypedDict, total=False):
     committed_subgoals: List[Subgoal]
     pruned_subgoals: List[Subgoal]
     replan_history: List[Dict[str, Any]]
+    role_provenance: Optional[Dict[str, Dict[str, Any]]]
 
 
 

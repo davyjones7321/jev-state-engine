@@ -35,6 +35,7 @@ from jev.advisory import AdvisoryErrorCode, AdvisoryRequest, AdvisoryResult, Rep
 from jev.evidence import evidence_level
 from jev.ledger import NullRecorder, Recorder
 from jev.retrieval import AstWorkspaceRetriever, RetrievalLimits
+from jev.replanning import replan_remaining_queue
 
 from jev.models import (
     CompileOutcome,
@@ -628,6 +629,27 @@ def _retry_is_dead_end(state: State, metadata: Optional[Dict[str, Any]]) -> bool
         "evidence_added", "hypothesis_changed", "material_diff_changed",
         "strategy_changed", "failure_class_addressed", "validation_result_changed",
     ))
+
+
+def _safe_record_memory(memory: Optional[Any], state: State, *, outcome: str,
+                        failure_class: Optional[str] = None, summary: str = "",
+                        diff: str = "", subgoal: Optional[Subgoal] = None) -> None:
+    """Persist bounded advisory summaries without affecting gate authority."""
+    if memory is None or not hasattr(memory, "write"):
+        return
+    try:
+        memory.write(
+            task=str(state.get("ticket") or "attempt")[:200],
+            summary=(summary or getattr(subgoal, "description", "attempt"))[:1000],
+            outcome=outcome[:1000],
+            failure_class=failure_class[:1000] if failure_class else None,
+            symbols=list(getattr(subgoal, "scope", []) or [])[:32],
+            run_id=str(state.get("run_id") or "")[:1000] or None,
+            attempt_id=str((state.get("failed_attempts") or [{}])[-1].get("attempt_no", ""))[:1000] or None,
+            evidence_hash=hashlib.sha256(diff.encode("utf-8")).hexdigest() if diff else None,
+        )
+    except Exception as exc:
+        logger.warning("advisory memory write failed: %s", exc)
 
 
 def _format_typed_semantic_feedback(
@@ -2972,6 +2994,10 @@ def node_gate(
     gatekeeper: Optional[Any] = None,
     recorder: Optional[Any] = None,
     advisory: Optional[Any] = None,
+    memory: Optional[Any] = None,
+    replan_enabled: bool = False,
+    replan_planner: Optional[Any] = None,
+    replan_validator: Optional[Any] = None,
 ) -> State:
     """The Two-Tier Gate Router.
 
@@ -3109,6 +3135,8 @@ def node_gate(
                     integration_branch=state.get("integration_branch"),
                     thread_id=state.get("thread_id"),
                 )
+            _safe_record_memory(memory, state, outcome="duplicate_diff", failure_class="duplicate_diff",
+                                summary=feedback_msg, diff=diff, subgoal=subgoal)
             return state
 
     # Phase 7: once retry metadata exists, a worker must change its evidence,
@@ -3119,6 +3147,26 @@ def node_gate(
         failed_check=(state.get("failed_attempts") or [{}])[-1].get("failed_check"),
     )
     if retry_intel != "off" and _retry_is_dead_end(state, retry_progress):
+        if replan_enabled and replan_planner is not None and replan_validator is not None:
+            evidence = dict(retry_progress or {})
+            evidence.update({"dead_end": True, "attempt_count": len(state.get("failed_attempts") or []) + 1,
+                             "failure_class": evidence.get("failure_class") or "retry_dead_end",
+                             "reason": "retry_dead_end"})
+            try:
+                replan_result = replan_remaining_queue(
+                    state, evidence, replan_planner, validate_scope=replan_validator,
+                    max_budget=state.get("replan_budget", 1),
+                )
+            except Exception as exc:
+                replan_result = None
+                logger.warning("advisory replanning failed: %s", exc)
+            if replan_result is not None and replan_result.replanned:
+                state["current_subgoal"] = None
+                state["failed_attempts"] = []
+                state["gate_status"] = "replanned"
+                state["status"] = None
+                state["trajectory"].append({"node": "gate", "gate_status": "replanned"})
+                return state
         state["gate_status"] = "retry_dead_end"
         state["status"] = "escalated"
         state["last_feedback"] = (
@@ -3138,6 +3186,8 @@ def node_gate(
             triggering_tier="retry_policy", integration_branch=state.get("integration_branch"),
             thread_id=state.get("thread_id"),
         )
+        _safe_record_memory(memory, state, outcome="retry_dead_end", failure_class="retry_dead_end",
+                            summary=state.get("last_feedback", ""), diff=diff, subgoal=subgoal)
         return state
 
     # An empty implementation is a deterministic mechanical failure.  It is
@@ -3187,6 +3237,8 @@ def node_gate(
                 integration_branch=state.get("integration_branch"),
                 thread_id=state.get("thread_id"),
             )
+        _safe_record_memory(memory, state, outcome="empty_diff", failure_class="empty_diff",
+                            summary=state.get("last_feedback", ""), diff=diff, subgoal=subgoal)
         return state
 
     # Tier 0: Mechanical checks
@@ -3337,6 +3389,9 @@ def node_gate(
                 integration_branch=state.get("integration_branch"),
                 thread_id=state.get("thread_id"),
             )
+            _safe_record_memory(memory, state, outcome=mech_result.failed_check,
+                                failure_class=mech_result.failed_check, summary=state.get("last_feedback", ""),
+                                diff=diff, subgoal=subgoal)
             return state
 
         current_mech_strikes = state.get("mechanical_strike_count", 0) + 1
@@ -3430,6 +3485,9 @@ def node_gate(
                 integration_branch=state.get("integration_branch"),
                 thread_id=state.get("thread_id"),
             )
+        _safe_record_memory(memory, state, outcome="mechanical_failure",
+                            failure_class=mech_result.failed_check, summary=state.get("last_feedback", ""),
+                            diff=diff, subgoal=subgoal)
         return state
 
     # Tier 0 Passed -> Proceed to Tier 1 (Semantic check via Gatekeeper)
@@ -3638,6 +3696,7 @@ def node_gate(
         state["last_feedback"] = ""
         subgoal.status = "committed"
         state["current_subgoal"] = subgoal
+        state["committed_subgoals"] = list(state.get("committed_subgoals", [])) + [subgoal.model_copy(deep=True)]
 
         _snapshot_attempt(
             safe_rec,
@@ -3668,6 +3727,8 @@ def node_gate(
             "jev_verdict": jev_verdict_telemetry,
             "advisory": advisory_telemetry,
         })
+        _safe_record_memory(memory, state, outcome="passed", summary="Subgoal passed Tier 0 and Tier 1 gates.",
+                            diff=diff, subgoal=subgoal)
         return state
     else:
         current_sem_strikes = state.get("semantic_strike_count", 0) + 1
@@ -3761,6 +3822,9 @@ def node_gate(
                 integration_branch=state.get("integration_branch"),
                 thread_id=state.get("thread_id"),
             )
+
+        _safe_record_memory(memory, state, outcome="semantic_failure", failure_class="semantic_rejection",
+                            summary=state.get("last_feedback", ""), diff=diff, subgoal=subgoal)
 
         return state
 
@@ -4246,6 +4310,10 @@ class JevEngine:
         dep_delta_jev: str = "off",
         advisory: Optional[Any] = None,
         role_provenance: Optional[Dict[str, Dict[str, Any]]] = None,
+        memory: Optional[Any] = None,
+        replan_enabled: bool = False,
+        replan_planner: Optional[Any] = None,
+        replan_validator: Optional[Any] = None,
     ):
         self.workspace = workspace
         self.gatekeeper = gatekeeper
@@ -4256,6 +4324,10 @@ class JevEngine:
         self.dep_delta_jev = dep_delta_jev
         self.advisory = advisory
         self.role_provenance = role_provenance or build_role_provenance(llm, gatekeeper, advisory)
+        self.memory = memory
+        self.replan_enabled = replan_enabled
+        self.replan_planner = replan_planner
+        self.replan_validator = replan_validator
         if recorder is None:
             self.recorder = SafeRecorder(NullRecorder())
         elif isinstance(recorder, SafeRecorder):
@@ -4284,7 +4356,9 @@ class JevEngine:
     def node_gate(self, state: State) -> State:
         return node_gate(
             state, workspace=self.workspace, gatekeeper=self.gatekeeper,
-            recorder=self.recorder, advisory=self.advisory,
+            recorder=self.recorder, advisory=self.advisory, memory=self.memory,
+            replan_enabled=self.replan_enabled, replan_planner=self.replan_planner,
+            replan_validator=self.replan_validator,
         )
 
     def _node_verify(self, state: State) -> State:
