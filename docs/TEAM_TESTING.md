@@ -1,6 +1,6 @@
 # Teammate Testing Guide: Jev State Engine
 
-Welcome to the Jev State Engine testing guide. This document provides step-by-step instructions for teammates to verify, test, and run the engine locally against disposable repositories.
+Welcome to the Jev State Engine testing guide. This document provides step-by-step instructions for teammates to verify, test, and run the engine locally against disposable repositories. For the short setup and CLI reference, see the [README](../README.md).
 
 ---
 
@@ -54,10 +54,10 @@ python -m venv .venv
 *(For macOS/Linux: `source .venv/bin/activate`)*
 
 ### Step 3.3: Install Dependencies
-Install runtime and test dependencies from [requirements.txt](file:///d:/edge-downloades/d/intership-projects/jev-state-engine/requirements.txt), along with the Google Generative AI LangChain integration:
+Install runtime and test dependencies from [requirements.txt](../requirements.txt). The Google Generative AI LangChain integration is already listed there:
 ```powershell
 pip install --upgrade pip
-pip install -r requirements.txt langchain-google-genai
+pip install -r requirements.txt
 ```
 
 ### Step 3.4: Configure Environment Variables (`.env`)
@@ -75,34 +75,43 @@ JEV_API_KEY=your_typesafe_jev_api_key_here
 # Optional / Required for live LLM generation:
 # If omitted, unit tests still pass via mocks, but live execution defaults to llm=None
 GOOGLE_API_KEY=your_gemini_api_key_here
+
+# Optional non-authoritative OpenAI-compatible repair advisor
+ADVISORY_BASE_URL=https://api.deepseek.com
+ADVISORY_MODEL=deepseek-flash
+ADVISORY_API_KEY=your_advisory_key_here
 ```
 
 **Key Classifications:**
-* **`JEV_API_URL` & `JEV_API_KEY` (Mandatory):** Consumed by [src/jev/gatekeeper.py](file:///d:/edge-downloades/d/intership-projects/jev-state-engine/src/jev/gatekeeper.py) for Tier 1 semantic gating.
-* **`GOOGLE_API_KEY` (Optional for unit tests / Required for live code generation):** Consumed by [src/main.py](file:///d:/edge-downloades/d/intership-projects/jev-state-engine/src/main.py) to instantiate `gemini-3.5-flash-lite`. If absent, unit tests and offline workflows run using mocks, while live runs warn that `ChatGoogleGenerativeAI` could not be initialized.
+* **`JEV_API_URL` & `JEV_API_KEY` (Mandatory):** Consumed by [`src/jev/gatekeeper.py`](../src/jev/gatekeeper.py) for Tier 1 semantic gating.
+* **`GOOGLE_API_KEY` (Optional for unit tests / Required for live code generation):** Consumed by [`src/main.py`](../src/main.py) to instantiate `gemini-3.5-flash-lite`. If absent, unit tests and offline workflows run using mocks, while live runs warn that `ChatGoogleGenerativeAI` could not be initialized.
+* **`ADVISORY_BASE_URL` + `ADVISORY_MODEL` (Optional):** Enable a non-authoritative repair advisor. The adapter appends `/chat/completions` to the base URL and expects JSON containing `summary`, `cause`, and `actions`. `ADVISORY_API_KEY` is optional.
 
 ---
 
 ## 4. Run the Unit Tests
 
-Before launching the engine against any target project, execute the full test suite to verify system integrity:
+Before launching the engine against any target project, execute the non-live test suite to verify system integrity:
 
 ```powershell
-pytest -q
+python -m pytest -q -m "not live"
 ```
 
-### Expected Output
-```text
-........................................................................ [ 28%]
-..................................................................s..... [ 57%]
-........................................................................ [ 86%]
-..................................                                       [100%]
-249 passed, 1 skipped in ~30-60s
+### Interpreting the result
+
+Do not rely on a fixed pass count: the suite changes as tests are added. A normal local run is:
+
+```powershell
+python -m pytest -q -m "not live"
 ```
 
-### Understanding the Skipped Test
-* **`tests/test_live_substep_7c.py`**: Will display as `s` (skipped). This test requires a live integration script (`run_substep_7c.py`) and live API credentials via `pytest.importorskip("run_substep_7c")`. It is intentionally skipped during standard local unit testing.
-* **All other 249 tests must pass.** If any unit test fails, see [Section 9: Troubleshooting FAQ](#9-troubleshooting-faq).
+Run all tests, including tests marked `live`, only when the required external services and credentials are available:
+
+```powershell
+python -m pytest -q
+```
+
+If a test is skipped, read the reason in the pytest output. If any non-live test fails, capture the failure before running the engine; see [Section 9: Troubleshooting FAQ](#9-troubleshooting-faq).
 
 ---
 
@@ -208,9 +217,9 @@ $env:PYTHONPATH = "src"
   ```powershell
   cd ..\demo-target
   git status
-  # Output: On branch main, nothing to commit, working tree clean
+   # Output: On the checked-out target branch, nothing to commit, working tree clean
   git log -n 2 --oneline
-  # Output shows the merged commit fast-forwarded to main
+   # Output shows the merged commit fast-forwarded to the checked-out branch
   npm run typecheck
   npm test
   cd ..\jev-state-engine
@@ -256,13 +265,13 @@ $env:PYTHONPATH = "src"
      ```
      * `triggering_tier`: `"mechanical"`
      * `integration_branch`: `"jev-ticket-ticket-c"`
-  2. Verify `main` was **not touched**:
+  2. Verify the checked-out target branch was **not touched**:
      ```powershell
      cd ..\demo-target
      git status
-     # Still clean on main
+      # Still clean on the checked-out branch
      git branch -a
-     # Notice jev-ticket-ticket-c is preserved for debugging; main has NOT moved
+      # Notice jev-ticket-ticket-c is preserved for debugging; the checked-out branch has NOT moved
      cd ..\jev-state-engine
      ```
 
@@ -279,30 +288,30 @@ $env:PYTHONPATH = "src"
   [ESCALATION] Engine halted. Triggering status: strike_limit_reached
   ```
 * **Verification**:
-  Inspect `escalation.log`: `triggering_tier` will record `"semantic"` or `"scope_creep"`. The worktree is discarded, and `main` is untouched.
+   Inspect `escalation.log`: `triggering_tier` will record `"semantic"` or `"scope_creep"`. The worktree is discarded, and the checked-out target branch is untouched.
 
 ---
 
-### Ticket E: Resume from Checkpoint
-* **Goal**: Verify state machine recovery and resumption using SQLite checkpoints.
-* **Execution Command (Part 1 - Interrupt or run initial step)**:
+### Ticket E: Thread restart semantics
+* **Goal**: Verify that a thread ID identifies a run but is not an implicit resume token.
+* **Execution Command (first run)**:
   ```powershell
   python src/main.py "Add a divide(a: number, b: number): number utility function to src/math.ts" --repo-dir "..\demo-target" --thread-id "resumable-thread-1"
   ```
-* **Execution Command (Part 2 - Resuming)**:
-  Run the exact same command with the identical `--thread-id`:
+* **Execution Command (intentional clean restart)**:
+   Run the exact same command with the identical `--thread-id` only when you intentionally want to restart that run from scratch:
   ```powershell
   python src/main.py "Add a divide(a: number, b: number): number utility function to src/math.ts" --repo-dir "..\demo-target" --thread-id "resumable-thread-1"
   ```
-* **Expected Output**:
-  The engine loads the existing state graph from `checkpoints.db` for thread `"resumable-thread-1"` and resumes execution without re-running completed subgoals.
+* **Expected behavior**:
+   The engine does not resume completed work. It restarts execution, recreates the associated `jev-ticket-resumable-thread-1` integration branch, and may repeat all subgoals. Use a new thread ID for a distinct attempt.
 
 ---
 
 ## 7. How to Verify It Worked
 
 ### 7.1 Inspecting `checkpoints.db`
-The engine persists all state transitions, strike counts, and trajectory notes to SQLite via `SqliteSaver` in [src/jev/engine.py](file:///d:/edge-downloades/d/intership-projects/jev-state-engine/src/jev/engine.py).
+The engine persists all state transitions, strike counts, and trajectory notes to SQLite via `SqliteSaver` in [`src/jev/engine.py`](../src/jev/engine.py).
 
 #### Fast Python Checkpoint Inspection One-Liner:
 ```powershell
@@ -334,8 +343,8 @@ git branch -a
 1. **Pre-Existing Type Errors or Test Failures (Baseline Worktrees)**:
    The compile gate computes diff-relative errors against a temporary detached worktree at `base_commit`. If the target repository has pre-existing errors on `base_commit`, only newly introduced errors count as strikes. However, if the baseline repository itself cannot build at all (e.g., missing dependencies), the gate returns `ENV_NOT_READY` and halts. Always ensure the baseline repository compiles before running.
 
-2. **Deferred Main Fast-Forward (Integration Branch Architecture)**:
-   Individual subgoals are merged into a temporary branch (`jev-ticket-<thread-id>`), never directly into `main`. The `main` branch moves **only once**, via a fast-forward merge after the entire ticket passes final verification (`node_verify`). If a ticket escalates at any stage, `main` remains untouched, while `jev-ticket-<thread-id>` is preserved for triage.
+2. **Deferred target-branch fast-forward (Integration Branch Architecture)**:
+    Individual subgoals are merged into a temporary branch (`jev-ticket-<thread-id>`), never directly into the checked-out target branch. That branch moves **only once**, via a fast-forward after the entire ticket passes final verification (`node_verify`). If a ticket escalates at any stage, the checked-out branch remains untouched while `jev-ticket-<thread-id>` is preserved for triage.
 
 3. **Windows `node_modules` Junction Safety**:
    On Windows, symlinking `node_modules` into isolated Git worktrees (`.jev-worktrees/subgoal-<id>`) can fail without Administrator privileges. The engine uses Windows Directory Junctions (`_winapi.CreateJunction`). Before removing worktrees, the engine explicitly unlinks the junction via `os.rmdir` to prevent deleting the physical contents in your target repository's root `node_modules`.
@@ -384,7 +393,11 @@ git branch -a
   ```powershell
   git config --global core.autocrlf true
   ```
-  Or add a `.gitattributes` file in your target repository with `* text=auto`.
+Or add a `.gitattributes` file in your target repository with `* text=auto`.
+
+### Q6: Advisory provider errors or malformed repair guidance
+* **Cause**: `ADVISORY_BASE_URL` may include the wrong path, the model may not support the requested chat-completions format, or the response may not be JSON with `summary`, `cause`, and `actions`.
+* **Fix**: Configure the provider root (for example `https://host/v1`, not `https://host/v1/chat/completions`) and verify the model name. Advisory failures are non-fatal; the engine continues with deterministic evidence.
 
 ---
 
@@ -401,10 +414,10 @@ If you encounter unexpected behavior or an unhandled failure, please create a re
    ```powershell
    git status
    git branch -a
-   git diff main..jev-ticket-<thread-id>
+    git diff <checked-out-branch>..jev-ticket-<thread-id>
    ```
 4. **Pytest Run Output**:
-   Run `pytest -v` and attach the terminal output to confirm whether unit tests are green on your platform.
+   Run `python -m pytest -q -m "not live"` and attach the terminal output. Run `python -m pytest -q` separately only when live credentials/services are available.
 5. **Environment Information**:
    * OS version: `[System.Environment]::OSVersion.VersionString`
    * Python version: `python --version`

@@ -1,5 +1,7 @@
 # Open Questions / Unverified Claims
 
+This is a presentation-support document containing claims that still need evidence. It is not an installation or runtime guide; use [README.md](../../README.md) for current setup and CLI instructions.
+
 The following claims requested for the presentation could not be verified in the codebase, tests, or Git history:
 
 1. **"jp-bat" test site and real end-to-end bugs:** 

@@ -1,8 +1,12 @@
 # Jev State Engine: Execution Tasks (Revised — Tier 0 Gate)
 
+> **Document status:** historical task checklist. Most items are implemented on the current branch; retain this file for planning traceability. For setup, CLI flags, test policy, and branch behavior, use [README.md](../README.md).
+>
+> The unchecked boxes are historical planning markers, not a current completion report.
+
 - `[ ]` **Phase 1: Environment & Schemas**
   - `[ ]` Initialize `venv` and `requirements.txt`.
-  - `[ ]` Install core libraries: `langgraph`, `langchain-anthropic`, `pydantic`, `httpx`, `python-dotenv`.
+  - `[ ]` Install core libraries: `langgraph`, `langchain-google-genai`, `pydantic`, `httpx`, `python-dotenv`.
   - `[ ]` Create `src/jev/models.py`:
     - `Subgoal(BaseModel)`: must include a `scope: list[str]` field — the files/paths the subgoal is expected to touch. Tier 0 needs this to check for scope creep.
     - **[NEW]** `Subgoal.expects_tests: bool` — set during Planning. `True` for any subgoal claiming to implement real behavior; `False` only for subgoals that are honestly not testable yet (e.g. initial scaffolding, config-only changes). Defaults to `True` — a subgoal has to explicitly opt out of being tested, not opt in.
@@ -24,7 +28,7 @@
 
 - `[ ]` **Phase 3: The Gatekeeper Module**
   - `[ ]` Create `src/jev/gatekeeper.py`.
-  - `[ ]` Load `JEV_API_URL` (`https://api.typesafe.ai/v1/systemone`) and `JEV_API_KEY` exclusively from `.env`.
+  - `[ ]` Load `JEV_API_URL` and `JEV_API_KEY` from process environment or `.env`; there is no hardcoded fallback URL or key.
   - `[ ]` **[REVISED]** Implement `validate_subgoal(subgoal, diff)` — **Tier 1 only**. Assumes Tier 0 already passed.
     - **[NEW] Canonical signature — do not deviate:** `validate_subgoal(self, subgoal: Subgoal, diff: str, mechanical_detail: str = "") -> ValidationVerdict`. This exact parameter name (`mechanical_detail`) must be used by the real `Gatekeeper`, by `node_gate`'s call site, and by every fake/mock Gatekeeper in the test suite. `node_gate` must call it directly with this signature — no `try/except TypeError` fallback cascade through alternate parameter names. If a call fails, the failure should surface, not be silently retried under a different guessed signature.
     - Jev is TypeSafe AI's System One model — it does not generate text. It takes a `state` object plus a set of typed `questions` and returns typed, calibrated answers directly. There is no free-text response to parse, so drop any earlier assumption about prompting a chat model and extracting JSON from its output.

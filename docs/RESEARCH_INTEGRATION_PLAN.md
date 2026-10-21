@@ -2,6 +2,8 @@
 
 **Status:** Planning only; no source-code implementation is included here.
 
+For the current installation procedure, CLI contract, environment variables, and implemented behavior, use [README.md](../README.md) and [ARCHITECTURE.md](../ARCHITECTURE.md). This document records research conclusions and roadmap intent, not a guarantee that every proposed phase is complete.
+
 **Date:** 2026-10-16
 
 **Purpose:** Integrate lessons from open-source coding agents and recent software-engineering-agent research into the existing Jev State Engine roadmap without weakening deterministic gates, Git isolation, or scope enforcement.

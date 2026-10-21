@@ -2,7 +2,7 @@
 
 **Status:** Revised planning document. This file specifies implementation order and evaluation gates; it does not itself authorize source-code changes.
 
-**Baseline:** `master` at `d09d618` (after `--test-policy`).
+**Baseline:** historical planning baseline (`master` at `d09d618`, after `--test-policy`). This is not a claim about the current branch `HEAD`.
 
 **Evidence convention:** `ran` means executed and observed; `read` means inferred from source or documentation only.
 
@@ -37,6 +37,18 @@ close security holes
 - **Laya:** local/open-source semantic replacement mode or shadow judge; never silently mixed with Jev authority.
 - **DeepSeek:** advisory diagnostician. It explains evidence and likely root causes; it does not approve diffs or write patches.
 - **Worker LLM:** untrusted generator and repair actor operating inside tool, scope, and worktree boundaries.
+
+### Current implementation facts
+
+The roadmap below remains forward-looking, but the current branch already includes several items that were previously listed as future work:
+
+- deterministic Tier 0 build/compile, scope, suppression, unresolved-import, and policy-aware test checks;
+- isolated subgoal worktrees and an integration branch named `jev-ticket-<thread-id>`;
+- final verification before fast-forwarding the checked-out target branch;
+- SQLite checkpoints, an optional run ledger, retry-intelligence guards, repository profiles, dependency-delta evidence, and structured advisory repair briefs;
+- an optional OpenAI-compatible advisory adapter. It is non-authoritative and can be configured for DeepSeek, but the separate `deepseek/run_tri_test.py` comparison runner remains experimental.
+
+The roadmap is not evidence that every listed phase is complete. In particular, broad live coverage across Python, Rust, Go, JVM, and infrastructure repositories, plus measured Jev/Laya/DeepSeek evaluation, remains unverified from this repository alone.
 
 ### Central design rule
 
@@ -80,10 +92,10 @@ The worker must not receive the entire repository by default. Context should be 
 ## 3. Current baseline and known findings
 
 - **FSM:** `investigate -> plan -> implement -> gate -> implement | verify | escalate`, then `verify -> END | escalate`. *read*
-- **Isolation:** subgoal worktrees branch from `jev-ticket-<thread_id>`; successful subgoals advance the integration branch; `main` moves only after final verification. *read*
+- **Isolation:** subgoal worktrees branch from `jev-ticket-<thread_id>`; successful subgoals advance the integration branch; the checked-out target branch moves only after final verification. *read*
 - **Tier 0:** build, suppression, unresolved-import, compile, tests, and scope checks are deterministic; policy controls test execution. *read*
 - **Tier 1:** Jev currently receives a Noul validity question and a probability; semantic reasons are limited unless additional typed questions are used. *read*
-- **Proven live:** About-page, multi-file Contact-page, and forced-failure scenarios with `main` untouched. *read*
+- **Proven live:** About-page, multi-file Contact-page, and forced-failure scenarios with the target branch untouched. *read*
 - **Not proven live:** all main-divergence, dirty-tree, interrupt/re-run, and cross-ecosystem scenarios. *read*
 
 ### Findings that block safe expansion

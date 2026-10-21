@@ -1,8 +1,11 @@
 # Jev State Engine: Test Plan
 
+> **Document status:** test-intent and regression checklist. The opening “write before implementation” language describes the original workflow, not the current repository state. Run the tests listed here against the current implementation; use [README.md](../README.md) for the supported command forms.
+
 Test cases only — no implementation. Each section corresponds to a step in
-`BUILD_ORDER.md` and must be written (and observed failing, since no
-implementation exists yet) before that step's implementation begins.
+`BUILD_ORDER.md`. The “write before implementation” wording records the original
+test-first workflow; the current branch already contains the implementation and
+these cases now serve as regression intent.
 
 ---
 

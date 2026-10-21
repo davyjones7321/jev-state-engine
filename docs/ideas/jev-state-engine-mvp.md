@@ -1,4 +1,7 @@
 # Jev State Engine: MVP Specification
+
+> **Document status:** historical MVP/design specification. The implemented runtime may differ; use [README.md](../../README.md) and [ARCHITECTURE.md](../../ARCHITECTURE.md) for the current installation and behavior.
+
 ## Architecture Direction: Direction C (Hybrid MCP + Worktree)
 
 ### 1. The Core Mechanical Adaptation
@@ -39,9 +42,9 @@ To resolve this, we adopt **Direction C augmented by Direction B**.
     2. The LangGraph SQLite memory checkpoint and Jev rejection logs are extracted.
     3. The FSM freezes the current Git Worktree to preserve the failed state.
     4. The FSM executes a Human-in-the-Loop (HITL) handoff, alerting the developer.
-    5. The developer manually resolves the logical deadlock and resumes the FSM.
+    5. The developer manually resolves the logical deadlock and starts a new run; an existing thread ID is not an implicit resume mechanism.
 
 ### 4. MVP Success Criteria
-1.  **Zero Hallucinated Merges:** No code enters the main branch without Jev validation.
+1.  **Zero Hallucinated Merges:** No code enters the checked-out target branch without Jev validation and final verification.
 2.  **API Efficiency:** Jev API calls are minimized to discrete subgoal boundaries, eliminating step-by-step latency.
 3.  **Graceful Escalation:** The system successfully intercepts a 3-strike logic loop, prevents architectural drift, and halts cleanly for human intervention.

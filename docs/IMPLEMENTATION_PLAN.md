@@ -1,15 +1,17 @@
 # Jev State Engine: Deep Module Implementation Plan (Tier 0 Architecture)
 
+> **Document status:** historical implementation plan. The repository now contains the modules described below, but some bullets preserve the original design intent rather than current behavior. Use [README.md](../README.md) and [ARCHITECTURE.md](../ARCHITECTURE.md) for the current runtime contract.
+
 This plan translates the `ARCHITECTURE.md` blueprint into concrete Python modules using deep module boundaries. It relies on a **Two-Tier Gating System** to minimize external API costs, strictly eliminate scope creep, and enforce test coverage mechanically.
 
 ## Environment & Tooling
 *   **Dependency Management:** standard `venv` and `requirements.txt`.
-*   **LLM Provider:** `langchain-anthropic` or `langchain-openai` for structured tool outputs.
-*   **API Configuration:** All external integrations read strictly from a local `.env` file. No hardcoding. No mocks.
+*   **Worker LLM Provider:** `langchain-google-genai` is the dependency used by the current CLI for Gemini worker generation.
+*   **API Configuration:** Jev, Google, and advisory credentials are read from process environment or the discovered local `.env` file. Tests use fakes/mocks where appropriate; live provider calls are not required for the unit suite.
 
 ## Proposed Changes
 
-We will scaffold the Python package `jev` inside a `src/` directory to separate it from the documentation.
+The original plan scaffolded the Python package `jev` inside `src/` to separate it from the documentation. The package now exists; the proposed-change sections below are retained as design history.
 
 ### Core Domain Models
 

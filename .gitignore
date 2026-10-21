@@ -4,10 +4,6 @@
 *.env
 /.env
 
-# Architecture and design documentation (do not push)
-ARCHITECTURE.md
-architecture.md
-
 # Python cache and bytecode
 __pycache__/
 *.py[cod]
@@ -58,6 +54,4 @@ scratch/
 .DS_Store
 Thumbs.db
 
-# Important notes (local only)
-importan.md
 *.jsonl

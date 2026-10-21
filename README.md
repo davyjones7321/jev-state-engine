@@ -1,380 +1,277 @@
 # Jev State Engine
 
-A deterministic, finite-state machine (FSM) runtime that orchestrates autonomous software engineering tasks. Built on LangGraph, the engine couples an untrusted worker LLM with strict Inversion of Control (IoC), real Git worktree isolation, multi-ecosystem mechanical validation, and TypeSafe AI's Jev System One semantic gatekeeper.
+Jev State Engine is a deterministic finite-state-machine runtime for executing software-engineering tickets against a separate Git repository. It combines an untrusted worker LLM with read-only investigation, scoped mutations, isolated Git worktrees, deterministic Tier 0 checks, and TypeSafe AI Jev semantic validation.
 
-```mermaid
-flowchart TD
-    START([Start]) --> Investigate["1. Investigation<br/><i>Read-Only Code Exploration</i>"]
-    Investigate --> Plan["2. Planning<br/><i>Grounding & Subgoal Generation</i>"]
-    
-    Plan -->|Valid Plan| Implement["3. Implementation<br/><i>Isolated Git Worktree</i>"]
-    Plan -->|Planning Failed| Escalate["5. Escalation<br/><i>Deadlock HITL Log</i>"]
-    
-    Implement --> Gate{"4. Two-Tier Gate<br/><i>Mechanical & Semantic</i>"}
-    
-    Gate -->|Passed & More Subgoals| Implement
-    Gate -->|Passed & Queue Empty| Verify["4b. Verification<br/><i>Test Suite & Final Diff</i>"]
-    Gate -->|Strike Limit Reached / Merge Error| Escalate
-    Gate -->|Retry Subgoal| Implement
-    
-    Verify -->|Verified| END([Completed])
-    Verify -->|Verification Failed| Escalate
-    
-    Escalate --> END_FAIL([Halted / Exit 1])
+> **Safety warning:** the engine runs repository build and test commands directly on the host. Git worktrees are not an OS sandbox. Use a disposable target repository; never point `--repo-dir` at production, a repository containing secrets, or an untrusted codebase.
+
+## How a run works
+
+```text
+investigate -> plan -> implement -> Tier 0 checks -> Jev Tier 1 gate
+                                      |                    |
+                                      +---- retry ---------+
+                                              |
+                         final verification -> fast-forward landing
+                                              |
+                                           escalate
 ```
 
----
+### Roles and authority
 
-## Architecture & Design Philosophy
+- **Engine/FSM:** owns state transitions, budgets, retries, checkpointing, and branch lifecycle.
+- **Worker:** investigates, plans, and implements inside declared scope. It is not an authority.
+- **Tier 0:** deterministic local checks for syntax/build, compile, scope, dependencies, and tests. It is authoritative for mechanical facts.
+- **Jev:** the production semantic judge. It evaluates a staged diff after Tier 0 passes and performs final ticket verification.
+- **Optional advisory:** an OpenAI-compatible model, such as DeepSeek, may return bounded repair guidance. It cannot approve a diff, override Tier 0 or Jev, or write files.
 
-Autonomous coding agents typically suffer from cascading hallucination: an unstructured model loop writes unconstrained diffs, introduces silent syntax breaks, wanders outside task scope, and hallucinates non-existent dependencies or file locations.
+## Prerequisites
 
-**Jev State Engine enforces Inversion of Control (IoC):**
+- Python 3.10 or newer (Python 3.13 is supported by the current test environment).
+- Git 2.25 or newer, available on `PATH`.
+- PowerShell 5.1 or PowerShell 7+ on Windows.
+- Tools required by the **target repository**, only when its files are changed or its tests are detected: Node/npm, Go, Rust/Cargo, Maven or Gradle, Terraform, Ansible, or Helm.
 
-* **Deterministic FSM as Master (LangGraph):** The model never dictates execution flow or lifecycle boundaries. State transitions, turn budgets, strike counters, and checkpoint persistence are strictly managed by a deterministic state machine.
-* **Worker LLM as Untrusted Generator:** The worker model (e.g. Gemini 3.5 Flash Lite) is invoked only inside tightly controlled sandbox states with scoped tool bindings. In Investigation, it possesses strictly read-only tools. In Implementation, it operates solely inside an isolated Git worktree.
-* **Gatekeeper as Authoritative Judge (TypeSafe AI):** Code is never committed to the target branch upon model output alone. Every staged diff must first pass deterministic mechanical validation (Tier 0), followed by an external, calibrated boolean evaluation by TypeSafe AI's Jev System One model (Tier 1).
+Check the local installation:
 
----
-
-## State Machine Pipeline
-
-The runtime implements a 5-state deterministic state machine:
-
-### 1. Investigation (`node_investigate`)
-Explores the target codebase to understand existing conventions, architecture, and file paths before proposing modifications.
-* **Strict Read-Only Toolset:** The worker is bound exclusively to `list_dir`, `grep`, `read_file`, and `finish_investigation`. Write operations are physically omitted from the LLM tool bindings.
-* **Path Confinement:** Every tool call strictly enforces relative path traversal guards; access attempts escaping the repository root fail closed immediately.
-* **Turn Budget:** Bounded to a 20-turn maximum cap. If the worker fails to call `finish_investigation` within the turn cap, `investigation_incomplete` is set to `True`, triggering cautious planning constraints.
-* **Grounding Discovery:** Populates `investigation_notes` and tracks `investigated_directories` for architectural grounding downstream.
-
-### 2. Planning (`node_plan`)
-Deconstructs the ticket into an ordered queue of atomic subgoals.
-* **Structured Subgoal Validation:** Enforces a strict Pydantic contract (`Subgoal`):
-  * `description`: Explicit statement of the atomic modification.
-  * `scope`: Non-empty list of exact file paths to touch or create.
-  * `expects_tests`: Boolean indicating whether automated unit tests are expected to verify this step.
-* **Architectural Grounding Guard:** The planner strictly verifies that scopes reference files discovered during Investigation or explicitly stated in the ticket. It rejects hallucinated files, arbitrary language extension assumptions, and uninvestigated directory targets.
-* **`expects_tests` Criteria:** Automatically qualified as `False` for docstrings, comments, formatting, or projects lacking a test framework, and `True` for verifiable logic changes.
-* **Error Self-Correction & Routing:** Retries once with explicit validation diagnostics upon JSON or schema errors; transitions immediately to `implement` if valid or `escalate` if planning fails.
-
-### 3. Implementation (`node_implement`)
-Applies code mutations for the active subgoal inside an isolated Git worktree.
-* **Worktree Isolation:** Creates a dedicated branch (`jev-subgoal-<id>`) and worktree (`.jev-worktrees/subgoal-<id>`), shielding the main repository from dirty working tree state.
-* **Restricted Mutation Tools:** Provides `stage_file_mutation` and `submit_subgoal`.
-* **Scope-Aware Prompt Injection:** Automatically reads and injects the current content of all in-scope files and previous gate feedback into the worker context.
-
-### 4. Gating (`node_gate`)
-Evaluates the staged worktree mutation through Tier 0 and Tier 1 gates.
-* **On Pass:** Executes a fast-forward merge (`git merge --ff-only`) into the main repo, cleanly discards the worktree, prunes git refs, resets strike counters to 0, and advances to the next subgoal.
-* **On Fail:** Discards the worktree without leaking artifacts to main, increments the failure tier's strike counter, logs diagnostic feedback, and routes back to `implement` for retry.
-
-### 5. Verification & Completion (`node_verify`)
-Validates repository-level integrity once the subgoal queue is exhausted.
-* **Multi-Ecosystem Test Suite:** Executes full repository test suites on `repo_dir`.
-* **Untested Pass Handling:** Correctly qualifies tickets lacking automated tests, docs-only modifications, or framework-less projects as valid untested passes.
-* **Final Ticket Verification:** Dispatches ticket description, cumulative git diff, test output, and investigation notes to Jev Gatekeeper (`verify_ticket`) for final sign-off.
-* **Halt / Completion:** Transitions to `END` on status `completed`, or routes to `escalate` upon verification rejection.
-
-### Escalation (`node_escalate`)
-Deadlock circuit breaker and safe fallback handler.
-* Cleans up active worktrees and restores workspace pointers to `repo_dir`.
-* Serializes the complete execution trajectory, failure nodes, and triggering tier into `escalation.log` for Human-in-the-Loop (HITL) review.
-
----
-
-## Two-Tier Gating & Circuit Breakers
-
-Before any code commits to the base repository, it must clear two independent verification tiers:
-
-```mermaid
-flowchart LR
-    SubgoalDiff["Staged Worktree Diff"] --> Tier0{"Tier 0: Mechanical Gate"}
-    Tier0 -->|Fails AST / Scope / Tests| MechStrike["+1 Mechanical Strike<br/>(Max 3)"]
-    Tier0 -->|Passes| Tier1{"Tier 1: Semantic Gate<br/>(TypeSafe AI Jev System One)"}
-    
-    Tier1 -->|Rejected: prob < 0.5| SemStrike["+1 Semantic Strike<br/>(Max 3)"]
-    Tier1 -->|Valid: prob >= 0.5| Merge["Fast-Forward Merge &<br/>Reset Strike Counters to 0"]
-    
-    MechStrike -->|Counter >= 3| Escalate["Escalate Deadlock"]
-    SemStrike -->|Counter >= 3| Escalate
-    MechStrike -->|Counter < 3| Retry["Rollback Worktree & Retry Subgoal"]
-    SemStrike -->|Counter < 3| Retry
-```
-
-### Tier 0: Mechanical Gating
-Runs purely local, deterministic checks before touching external networks or APIs:
-1. **AST Syntax Validation:** Executes `ast.parse` over all touched Python source files, instantly flagging syntax regressions while safely skipping virtual environments, cache directories, and vendor paths.
-2. **Scope Creep Enforcement (`check_scope`):** Extracts touched files from `git diff` and validates them against the subgoal's declared `scope`. Any modification outside declared files triggers an immediate mechanical failure.
-3. **Multi-Ecosystem Test Execution:** Automatically detects and runs native test suites based on repository manifests:
-   * **Node.js / TypeScript:** `package.json` test scripts with automatic package manager detection (`yarn test`, `pnpm test`, or `npm test`).
-   * **Go:** `go.mod` (`go test ./...`).
-   * **Rust:** `Cargo.toml` (`cargo test`).
-   * **Java (Maven):** `pom.xml` (`mvn test` or `./mvnw test` / `mvnw.cmd`).
-   * **Java/Kotlin (Gradle):** `build.gradle` / `build.gradle.kts` (`gradle test` or `./gradlew test` / `gradlew.bat`).
-   * **Python:** `pytest.ini`, `pyproject.toml` (`[tool.pytest]`), or auto-discovered test directories (`test_*.py`, `*_test.py`, `tests/`).
-   * **Infrastructure as Code (IaC):** Terraform (`terraform validate`), Ansible (`ansible-lint` / `ansible-playbook --syntax-check`), and Helm (`helm lint`).
-4. **Docs-Only Diff Classification (`_is_docs_only_diff`):** Uses lexical and AST-level comment analysis (supporting Markdown, TypeScript/JavaScript block/line comments, and Python docstrings/comments). When a diff modifies only documentation or comments without altering executable logic, it permits an untested pass even if no unit tests run.
-5. **Configurable Test Execution Policy (`--test-policy`):** Controls when and if native test runners execute during mechanical checks:
-   * **`auto` (Default):** Honors `subgoal.expects_tests`. When a subgoal does not expect tests (`expects_tests == False`), intermediate mechanical checks skip running test suites.
-   * **`verify-only`:** Skips test execution during intermediate subgoals to accelerate development on large repos, running the full test suite once during final verification (`node_verify`).
-   * **`never`:** Disables test runner execution completely (intermediate and final verification), qualifying as an untested pass while still strictly enforcing AST syntax (`check_build`), compilation / typechecks (`check_compile`), and scope creep validation.
-   * **`always`:** Enforces running the full test suite on every single subgoal regardless of `subgoal.expects_tests`.
-
-### Tier 1: Semantic Gating
-When Tier 0 passes, the staged diff is sent to TypeSafe AI's Jev System One classifier:
-* **Target Endpoint:** Configured via `JEV_API_URL` (defaulting to `https://api.typesafe.ai/v1/systemone`).
-* **Calibrated Boolean Question (`noul`):** Queries `jev-latest` with the subgoal description, declared scope, staged diff, and investigation context:
-  > *"Does the diff fully and correctly implement the subgoal described in state, without exceeding its declared scope?"*
-* **Probability Verdict:** Evaluates the calibrated probability score (valid when $\ge 0.5$ or explicit boolean verdict). The gatekeeper ensures the diff implements the feature completely and correctly without side-effects or style-guide violations.
-
-### Independent Strike Counters
-* `mechanical_strike_count` (budget: 3 strikes)
-* `semantic_strike_count` (budget: 3 strikes)
-
-Mechanical build and syntax failures do not consume semantic validation budgets, and semantic rejections do not penalize mechanical budgets. Clearing any subgoal resets **both** strike counters to 0. Exceeding 3 strikes on either tier trips the circuit breaker and triggers immediate escalation.
-
----
-
-## Git Worktree Isolation Mechanics
-
-The engine isolates every code modification inside dedicated Git worktrees:
-
-```
-<repo-root>/
-├── .git/
-│   └── info/exclude        <-- Automatically excludes .jev-worktrees/
-├── .jev-worktrees/
-│   └── subgoal-<id>        <-- Isolated worktree on branch 'jev-subgoal-<id>'
-├── src/
-└── ...
-```
-
-1. **Worktree Creation:** In `node_implement`, `workspace.create_subgoal_worktree(subgoal_id)` creates `.jev-worktrees/subgoal-<subgoal_id>` branched off current `HEAD`.
-2. **Safe Staging:** Mutations generated via `stage_file_mutation` modify only files in the worktree directory. The primary repository remains pristine.
-3. **Atomic Merge on Gate Pass:**
-   * Changes in the worktree are committed.
-   * Merged into the main branch via fast-forward only:
-     ```bash
-     git merge --ff-only jev-subgoal-<id>
-     ```
-   * The worktree is removed (`git worktree remove --force`), pruned (`git worktree prune`), and the temporary branch is deleted (`git branch -D`).
-4. **Clean Discard on Gate Fail:**
-   * If a gate fails, `workspace.discard_subgoal_worktree()` strips the worktree directory, prunes worktree metadata, and drops the temporary branch without leaving any dirty state in the main repository.
-
----
-
-## State Persistence & Checkpointing
-
-The engine uses a dedicated SQLite checkpointer (`SqliteSaver`) built on LangGraph's `BaseCheckpointSaver`:
-* **WAL Mode Concurrency:** Configured with `PRAGMA journal_mode = WAL` and thread-safe reentrant locks (`threading.RLock`).
-* **Database Schema:** Persists serialized state dictionaries, metadata, and task-channel writes across two tables (`checkpoints` and `checkpoint_writes`).
-* **Thread Isolation & Re-runs:** Runs are keyed by `--thread-id` (defaulting to an auto-generated unique ID). If an existing `--thread-id` is provided, the engine restarts execution from scratch (no resume) and deletes any prior integration branch for clean isolation.
-
----
-
-## Prerequisites & Environment Setup
-
-### Prerequisites
-* Python 3.10+ (tested through Python 3.13)
-* Git 2.25+ installed and available in `PATH`
-* Node.js, Go, Rust, Java, or Terraform CLI (only if working with repositories in those respective ecosystems)
-
-### Installation
-```bash
-git clone https://github.com/davyjones7321/jev-state-engine.git
-cd jev-state-engine
-
-# Create and activate virtual environment
-python -m venv .venv
-
-# Windows:
-.venv\Scripts\activate
-# macOS/Linux:
-source .venv/bin/activate
-
-# Install dependencies
-pip install -r requirements.txt
-```
-
-### Environment Configuration
-Create a `.env` file in the project root:
-
-```env
-# TypeSafe AI Jev System One Configuration
-JEV_API_URL=https://api.typesafe.ai/v1/systemone
-JEV_API_KEY=your_typesafe_api_key_here
-
-# Google Gemini Worker LLM Configuration
-GOOGLE_API_KEY=your_gemini_api_key_here
-```
-
-> [!NOTE]
-> * **`JEV_API_KEY`**: Obtain from the [TypeSafe AI Console](https://console.typesafe.ai).
-> * **`GOOGLE_API_KEY`**: Obtain from [Google AI Studio](https://aistudio.google.com). The default worker model is `gemini-3.5-flash-lite`.
-
----
-
-## Usage & CLI Reference
-
-### Command Syntax
-
-```bash
-python -m src.main "<TICKET_DESCRIPTION>" [OPTIONS]
-```
-
-### CLI Arguments
-
-| Argument | Type | Default | Description |
-|---|---|---|---|
-| `ticket` | String | *(Required)* | Task description or ticket specifications for the engine to execute. |
-| `--repo-dir` | Path | `.` (Current Dir) | Absolute or relative path to the target repository. |
-| `--db-path` | Path | `checkpoints.db` | Path to the SQLite checkpoint database. |
-| `--thread-id` | String | `run-<timestamp>-<hex>` | Unique thread identifier for state persistence. Defaults to an auto-generated timestamped ID (e.g., `run-20261012T120000Z-a1b2`). Rerunning an existing thread ID restarts from scratch (no resume) and deletes its prior integration branch. |
-| `--test-policy` | String | `auto` | Test execution policy (`auto`, `verify-only`, `never`, `always`). Controls whether test suites run on every subgoal, only during final verification, or are bypassed entirely. |
-| `--no-ledger` | Flag | `False` | Disable recording run events, subgoals, attempts, and diffs to the SQLite run ledger. |
-
-### Examples
-
-#### 1. Execute a ticket on a target repository
-```bash
-python -m src.main "Add docstrings to all exported functions in auth.ts" \
-    --repo-dir ../my-target-project \
-    --db-path checkpoints.db \
-    --thread-id ticket-101
-```
-
-#### 2. Skip test runner on repositories with pre-existing failures (`--test-policy never`)
-```bash
-python -m src.main "Implement string utilities in src/utils/string.ts" \
-    --repo-dir ../my-target-project \
-    --thread-id ticket-string-utils \
-    --test-policy never
-```
-
-#### 3. Run test runner only during final verification (`--test-policy verify-only`)
-```bash
-python -m src.main "Refactor user authentication pipeline" \
-    --repo-dir ../my-target-project \
-    --thread-id ticket-auth-refactor \
-    --test-policy verify-only
-```
-
-#### 4. Thread identification & re-run behavior
-By default, `--thread-id` generates a unique run identifier (`run-<timestamp>-<hex>`). Specifying an existing `--thread-id` restarts execution from scratch (no resume) and deletes any prior integration branch:
-
-```bash
-python -m src.main "Add docstrings to all exported functions in auth.ts" \
-    --repo-dir ../my-target-project \
-    --db-path checkpoints.db \
-    --thread-id ticket-101
-```
-
-### Exit Codes & Deadlock Escalation
-* **Exit Code `0`:** Ticket completed, verified, and merged cleanly.
-* **Exit Code `1`:** Execution halted or escalated.
-  * Inspect `escalation.log` in the current working directory to review failure diagnostics, triggering tier, and execution trajectory.
-
----
-
-## Run Ledger & Reporting
-
-The engine automatically records execution lineage, subgoals, gate attempt snapshots, Jev probability scores, and unified diffs into a persistent run ledger.
-
-* **Storage Path:** `$JEV_HOME/repos/<repo_key>/ledger.db`
-  * `JEV_HOME`: Base directory for engine persistence. Defaults to `~/.jev` (e.g. `C:\Users\<user>\.jev` on Windows). Can be configured via the `JEV_HOME` environment variable.
-  * `<repo_key>`: A 16-hex character SHA-256 digest computed across root commit hashes, ensuring stable identity across worktrees and clones.
-* **Disabling the Ledger:** Pass `--no-ledger` to run without SQLite ledger recording.
-
-### Ledger Viewer (`scripts/ledger_report.py`)
-
-A read-only viewer displays plain-text summaries of runs, subgoals (with parent/commit SHAs), gate attempts, mechanical check results, and semantic probabilities.
-
-**PowerShell Example:**
 ```powershell
-# View report for the latest run in the target repository
-python scripts/ledger_report.py --repo-dir .
-
-# View a specific run by ID
-python scripts/ledger_report.py --repo-dir . --run-id run-20261012T120000Z-a1b2
-
-# View by repo key directly
-python scripts/ledger_report.py --repo-key e374640a3fd334bc
+python --version
+git --version
+$PSVersionTable.PSVersion
 ```
 
-#### Sample `escalation.log`
-```json
-{
-  "triggering_tier": "semantic",
-  "trajectory": [
-    {
-      "node": "investigate",
-      "notes": "Found candidate src/auth.py..."
-    },
-    {
-      "node": "plan",
-      "subgoals": [...]
-    },
-    {
-      "node": "gate",
-      "status": "semantic_failure",
-      "strikes": 3,
-      "feedback": "Diff omitted required edge-case validation for token expiry."
-    }
-  ]
-}
+## Windows PowerShell setup
+
+From PowerShell:
+
+```powershell
+git clone <repository-url> jev-state-engine
+Set-Location .\jev-state-engine
+
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
----
+If activation is blocked for the current PowerShell process:
 
-## Testing & Quality Gates
-
-The engine includes a comprehensive test suite (264+ unit, integration, and AST security tests).
-
-### Run Test Suite
-
-```bash
-# Run unit and integration tests (skipping live API endpoints)
-pytest -v -m "not live"
-
-# Run entire suite including live API validation (requires valid keys in .env)
-pytest -v
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\.venv\Scripts\Activate.ps1
 ```
 
-### AST State Guard (`test_state_guard.py`)
-To prevent LangGraph from silently discarding undeclared state keys across graph edges, `tests/test_state_guard.py` performs a static AST audit:
-* Parses `src/jev/engine.py` into an Abstract Syntax Tree.
-* Identifies all subscript assignments matching `state['...'] = ...`.
-* Asserts that every assigned key is explicitly declared in `State.__annotations__` in `src/jev/models.py`.
+The repository's `pytest.ini` adds `src` to pytest's import path. The most reliable direct CLI command is `python src/main.py` from the engine root. If you prefer module-style invocation with `python -m src.main`, keep this variable set:
 
-```bash
-pytest tests/test_state_guard.py -v
+```powershell
+$env:PYTHONPATH = "src"
 ```
 
----
+For macOS/Linux, use `source .venv/bin/activate`; the Python commands are otherwise the same.
 
-## Repository Structure
+## Environment variables
 
+Create `.env` in the engine root. The CLI first looks in the current working directory, then the engine root, and finally the target repository directory. Environment variables already exported in the process take precedence for the provider that reads them.
+
+```dotenv
+# Required for the production semantic gate
+JEV_API_URL=https://api.typesafe.ai/v1/systemone
+JEV_API_KEY=your_typesafe_api_key
+
+# Required for live worker generation; unit tests can run without it
+GOOGLE_API_KEY=your_google_ai_api_key
+
+# Optional non-authoritative repair advisor
+ADVISORY_BASE_URL=https://api.deepseek.com
+ADVISORY_MODEL=deepseek-flash
+ADVISORY_API_KEY=your_advisory_key
 ```
-jev-state-engine/
-├── src/
-│   ├── main.py                  # CLI entrypoint and dependency injection wiring
-│   └── jev/
-│       ├── __init__.py          # Package initialization
-│       ├── engine.py            # LangGraph FSM (5 nodes, routing, SqliteSaver)
-│       ├── gatekeeper.py        # TypeSafe AI HTTP client (Tier 1 & verification)
-│       ├── models.py            # Pydantic schemas (Subgoal, Verdict, State, TestPolicy)
-│       └── workspace.py         # Git worktree lifecycle, AST checks, test runners
-├── tests/                       # Comprehensive pytest suite (264+ tests)
-│   ├── test_engine.py           # FSM graph execution and routing tests
-│   ├── test_gatekeeper.py       # Gatekeeper HTTP retries and payload tests
-│   ├── test_implement.py        # Implementation node and mutation tests
-│   ├── test_investigate.py      # Investigation tools and path confinement tests
-│   ├── test_plan.py             # Planning node, schema validation, and grounding
-│   ├── test_state_guard.py      # AST static audit and schema integrity tests
-│   ├── test_test_policy.py      # Test execution policy (--test-policy) tests
-│   ├── test_workspace.py        # Build checks, multi-ecosystem runners, scope checks
-│   └── test_worktree.py         # Worktree isolation, fast-forward merge, discard
-├── requirements.txt             # Python dependencies
-└── README.md                    # System documentation
+
+- `JEV_API_URL` and `JEV_API_KEY` configure the Jev HTTP gatekeeper. There is no source-code fallback URL or key.
+- `GOOGLE_API_KEY` enables the Gemini worker (`gemini-3.5-flash-lite`) in `src/main.py`. Without it, the CLI can initialize but the worker LLM remains unavailable.
+- The advisory is enabled only when both `ADVISORY_BASE_URL` and `ADVISORY_MODEL` are present. `ADVISORY_API_KEY` is optional and is sent as `Authorization: Bearer ...` when supplied.
+- `ADVISORY_BASE_URL` is an OpenAI-compatible **base URL**. The provider appends `/chat/completions`; configure `https://host/v1`, not the complete `/chat/completions` URL.
+- The advisory must return a chat-completions response whose first choice contains JSON with `summary`, `cause`, and a non-empty `actions` list. Provider failures are non-fatal and fall back to deterministic feedback.
+
+### DeepSeek advisory use
+
+To use a DeepSeek-compatible endpoint as the optional advisor, set `ADVISORY_BASE_URL`, `ADVISORY_MODEL`, and, if required, `ADVISORY_API_KEY`. DeepSeek remains diagnostic only: it supplies a bounded repair brief and never decides whether a diff passes.
+
+The separate `deepseek/run_tri_test.py` script is an experimental Jev/DeepSeek/Laya comparison runner. It is not the default CLI path and should not be described as the production authority model.
+
+## CLI usage
+
+Run from the engine repository with the virtual environment active:
+
+```powershell
+python src/main.py "<ticket description>" [options]
 ```
+
+Equivalent module-style invocation:
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m src.main "<ticket description>" [options]
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `ticket` | required | The task description. It is the work request, not a checkpoint identifier. |
+| `--repo-dir PATH` | current directory | Target Git repository. Prefer an absolute path or a disposable sibling directory. |
+| `--db-path PATH` | `checkpoints.db` | SQLite checkpoint path. |
+| `--thread-id ID` | `run-<UTC timestamp>-<4 hex>` | Run identity used for checkpoints, ledger records, branches, and escalation artifacts. |
+| `--test-policy VALUE` | `auto` | `auto`, `verify-only`, `never`, or `always`. |
+| `--no-ledger` | off | Disable the SQLite run ledger; checkpoints still use `--db-path`. |
+| `--retry-intel on\|off` | `on` | Enable duplicate-diff/dead-end guards and typed feedback handling. |
+| `--repo-profile on\|off` | `off` | Inject the detected target-repository profile into worker prompts. |
+| `--test-timeout SECONDS` | `JEV_TEST_TIMEOUT` or 600 | Positive timeout for target test commands. |
+| `--dep-delta-jev on\|off` | `off` | Include dependency-manifest changes in Jev evidence when supported. |
+| `--advisory-base-url URL` | env value | Override `ADVISORY_BASE_URL`. |
+| `--advisory-model NAME` | env value | Override `ADVISORY_MODEL`. |
+| `--advisory-api-key KEY` | env value | Override `ADVISORY_API_KEY`; it is not recorded in advisory telemetry. |
+
+### Ticket versus `--thread-id`
+
+The positional `ticket` is the natural-language task to execute. `--thread-id` is only the stable identifier for one run's state and artifacts.
+
+- Omit `--thread-id` for a new generated ID.
+- Reusing an existing ID **does not resume** a completed or interrupted run. The engine restarts from scratch and removes/recreates the corresponding integration branch.
+- Use a new ID for a new attempt. Keep the same ID only when you intentionally want a clean restart with the same run label.
+
+Examples:
+
+```powershell
+# Run a ticket against a disposable sibling repository
+python src/main.py "Add a unit-tested string utility" `
+  --repo-dir ..\demo-target `
+  --thread-id ticket-string-utils
+
+# Skip target test runners while retaining compile, scope, and other Tier 0 checks
+python src/main.py "Update documentation only" `
+  --repo-dir ..\demo-target `
+  --thread-id ticket-docs `
+  --test-policy never
+
+# Run tests only during final verification
+python src/main.py "Refactor the authentication helper" `
+  --repo-dir ..\demo-target `
+  --thread-id ticket-auth `
+  --test-policy verify-only
+```
+
+### Test-policy semantics
+
+- **`auto`**: run tests for subgoals whose plan says `expects_tests=true`; skip intermediate tests for subgoals that do not expect tests. Final verification runs the applicable tests.
+- **`verify-only`**: skip intermediate test execution and run tests during final verification.
+- **`always`**: run the detected test suite for every subgoal, even when `expects_tests=false`.
+- **`never`**: do not invoke a target test runner during intermediate or final verification. This is an explicitly **excluded** test result, not a passing test result. Tier 0 still enforces syntax/build, compile/type checks where available, scope, suppression, and unresolved-import checks; Jev receives the exclusion marker.
+
+`never` is appropriate for a target with known or unavailable tests only when you accept that the run has no test evidence. It does not disable all validation and does not make an otherwise invalid diff safe.
+
+## Target repository workflow and safety
+
+1. Create or clone a disposable target repository **outside** this repository.
+2. Install that target's dependencies and verify its baseline is usable.
+3. Commit a clean baseline before running the engine.
+4. Run the CLI with `--repo-dir` pointing to the target.
+5. Inspect the target branch and the ledger/escalation artifacts after the run.
+
+The engine executes detected commands such as `npm test`, `go test ./...`, `cargo test`, Maven/Gradle tests, `pytest -q`, `terraform validate`, Ansible checks, or `helm lint`. Missing tools or dependencies produce environment-not-ready evidence; they are not silently treated as successful tests.
+
+Do not use `--repo-dir` for the engine repository itself while experimenting with destructive or intentionally failing tickets. The engine can modify files, create worktrees, run arbitrary repository-defined commands, and update Git refs in the target.
+
+## Branch and merge policy
+
+- At startup, the engine records the current target `HEAD` as the base commit and creates `jev-ticket-<thread-id>` as an integration branch.
+- Each subgoal runs in `.jev-worktrees/subgoal-<id>` on `jev-subgoal-<id>`.
+- A subgoal that passes Tier 0 and Jev is committed and fast-forwarded into the integration branch. Its temporary subgoal worktree and branch are then removed.
+- The checked-out target branch is not changed during intermediate subgoals.
+- Final verification runs from a separate verification worktree. Only after final checks and Jev verification pass does the engine fast-forward the checked-out branch to the integration branch. The checked-out branch must have no tracked modifications and must still match the recorded base commit.
+- On escalation or final-verification failure, the checked-out branch remains untouched and the integration branch is preserved for triage.
+
+This is a fast-forward-only workflow; it does not create a merge commit and does not resolve concurrent changes automatically.
+
+## Architecture and evidence
+
+The implementation is organized around `src/jev/engine.py`, `workspace.py`, `gatekeeper.py`, and the provider/advisory adapters:
+
+1. **Investigation:** read-only repository inspection with path confinement.
+2. **Planning:** typed subgoals with declared mutation scope and test expectations.
+3. **Implementation:** scoped writes in an isolated worktree.
+4. **Gate:** deterministic Tier 0 checks, followed by Jev Tier 1 semantic validation.
+5. **Verification:** cumulative diff and final target evidence, then fast-forward or escalation.
+
+SQLite checkpoints persist graph state by thread ID. The run ledger records attempts, evidence, diffs, gate outcomes, and role provenance unless `--no-ledger` is supplied. Escalations are written to `escalation.log` for compatibility and, when a thread ID is available, to `$JEV_HOME/runs/<thread-id>/escalation.json`.
+
+For the longer architectural and research rationale, see:
+
+- [ARCHITECTURE.md](ARCHITECTURE.md)
+- [plan.md](plan.md)
+- [docs/RESEARCH_INTEGRATION_PLAN.md](docs/RESEARCH_INTEGRATION_PLAN.md)
+
+## Tests
+
+Run the repository's non-live tests:
+
+```powershell
+python -m pytest -q -m "not live"
+```
+
+Run all discovered tests, including tests marked `live`:
+
+```powershell
+python -m pytest -q
+```
+
+Useful focused commands:
+
+```powershell
+python -m pytest tests/test_test_policy.py -q
+python -m pytest tests/test_integration_branch.py -q
+python -m pytest tests/test_advisory_provider.py -q
+```
+
+The current suite includes unit, integration, AST, worktree, policy, ledger, and provider tests. Do not rely on a fixed test count in documentation; use the command output as the source of truth for the current branch.
+
+## Troubleshooting
+
+### `ModuleNotFoundError: No module named 'jev'`
+
+Run from the engine root, activate `.venv`, or set `$env:PYTHONPATH = "src"` before invoking a script directly.
+
+### `JEV_API_URL must be configured` or `JEV_API_KEY must be configured`
+
+Check that `.env` is in the engine root/current working directory, that the variable names are exact, and that the values are not blank. The gatekeeper has no hardcoded fallback.
+
+### The worker is unavailable or the CLI warns about Gemini initialization
+
+Set `GOOGLE_API_KEY`, confirm `langchain-google-genai` installed from `requirements.txt`, and verify the key has access to the configured Gemini model. Unit tests can use mocks without this key.
+
+### `ENV_NOT_READY` for a target
+
+Install the target repository's dependencies and required toolchain in the target directory. For a Node target, for example:
+
+```powershell
+Set-Location ..\demo-target
+npm install
+Set-Location ..\jev-state-engine
+```
+
+### PowerShell cannot run `Activate.ps1` or an npm command
+
+Use the process-scoped execution-policy command shown above and verify `python`, `npm`, or the target tool works directly from the same shell.
+
+### The engine escalates with `main_diverged` or tracked modifications
+
+The checked-out target branch changed after the run started, or it contains tracked edits. Commit/stash those edits, reset the disposable target to its baseline, and start a new run with a new thread ID.
+
+### Advisory errors
+
+Advisory errors are non-fatal. Confirm that `ADVISORY_BASE_URL` is the provider root (the adapter appends `/chat/completions`), that `ADVISORY_MODEL` is valid, and that the endpoint returns the required JSON repair-brief shape. The engine continues with deterministic feedback when the advisor times out, rejects the request, or returns malformed JSON.
+
+## Related documentation
+
+- [docs/TEAM_TESTING.md](docs/TEAM_TESTING.md): Windows walkthrough and disposable demo target.
+- [docs/TEST_PLAN.md](docs/TEST_PLAN.md): test intent and quality gates.
+- [docs/BUILD_ORDER.md](docs/BUILD_ORDER.md): historical implementation sequencing.
+- [docs/RESEARCH_INTEGRATION_PLAN.md](docs/RESEARCH_INTEGRATION_PLAN.md): research and roadmap intent.

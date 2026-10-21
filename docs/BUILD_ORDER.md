@@ -1,8 +1,11 @@
 # Jev State Engine: Build Order
 
+> **Document status:** historical build sequencing. The implementation has progressed beyond this test-first checklist. It remains useful for understanding why the deterministic workspace and gate-routing tests were built before provider integration; current commands and behavior are documented in [README.md](../README.md).
+
 This sequencing overrides the Phase 1→5 numbering in `TASK.md`. `TASK.md` describes
-*what* to build; this document describes *in what order and with what testing
-discipline*. Do not start a step until the previous one's tests are green.
+*what* to build; this document describes the original order and testing discipline.
+The “do not start” wording below is historical guidance, not a requirement to
+rebuild already-present modules.
 
 Rule of thumb driving the order: build and prove the deterministic core first,
 with the expensive/nondeterministic Jev API plugged in last. Every step before
