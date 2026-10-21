@@ -117,6 +117,7 @@ class Gatekeeper:
         mechanical_detail: str = "",
         investigation_notes: Optional[str] = None,
         dependency_delta: Optional[Dict[str, Any]] = None,
+        test_evidence: Optional[Dict[str, Any]] = None,
     ) -> ValidationVerdict:
         """Tier 1 validation using Jev System One model."""
         state: Dict[str, Any] = {
@@ -128,11 +129,16 @@ class Gatekeeper:
         if investigation_notes:
             state["investigation_notes"] = investigation_notes
 
-        if "untested" in mechanical_detail.lower():
+        if "tests_excluded_by_policy=true" in mechanical_detail:
+            state["tests_excluded_by_policy"] = True
+            state["mechanical_detail"] = mechanical_detail
+        elif "untested" in mechanical_detail.lower():
             state["untested_pass"] = True
             state["mechanical_detail"] = mechanical_detail
         elif mechanical_detail:
             state["mechanical_detail"] = mechanical_detail
+        if test_evidence is not None and not state.get("tests_excluded_by_policy"):
+            state["test_evidence"] = test_evidence
 
         if dependency_delta is not None and not self._dep_delta_unsupported:
             delta_dict = dict(dependency_delta)
@@ -405,16 +411,28 @@ class Gatekeeper:
         final_diff: str,
         test_output: str,
         investigation_notes: Optional[str] = None,
+        test_evidence: Optional[Dict[str, Any]] = None,
     ) -> ValidationVerdict:
         """Phase 4 final verification post to Jev."""
-        state = {
+        state: Dict[str, Any] = {
             "ticket": ticket,
             "final_diff": final_diff,
-            "test_output": test_output,
         }
+        if "tests_excluded_by_policy=true" in test_output:
+            state["tests_excluded_by_policy"] = True
+        else:
+            state["test_output"] = test_output
+            if test_evidence is not None:
+                state["test_evidence"] = test_evidence
         if investigation_notes:
             state["investigation_notes"] = investigation_notes
-        if investigation_notes and investigation_notes.strip():
+        if state.get("tests_excluded_by_policy"):
+            instructions = (
+                "Does the final diff completely resolve the ticket considering the investigation notes, "
+                "compile and scope evidence? Tests are excluded by policy; do not infer a pass or failure "
+                "from missing test results or reject solely because tests were not run."
+            )
+        elif investigation_notes and investigation_notes.strip():
             instructions = (
                 "Considering the investigation notes regarding what parts of the ticket were already satisfied "
                 "in the repository, does the final diff complete the remaining requirements of the ticket, and does "

@@ -12,7 +12,7 @@ import uuid
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 
 from pydantic import BaseModel, Field
 
@@ -518,6 +518,18 @@ class ResolvedTestCommand:
     reason: Optional[str] = None
 
 
+def compare_test_runs(before: Optional[dict], after: Optional[dict]) -> dict:
+    """Compare recorded baseline and candidate outcomes without executing tests."""
+    baseline = before.get("outcome") if before else None
+    candidate = after.get("outcome") if after else None
+    return {
+        "before": baseline,
+        "after": candidate,
+        "regressed": baseline == TestOutcome.PASSED.value and candidate != TestOutcome.PASSED.value,
+        "improved": baseline is not None and baseline != TestOutcome.PASSED.value and candidate == TestOutcome.PASSED.value,
+    }
+
+
 def resolve_test_command(wt: Union[str, Path]) -> ResolvedTestCommand:
     """Detects the test command from repository manifests without running subprocesses or writing files.
 
@@ -715,6 +727,7 @@ class Workspace:
         stdout: str = "",
         stderr: str = "",
         outcome: TestOutcome = TestOutcome.NO_TESTS_COLLECTED,
+        executed_command: Optional[List[str]] = None,
     ) -> TestOutcome:
         stdout_tail = stdout[-1000:] if stdout else ""
         stderr_tail = stderr[-1000:] if stderr else ""
@@ -725,7 +738,13 @@ class Workspace:
         self.last_test_run = {
             "ecosystem": ecosystem,
             "command": command,
+            "executed_command": executed_command if executed_command is not None else command,
             "exit_code": exit_code,
+            # Bounded evidence: short output is exact; longer output is explicitly marked as truncated.
+            "stdout": stdout_tail,
+            "stderr": stderr_tail,
+            "stdout_truncated": len(stdout) > 1000,
+            "stderr_truncated": len(stderr) > 1000,
             "stdout_tail": stdout_tail,
             "stderr_tail": stderr_tail,
             "output_tail": output_tail,
@@ -1407,9 +1426,56 @@ class Workspace:
     def resolve_test_command(self) -> ResolvedTestCommand:
         return resolve_test_command(self.worktree_dir)
 
-    def run_tests(self) -> TestOutcome:
+    def run_tests(self, targets: Optional[Sequence[Union[str, Path]]] = None) -> TestOutcome:
+        """Run the detected suite, optionally narrowing supported runners to relative test targets.
+
+        Targeted runs support pytest file/node IDs and package.json test scripts.
+        Unsupported ecosystems do not silently run their full suites. An omitted
+        or empty target sequence preserves the existing full-suite behavior.
+        """
         wt = self.worktree_dir
         res = resolve_test_command(wt)
+
+        if isinstance(targets, (str, bytes, Path)):
+            raise ValueError("Test targets must be a sequence of relative paths, not a command string")
+        if targets:
+            if len(targets) > 32:
+                raise ValueError("At most 32 test targets are allowed")
+            validated: List[str] = []
+            for target in targets:
+                if not isinstance(target, (str, Path)):
+                    raise ValueError("Each test target must be a relative path")
+                raw = str(target)
+                if len(raw) > 512:
+                    raise ValueError("Test target exceeds 512 characters")
+                path, sep, node = raw.partition("::") if res.ecosystem == "pytest" else (raw, "", "")
+                if not path or (sep and not node) or (res.ecosystem != "pytest" and "::" in raw):
+                    raise ValueError(f"Invalid test target: {raw!r}")
+                candidate = self.resolve_in_worktree(path)
+                if not candidate.exists():
+                    raise ValueError(f"Test target does not exist: {raw!r}")
+                # Keep each target a worktree-relative argv item, never a runner option.
+                relative = candidate.relative_to(wt).as_posix()
+                if relative == ".":
+                    raise ValueError("A test target must narrow the suite")
+                if relative.startswith("-"):
+                    raise ValueError(f"Test target cannot start with '-': {raw!r}")
+                if res.ecosystem in ("npm", "yarn", "pnpm") and not re.fullmatch(r"[A-Za-z0-9_./@-]+", relative):
+                    raise ValueError(f"Package test target contains unsupported characters: {raw!r}")
+                validated.append(relative + (sep + node if sep else ""))
+
+            if res.ecosystem == "pytest":
+                res = ResolvedTestCommand(res.ecosystem, [*res.command, *validated], res.source) if res.command else res
+            elif res.ecosystem in ("npm", "yarn", "pnpm") and res.command:
+                if res.ecosystem == "npm" and ((wt / "bun.lock").exists() or (wt / "bun.lockb").exists()):
+                    res = ResolvedTestCommand("bun", ["bun", "run", "test", *validated], res.source)
+                else:
+                    separator = ["--"] if res.ecosystem == "npm" else []
+                    res = ResolvedTestCommand(res.ecosystem, [*res.command, *separator, *validated], res.source)
+            else:
+                return self._record_test_run(
+                    res.ecosystem, None, None, "", "Targeted tests unsupported for this ecosystem", TestOutcome.NO_TESTS_COLLECTED
+                )
 
         if res.command is None:
             if res.ecosystem == "package_json" and res.reason:
@@ -1419,7 +1485,7 @@ class Workspace:
         cmd = res.command
         ecosystem = res.ecosystem
 
-        if ecosystem in ("yarn", "pnpm", "npm", "go", "cargo", "maven", "gradle"):
+        if ecosystem in ("yarn", "pnpm", "npm", "bun", "go", "cargo", "maven", "gradle"):
             resolved = shutil.which(cmd[0])
             if not resolved:
                 return self._record_test_run(
@@ -1433,9 +1499,12 @@ class Workspace:
                     timeout=self.test_timeout,
                 )
                 outcome = TestOutcome.PASSED if sub_res.returncode == 0 else TestOutcome.FAILED
-                return self._record_test_run(ecosystem, cmd, sub_res.returncode, sub_res.stdout, sub_res.stderr, outcome)
+                return self._record_test_run(
+                    ecosystem, cmd, sub_res.returncode, sub_res.stdout, sub_res.stderr, outcome,
+                    executed_command=exec_cmd,
+                )
             except Exception as e:
-                return self._record_test_run(ecosystem, cmd, -1, "", str(e), TestOutcome.FAILED)
+                return self._record_test_run(ecosystem, cmd, -1, "", str(e), TestOutcome.FAILED, executed_command=exec_cmd)
 
         elif ecosystem == "pytest":
             try:
@@ -1503,6 +1572,10 @@ class Workspace:
             )
 
         return self._record_test_run(None, None, None, "", "", TestOutcome.NO_TESTS_COLLECTED)
+
+    def run_targeted_tests(self, targets: Sequence[Union[str, Path]]) -> TestOutcome:
+        """Run only the explicitly selected, worktree-contained test targets."""
+        return self.run_tests(targets=targets)
 
 
     @staticmethod
@@ -2646,6 +2719,7 @@ class Workspace:
         subgoal: Subgoal,
         base_commit: Optional[str] = None,
         test_policy: str = "auto",
+        test_targets: Optional[Sequence[Union[str, Path]]] = None,
     ) -> MechanicalCheckResult:
         self.last_test_run = None
         self.last_compile_run = None
@@ -2777,7 +2851,7 @@ class Workspace:
             should_run_tests = False
 
         if should_run_tests:
-            test_outcome = self.run_tests()
+            test_outcome = self.run_tests(targets=test_targets)
             test_run_details = getattr(self, "last_test_run", None)
             if isinstance(test_run_details, dict):
                 test_run_details["ran"] = True

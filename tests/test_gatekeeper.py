@@ -267,6 +267,43 @@ def test_verify_ticket_sends_noul_question():
         assert verdict.probability == 0.97
 
 
+def test_gatekeeper_never_payload_has_no_test_pass_or_failure():
+    gk = Gatekeeper(api_url="https://api.typesafe.ai/v1/systemone", api_key="test_key")
+    response = httpx.Response(200, json={"valid": {"value": True, "probability": 0.9}})
+    with patch.object(gk.client, "post", return_value=response) as post:
+        gk.validate_subgoal(
+            Subgoal(description="Update app", scope=["app.py"]), "+code",
+            mechanical_detail="tests_excluded_by_policy=true",
+            test_evidence={"policy": "never", "ran": False, "outcome": "EXCLUDED"},
+        )
+        state = post.call_args.kwargs["json"]["state"]
+        assert state["tests_excluded_by_policy"] is True
+        assert "test_evidence" not in state and "untested_pass" not in state
+
+    with patch.object(gk.client, "post", return_value=response) as post:
+        gk.verify_ticket(
+            "Update app", "+code", "tests_excluded_by_policy=true (test_policy=never)",
+            test_evidence={"policy": "never", "ran": False, "outcome": "EXCLUDED"},
+        )
+        payload = post.call_args.kwargs["json"]
+        assert payload["state"]["tests_excluded_by_policy"] is True
+        assert "test_output" not in payload["state"] and "test_evidence" not in payload["state"]
+        assert "do not infer a pass or failure" in payload["questions"]["valid"]["instructions"]
+
+
+def test_gatekeeper_forwards_structured_evidence_when_tests_run():
+    gk = Gatekeeper(api_url="https://api.typesafe.ai/v1/systemone", api_key="test_key")
+    response = httpx.Response(200, json={"valid": {"value": True, "probability": 0.9}})
+    evidence = {"policy": "auto", "ran": True, "command": ["pytest", "tests/test_app.py"],
+                "targets": ["tests/test_app.py"], "exit_code": 0, "outcome": "PASSED"}
+    with patch.object(gk.client, "post", return_value=response) as post:
+        gk.validate_subgoal(Subgoal(description="Update app"), "+code", test_evidence=evidence)
+        assert post.call_args.kwargs["json"]["state"]["test_evidence"] == evidence
+    with patch.object(gk.client, "post", return_value=response) as post:
+        gk.verify_ticket("Update app", "+code", "PASSED", test_evidence=evidence)
+        assert post.call_args.kwargs["json"]["state"]["test_evidence"] == evidence
+
+
 # 31. Test escalate_deadlock writes file with custom objects
 def test_escalate_deadlock_dumps_valid_json(tmp_path):
     """Verify escalate_deadlock safely dumps trajectory into JSON file."""

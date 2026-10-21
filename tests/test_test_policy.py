@@ -1,4 +1,5 @@
 import subprocess
+import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -243,3 +244,170 @@ def test_jev_engine_seeds_test_policy_in_state():
     gk = MagicMock()
     engine = JevEngine(workspace=ws, gatekeeper=gk, test_policy="verify-only")
     assert engine.test_policy == "verify-only"
+
+
+def test_gate_never_excludes_test_results_from_jev_even_if_workspace_reports_a_pass():
+    ws = MagicMock()
+    ws.get_staged_diff.return_value = "diff --git a/src/app.py b/src/app.py\n+return 1\n"
+    ws.run_mechanical_checks.return_value = MechanicalCheckResult(
+        passed=True, detail="Untested pass: skipped per test_policy=never.",
+        checks_run=["compile", "scope"],
+        checks={"tests": {"ran": False, "passed": True}},
+        test_runner_outcome={"ran": False, "outcome": "NO_TESTS_COLLECTED"},
+    )
+    gk = MagicMock()
+    gk.validate_subgoal.return_value = ValidationVerdict(valid=True, probability=0.9)
+    state: State = {"current_subgoal": Subgoal(description="Change app", scope=["src/app.py"]),
+                    "test_policy": "never", "trajectory": []}
+
+    result = node_gate(state, workspace=ws, gatekeeper=gk)
+
+    assert result.get("gate_status") == "passed"
+    detail = gk.validate_subgoal.call_args.kwargs["mechanical_detail"]
+    assert "tests_excluded_by_policy=true" in detail
+    assert "pass" not in detail.lower() and "NO_TESTS_COLLECTED" not in detail
+    assert result.get("trajectory", [])[-1]["test_runner"]["outcome"] == "EXCLUDED"
+
+
+def test_gate_verify_only_required_tests_are_unverified_not_failed():
+    ws = MagicMock()
+    ws.get_staged_diff.return_value = "diff --git a/src/app.py b/src/app.py\n+return 1\n"
+    ws.run_mechanical_checks.return_value = MechanicalCheckResult(
+        passed=True, detail="Untested pass: skipped per test_policy=verify-only.",
+        checks={"tests": {"ran": False, "passed": True}},
+        test_runner_outcome={"ran": False, "outcome": "NO_TESTS_COLLECTED"},
+    )
+    gk = MagicMock()
+    gk.validate_subgoal.return_value = ValidationVerdict(valid=True, probability=0.9)
+
+    state: State = {"current_subgoal": Subgoal(description="Change app", expects_tests=True),
+                    "test_policy": "verify-only", "trajectory": []}
+    result = node_gate(state, workspace=ws, gatekeeper=gk)
+
+    assert result.get("gate_status") == "passed"
+    assert result.get("trajectory", [])[-1]["test_runner"]["outcome"] == "UNVERIFIED"
+    assert '"outcome": "UNVERIFIED"' in gk.validate_subgoal.call_args.kwargs["mechanical_detail"]
+
+
+def test_gate_auto_forwards_structured_targeted_test_evidence(tmp_path):
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_app.py").write_text("def test_app(): pass\n", encoding="utf-8")
+
+    class TargetedWorkspace:
+        worktree_dir = tmp_path
+
+        def get_staged_diff(self):
+            return "diff --git a/src/app.py b/src/app.py\n+return 1\n"
+
+        def run_mechanical_checks(self, subgoal, test_policy="auto", test_targets=None):
+            self.targets = test_targets
+            return MechanicalCheckResult(
+                passed=True, checks_run=["compile", "tests", "scope"],
+                test_runner_outcome={"ran": True, "command": ["pytest", "tests/test_app.py"],
+                                     "exit_code": 0, "outcome": "PASSED", "new_failures": []},
+            )
+
+        def commit_subgoal(self):
+            pass
+
+    ws = TargetedWorkspace()
+    gk = MagicMock()
+    gk.validate_subgoal.return_value = ValidationVerdict(valid=True, probability=0.9)
+    state: State = {"current_subgoal": Subgoal(description="Change app", scope=["src/app.py"]),
+                    "test_policy": "auto", "trajectory": []}
+
+    result = node_gate(state, workspace=ws, gatekeeper=gk)
+
+    assert ws.targets == ["tests/test_app.py"]
+    evidence = result.get("trajectory", [])[-1]["test_runner"]
+    assert evidence["policy"] == "auto"
+    assert evidence["ran"] is True
+    assert evidence["command"] == ["pytest", "tests/test_app.py"]
+    assert evidence["exit_code"] == 0
+    assert evidence["new_failures"] == []
+    assert json.loads(gk.validate_subgoal.call_args.kwargs["mechanical_detail"].split("Test evidence: ")[1]) == evidence
+
+
+def test_gate_auto_targets_workspace_run_tests_inside_mechanical_checks(tmp_path):
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_app.py").write_text("def test_app(): pass\n", encoding="utf-8")
+
+    class WorkspaceWithTargetedRunner:
+        worktree_dir = tmp_path
+
+        def get_staged_diff(self):
+            return "diff --git a/src/app.py b/src/app.py\n+return 1\n"
+
+        def run_tests(self, targets=None):
+            self.selected = targets
+            self.last_test_run = {"command": ["pytest", *(targets or [])], "exit_code": 0, "outcome": "PASSED"}
+            return TestOutcome.PASSED
+
+        def run_mechanical_checks(self, subgoal, test_policy="auto"):
+            self.run_tests()
+            return MechanicalCheckResult(passed=True, checks_run=["compile", "tests", "scope"],
+                                         test_runner_outcome=self.last_test_run)
+
+        def commit_subgoal(self):
+            pass
+
+    ws = WorkspaceWithTargetedRunner()
+    gk = MagicMock()
+    gk.validate_subgoal.return_value = ValidationVerdict(valid=True, probability=0.9)
+    state: State = {"current_subgoal": Subgoal(description="Change app", scope=["src/app.py"]),
+                    "test_policy": "auto", "trajectory": []}
+
+    result = node_gate(state, workspace=ws, gatekeeper=gk)
+
+    assert ws.selected == ["tests/test_app.py"]
+    assert result.get("trajectory", [])[-1]["test_runner"]["targets"] == ws.selected
+    assert ws.run_tests.__func__ is WorkspaceWithTargetedRunner.run_tests
+
+
+def test_verify_never_does_not_claim_no_tests_collected_or_failure():
+    ws = MagicMock()
+    ws.get_cumulative_diff.return_value = "diff --git a/src/app.py b/src/app.py\n+return 1\n"
+    ws.check_compile.return_value = {"outcome": "PASSED"}
+    ws.last_test_run = {"ran": True, "outcome": "FAILED", "output_tail": "old failure"}
+    gk = MagicMock()
+    gk.verify_ticket.return_value = ValidationVerdict(valid=True, probability=0.9)
+
+    state: State = {"ticket": "Fix app", "integration_branch": "branch",
+                    "test_policy": "never", "trajectory": []}
+    result = node_verify(state, workspace=ws, gatekeeper=gk)
+
+    ws.run_tests.assert_not_called()
+    assert result.get("status") == "completed"
+    output = gk.verify_ticket.call_args.args[2]
+    assert "tests_excluded_by_policy=true" in output
+    assert "PASSED" not in output and "FAILED" not in output and "NO_TESTS_COLLECTED" not in output
+    assert result.get("trajectory", [])[-1]["test_runner"]["outcome"] == "EXCLUDED"
+
+
+def test_verify_auto_prefers_targeted_runner_and_forwards_evidence(tmp_path):
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_app.py").write_text("def test_app(): pass\n", encoding="utf-8")
+    ws = MagicMock()
+    ws.worktree_dir = tmp_path
+    ws.get_cumulative_diff.return_value = "diff --git a/tests/test_app.py b/tests/test_app.py\n+assert True\n"
+    ws.check_compile.return_value = {"outcome": "PASSED"}
+    ws.run_targeted_tests.return_value = TestOutcome.PASSED
+    ws.last_test_run = {"command": ["pytest", "tests/test_app.py"], "exit_code": 0,
+                        "outcome": "PASSED", "base_failures": ["old"], "new_failures": []}
+    gk = MagicMock()
+    gk.verify_ticket.return_value = ValidationVerdict(valid=True, probability=0.9)
+
+    state: State = {"ticket": "Fix tests", "integration_branch": "branch",
+                    "test_policy": "auto", "trajectory": []}
+    result = node_verify(state, workspace=ws, gatekeeper=gk)
+
+    ws.run_targeted_tests.assert_called_once_with(["tests/test_app.py"])
+    ws.run_tests.assert_not_called()
+    evidence = result.get("trajectory", [])[-1]["test_runner"]
+    assert evidence["targets"] == ["tests/test_app.py"]
+    assert evidence["base_failures"] == ["old"]
+    assert evidence["new_failures"] == []
+    assert json.loads(gk.verify_ticket.call_args.args[2].split("Test evidence: ")[1]) == evidence

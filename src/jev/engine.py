@@ -1027,6 +1027,48 @@ def _accepts_param(fn: Any, param_name: str) -> bool:
         return False
 
 
+def _test_targets(workspace: Any, diff: str, scope: Sequence[str] = ()) -> List[str]:
+    """Find existing, affected test files; an empty list means run the full suite."""
+    root = getattr(workspace, "worktree_dir", None) or getattr(workspace, "repo_dir", None)
+    if not isinstance(root, (str, Path)):
+        return []
+    base = Path(root).resolve()
+    targets: set[str] = set()
+    for filename in Workspace._extract_files_from_diff(diff) | set(scope):
+        path = Path(filename)
+        if path.is_absolute() or ".." in path.parts:
+            continue
+        candidates = [path]
+        if path.suffix == ".py" and not path.name.startswith("test_"):
+            candidates.extend((Path("tests") / f"test_{path.stem}.py",
+                               Path("tests") / path.parent / f"test_{path.stem}.py"))
+        elif path.suffix in {".ts", ".tsx", ".js", ".jsx"}:
+            candidates.extend(path.with_name(f"{path.stem}.{kind}{path.suffix}")
+                              for kind in ("test", "spec"))
+        for candidate in candidates:
+            if (candidate.name.startswith("test_") or ".test." in candidate.name or ".spec." in candidate.name):
+                resolved = (base / candidate).resolve()
+                if resolved.is_relative_to(base) and resolved.is_file():
+                    targets.add(candidate.as_posix())
+    return sorted(targets)
+
+
+def _test_evidence(policy: str, ran: bool, runner: Any, targets: List[str], *, required: bool) -> Dict[str, Any]:
+    details = runner if ran and isinstance(runner, dict) else {}
+    evidence: Dict[str, Any] = {
+        "policy": policy, "ran": ran, "ecosystem": details.get("ecosystem"),
+        "command": details.get("executed_command") or details.get("command"),
+        "targets": targets if ran else [], "exit_code": details.get("exit_code"),
+        "output_tail": str(details.get("output_tail") or "")[-MAX_SELF_CHECK_OUTPUT_CHARS:],
+        "outcome": details.get("outcome", "UNKNOWN") if ran else
+                   ("EXCLUDED" if policy == "never" or not required else "UNVERIFIED"),
+    }
+    for name in ("base_failures", "baseline_failures", "new_failures"):
+        if name in details:
+            evidence[name] = details[name]
+    return evidence
+
+
 def _safe_escalate_deadlock(
     gatekeeper: Any,
     trajectory: List[Dict[str, Any]],
@@ -3249,7 +3291,25 @@ def node_gate(
         kwargs["base_commit"] = subgoal_base_commit
     if _accepts_param(workspace.run_mechanical_checks, "test_policy"):
         kwargs["test_policy"] = test_policy
-    mech_result = workspace.run_mechanical_checks(subgoal, **kwargs)
+    targets = _test_targets(workspace, diff, subgoal.scope)
+    should_target = bool(targets and (test_policy == "always" or
+                                      (test_policy == "auto" and subgoal.expects_tests)))
+    targeted_run = False
+    if should_target and _accepts_param(workspace.run_mechanical_checks, "test_targets"):
+        kwargs["test_targets"] = targets
+        mech_result = workspace.run_mechanical_checks(subgoal, **kwargs)
+        targeted_run = True
+    elif should_target and hasattr(workspace, "run_tests") and _accepts_param(workspace.run_tests, "targets"):
+        # Keep the workspace's compile/scope gate intact while selecting its supported targeted runner.
+        full_runner = workspace.run_tests
+        workspace.run_tests = lambda: full_runner(targets=targets)
+        try:
+            mech_result = workspace.run_mechanical_checks(subgoal, **kwargs)
+            targeted_run = True
+        finally:
+            workspace.run_tests = full_runner
+    if not targeted_run:
+        mech_result = workspace.run_mechanical_checks(subgoal, **kwargs)
 
     tier0_telemetry = {
         "passed": mech_result.passed,
@@ -3273,6 +3333,8 @@ def node_gate(
         tests_ran = True
     elif tier0_telemetry.get("checks", {}).get("tests", {}).get("ran"):
         tests_ran = True
+    if test_policy in ("never", "verify-only") or (test_policy == "auto" and not subgoal.expects_tests):
+        tests_ran = False
 
     if mech_result.failed_check in ("build", "compile", "no_compile_command", "env_not_ready") or (not tests_ran and not mech_result.passed):
         test_runner_telemetry = {"ran": False}
@@ -3312,6 +3374,13 @@ def node_gate(
             "outcome": "PASSED" if mech_result.passed or mech_result.failed_check not in ("compile", "no_compile_command", "env_not_ready") else "FAILED",
         }
 
+    if mech_result.failed_check in ("build", "compile", "no_compile_command", "env_not_ready") and not tests_ran:
+        test_runner_telemetry = {"ran": False}
+    else:
+        test_runner_telemetry = _test_evidence(
+            test_policy, tests_ran, test_runner_telemetry, targets if targeted_run else [],
+            required=bool(subgoal.expects_tests),
+        )
     mechanical_evidence = _attempt_evidence(
         state,
         failure_class=mech_result.failed_check or "mechanical_failure",
@@ -3526,9 +3595,20 @@ def node_gate(
         gate_kwargs["investigation_notes"] = inv_notes
     if pass_delta and _accepts_param(gatekeeper.validate_subgoal, "dependency_delta"):
         gate_kwargs["dependency_delta"] = attempt_dep_delta_obj.model_dump()
+    if _accepts_param(gatekeeper.validate_subgoal, "test_evidence"):
+        gate_kwargs["test_evidence"] = test_runner_telemetry
 
+    if test_policy == "never":
+        mechanical_detail = "tests_excluded_by_policy=true"
+    elif tests_ran or subgoal.expects_tests or test_policy == "verify-only":
+        mechanical_detail = (
+            f"{mech_result.detail}\nTest evidence: "
+            f"{json.dumps(test_runner_telemetry, sort_keys=True)}"
+        ).strip()
+    else:
+        mechanical_detail = mech_result.detail
     verdict = gatekeeper.validate_subgoal(
-        subgoal, diff, mechanical_detail=mech_result.detail, **gate_kwargs
+        subgoal, diff, mechanical_detail=mechanical_detail, **gate_kwargs
     )
     jev_keys = getattr(gatekeeper, "last_state_keys", None)
     if not isinstance(jev_keys, str):
@@ -3914,10 +3994,17 @@ def node_verify(
         tests_ran = False
         outcome = None
         test_policy = state.get("test_policy", "auto")
+        targets = _test_targets(workspace, final_diff)
         if test_policy == "never":
-            outcome = TestOutcome.NO_TESTS_COLLECTED
-            test_output = "NO_TESTS_COLLECTED (Untested pass: tests disabled via test_policy=never)"
-            tests_ran = False
+            test_output = "tests_excluded_by_policy=true (test_policy=never)"
+        elif targets and workspace is not None and hasattr(workspace, "run_targeted_tests"):
+            outcome = workspace.run_targeted_tests(targets)
+            tests_ran = True
+            test_output = getattr(outcome, "value", str(outcome))
+        elif targets and workspace is not None and hasattr(workspace, "run_tests") and _accepts_param(workspace.run_tests, "targets"):
+            outcome = workspace.run_tests(targets=targets)
+            tests_ran = True
+            test_output = getattr(outcome, "value", str(outcome))
         elif workspace is not None and hasattr(workspace, "run_tests"):
             outcome = workspace.run_tests()
             tests_ran = True
@@ -3984,17 +4071,10 @@ def node_verify(
         if not tests_ran:
             test_runner_info = {
                 "ran": False,
-                "ecosystem": None,
-                "command": None,
-                "exit_code": None,
-                "stdout_tail": "",
-                "stderr_tail": "",
-                "output_tail": "",
-                "outcome": getattr(outcome, "value", str(outcome)) if 'outcome' in locals() and outcome is not None else "NO_TESTS_COLLECTED",
             }
         else:
             test_runner_info = getattr(workspace, "last_test_run", None)
-            if test_runner_info is None:
+            if not isinstance(test_runner_info, dict):
                 test_runner_info = {
                     "ran": True,
                     "ecosystem": None,
@@ -4005,9 +4085,17 @@ def node_verify(
                     "output_tail": "",
                     "outcome": getattr(outcome, "value", str(outcome)) if 'outcome' in locals() else "UNKNOWN",
                 }
-            elif isinstance(test_runner_info, dict):
+            else:
                 test_runner_info = dict(test_runner_info)
                 test_runner_info["ran"] = True
+                test_runner_info.setdefault("outcome", getattr(outcome, "value", str(outcome)))
+
+        test_runner_info = _test_evidence(
+            test_policy, tests_ran, test_runner_info,
+            targets if tests_ran and (hasattr(workspace, "run_targeted_tests") or
+                                      (hasattr(workspace, "run_tests") and _accepts_param(workspace.run_tests, "targets"))) else [],
+            required=any_expects_tests,
+        )
 
         if outcome == TestOutcome.FAILED or test_output == "FAILED":
             output_tail = None
@@ -4019,12 +4107,17 @@ def node_verify(
                 tail_capped = output_tail[-4000:]
                 test_output = f"FAILED\n{tail_capped}"
 
+        if test_policy != "never":
+            test_output = f"{test_output}\nTest evidence: {json.dumps(test_runner_info, sort_keys=True)}".strip()
+
         verdict = None
         if gatekeeper is not None and hasattr(gatekeeper, "verify_ticket"):
+            verify_kwargs: Dict[str, Any] = {}
             if _accepts_param(gatekeeper.verify_ticket, "investigation_notes"):
-                verdict = gatekeeper.verify_ticket(ticket, final_diff, test_output, investigation_notes=inv_notes)
-            else:
-                verdict = gatekeeper.verify_ticket(ticket, final_diff, test_output)
+                verify_kwargs["investigation_notes"] = inv_notes
+            if _accepts_param(gatekeeper.verify_ticket, "test_evidence"):
+                verify_kwargs["test_evidence"] = test_runner_info
+            verdict = gatekeeper.verify_ticket(ticket, final_diff, test_output, **verify_kwargs)
 
             verify_keys = getattr(gatekeeper, "last_state_keys", None)
             if not isinstance(verify_keys, str):
