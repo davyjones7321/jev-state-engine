@@ -2243,6 +2243,14 @@ def node_implement(
             wt_path = workspace.create_subgoal_worktree(subgoal_id, base_ref=base_ref)
             state["current_worktree_path"] = str(wt_path)
             state["current_worktree_branch"] = f"jev-subgoal-{subgoal_id}"
+            if hasattr(workspace, "run_baseline_tests") and state.get("test_policy") != "never":
+                try:
+                    workspace.run_baseline_tests(
+                        base_commit=state.get("subgoal_base_commit"),
+                        test_policy=state.get("test_policy", "auto"),
+                    )
+                except Exception as e:
+                    logger.warning(f"Baseline test run failed: {e}")
         elif hasattr(workspace, "worktree_dir") and state.get("current_worktree_path"):
             workspace.worktree_dir = Path(state["current_worktree_path"])
 
@@ -2956,10 +2964,26 @@ def _snapshot_attempt(
     jev_state_keys: Optional[str] = None,
     failure_evidence: Optional[Any] = None,
     retry_metadata: Optional[Any] = None,
+    baseline_failures: Optional[int] = None,
+    new_failures: Optional[int] = None,
+    full_suite_clean: Optional[bool] = None,
 ) -> None:
     """Helper to snapshot an attempt row to the ledger."""
     if not recorder:
         return
+    if baseline_failures is None:
+        baseline_failures = state.get("baseline_failures")
+    if new_failures is None:
+        new_failures = state.get("new_failures")
+    if full_suite_clean is None:
+        full_suite_clean = state.get("full_suite_clean")
+
+    classification = state.get("test_classification")
+    if classification:
+        if test_outcome is None or test_outcome in ("PASSED", "FAILED"):
+            test_outcome = classification
+        if outcome in ("mechanical_failure", "passed", None):
+            outcome = classification
     if not isinstance(jev_state_keys, str):
         jev_state_keys = None
     safe_rec = recorder if isinstance(recorder, SafeRecorder) else SafeRecorder(recorder)
@@ -3045,6 +3069,9 @@ def _snapshot_attempt(
         hypothesis_changed=(retry_metadata or {}).get("hypothesis_changed") if isinstance(retry_metadata, dict) else None,
         hypothesis_change=(retry_metadata or {}).get("hypothesis_change") if isinstance(retry_metadata, dict) else None,
         retry_metadata=retry_metadata,
+        baseline_failures=baseline_failures,
+        new_failures=new_failures,
+        full_suite_clean=full_suite_clean,
     )
 
 
@@ -3328,6 +3355,26 @@ def node_gate(
             workspace.run_tests = full_runner
     if not targeted_run:
         mech_result = workspace.run_mechanical_checks(subgoal, **kwargs)
+
+    classification = getattr(mech_result, "test_classification", None)
+    full_suite_clean = getattr(mech_result, "full_suite_clean", None)
+    baseline_failures = getattr(mech_result, "baseline_failures", None)
+    new_failures = getattr(mech_result, "new_failures", None)
+    baseline_failing_ids = getattr(mech_result, "baseline_failing_ids", None)
+    new_failing_ids = getattr(mech_result, "new_failing_ids", None)
+
+    if classification is not None:
+        state["test_classification"] = classification
+    if full_suite_clean is not None:
+        state["full_suite_clean"] = full_suite_clean
+    if baseline_failures is not None:
+        state["baseline_failures"] = baseline_failures
+    if new_failures is not None:
+        state["new_failures"] = new_failures
+    if baseline_failing_ids is not None:
+        state["baseline_failing_ids"] = baseline_failing_ids
+    if new_failing_ids is not None:
+        state["new_failing_ids"] = new_failing_ids
 
     tier0_telemetry = {
         "passed": mech_result.passed,
@@ -3616,8 +3663,24 @@ def node_gate(
     if _accepts_param(gatekeeper.validate_subgoal, "test_evidence"):
         gate_kwargs["test_evidence"] = test_runner_telemetry
 
+    if isinstance(test_runner_telemetry, dict):
+        if classification:
+            test_runner_telemetry["classification"] = classification
+        if baseline_failures is not None and "baseline_failures" not in test_runner_telemetry:
+            test_runner_telemetry["baseline_failures"] = baseline_failures
+        if new_failures is not None and "new_failures" not in test_runner_telemetry:
+            test_runner_telemetry["new_failures"] = new_failures
+        if full_suite_clean is not None:
+            test_runner_telemetry["full_suite_clean"] = full_suite_clean
+
     if test_policy == "never":
         mechanical_detail = "tests_excluded_by_policy=true"
+    elif classification == "REGRESSION_FREE_WITH_BASELINE_FAILURES":
+        base_desc = f"Regression-free with baseline failures (baseline_failures={baseline_failures}, new_failures=0)."
+        mechanical_detail = (
+            f"{base_desc}\n{mech_result.detail}\nTest evidence: "
+            f"{json.dumps(test_runner_telemetry, sort_keys=True)}"
+        ).strip()
     elif tests_ran or subgoal.expects_tests or test_policy == "verify-only":
         mechanical_detail = (
             f"{mech_result.detail}\nTest evidence: "
@@ -4114,6 +4177,55 @@ def node_verify(
                                       (hasattr(workspace, "run_tests") and _accepts_param(workspace.run_tests, "targets"))) else [],
             required=any_expects_tests,
         )
+
+        verify_classification = None
+        verify_baseline_failures = state.get("baseline_failures")
+        verify_new_failures = state.get("new_failures")
+        verify_full_suite_clean = state.get("full_suite_clean")
+
+        if workspace is not None and hasattr(workspace, "_baseline_test_cache"):
+            commit_key = str(base_commit).strip() if base_commit else "HEAD"
+            baseline = workspace._baseline_test_cache.get(commit_key)
+            if baseline is not None:
+                base_failing_raw = baseline.get("failing_ids")
+                if base_failing_raw is not None:
+                    base_set = set(base_failing_raw)
+                    verify_baseline_failures = len(base_set)
+                    cand_ids = test_runner_info.get("failing_test_ids") if isinstance(test_runner_info, dict) else None
+                    if outcome == TestOutcome.PASSED:
+                        if len(base_set) > 0:
+                            verify_classification = "REGRESSION_FREE_WITH_BASELINE_FAILURES"
+                            verify_full_suite_clean = False
+                            verify_new_failures = 0
+                        else:
+                            verify_classification = "FULL_SUITE_PASSED"
+                            verify_full_suite_clean = True
+                            verify_new_failures = 0
+                    elif outcome == TestOutcome.FAILED and cand_ids is not None:
+                        cand_set = set(cand_ids)
+                        new_failing = cand_set - base_set
+                        verify_new_failures = len(new_failing)
+                        if len(new_failing) == 0:
+                            verify_classification = "REGRESSION_FREE_WITH_BASELINE_FAILURES"
+                            verify_full_suite_clean = False
+                            outcome = TestOutcome.PASSED
+                            test_output = f"REGRESSION_FREE_WITH_BASELINE_FAILURES ({len(base_set)} baseline failures, 0 new failures)"
+                        else:
+                            verify_classification = "REGRESSION_DETECTED"
+                            verify_full_suite_clean = False
+
+        if verify_classification is not None:
+            state["test_classification"] = verify_classification
+            state["baseline_failures"] = verify_baseline_failures
+            state["new_failures"] = verify_new_failures
+            state["full_suite_clean"] = verify_full_suite_clean
+            if isinstance(test_runner_info, dict):
+                test_runner_info["classification"] = verify_classification
+                if "baseline_failures" not in test_runner_info:
+                    test_runner_info["baseline_failures"] = verify_baseline_failures
+                if "new_failures" not in test_runner_info:
+                    test_runner_info["new_failures"] = verify_new_failures
+                test_runner_info["full_suite_clean"] = verify_full_suite_clean
 
         if outcome == TestOutcome.FAILED or test_output == "FAILED":
             output_tail = None

@@ -23,6 +23,85 @@ logger = logging.getLogger(__name__)
 MAX_READ_CHARS = 40_000
 
 
+def parse_failing_test_ids(output: str, ecosystem: Optional[str] = None, exit_code: Optional[int] = None) -> Optional[Set[str]]:
+    """Parse failing test identifiers from test runner output.
+
+    Supports pytest, unittest, jest/vitest, go, and cargo.
+    Returns:
+    - Set[str] of failing test IDs if parsed
+    - set() if output indicates clean pass (no failures)
+    - None if output indicates test failure but no specific IDs could be parsed (fail-closed)
+    """
+    if not output and (exit_code is None or exit_code == 0):
+        return set()
+    if not output and exit_code is not None and exit_code != 0:
+        return None
+
+    clean = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", output)
+    ids: Set[str] = set()
+
+    # 1. Pytest
+    for match in re.finditer(r"(?:^|\n)\s*(?:FAILED|ERROR)\s+([^\s\n\r]+)", clean):
+        token = match.group(1).strip()
+        if token and not token.startswith("(") and not token.startswith("="):
+            token = token.rstrip(":,")
+            ids.add(token)
+
+    for match in re.finditer(r"(?:^|\n)\s*([^\s\n\r]+::[^\s\n\r]+)\s+FAILED", clean):
+        token = match.group(1).strip().rstrip(":,")
+        if token:
+            ids.add(token)
+
+    # 2. Unittest
+    for match in re.finditer(r"(?:^|\n)\s*(?:FAIL|ERROR):\s+([a-zA-Z0-9_]+)\s+\(([^)]+)\)", clean):
+        func_name = match.group(1).strip()
+        cls_name = match.group(2).strip()
+        ids.add(f"{cls_name}.{func_name}")
+
+    # 3. Jest / Vitest
+    for match in re.finditer(r"(?:^|\n)\s*(?:[✕×]|●)\s+([^\n\r]+)", clean):
+        token = match.group(1).strip()
+        if token:
+            ids.add(token)
+
+    for match in re.finditer(r"(?:^|\n)\s*FAIL\s+([^\s\n\r]+)", clean):
+        token = match.group(1).strip().rstrip(":,")
+        if token and ("." in token or "/" in token):
+            ids.add(token)
+
+    # 4. Go test
+    for match in re.finditer(r"---\s+FAIL:\s+([^\s\(\)]+)", clean):
+        token = match.group(1).strip()
+        if token:
+            ids.add(token)
+
+    # 5. Cargo test
+    for match in re.finditer(r"(?:^|\n)\s*test\s+([^\s]+)\s+\.\.\.\s+FAILED", clean):
+        token = match.group(1).strip()
+        if token:
+            ids.add(token)
+
+    if exit_code is not None and exit_code != 0:
+        if ids:
+            return ids
+        return None
+
+    lower = clean.lower()
+    failure_indicators = [
+        "failed", "failure", "error", "traceback", "exception", "timed out",
+        "command exited", "process exited"
+    ]
+    has_failure = any(ind in lower for ind in failure_indicators)
+
+    if has_failure:
+        if ids:
+            return ids
+        return None
+
+    return set()
+
+
+
 def _cap_read_text(text: str) -> str:
     if len(text) > MAX_READ_CHARS:
         return text[:MAX_READ_CHARS] + f"\n[truncated: showing first {MAX_READ_CHARS} of {len(text)} characters]"
@@ -686,6 +765,7 @@ class Workspace:
         self.base_commit: Optional[str] = self._get_head_commit()
         self.last_test_run: Optional[dict] = None
         self.last_compile_run: Optional[dict] = None
+        self._baseline_test_cache: Dict[str, Dict[str, Any]] = {}
 
         if test_timeout is not None:
             try:
@@ -735,6 +815,14 @@ class Workspace:
         if stderr_tail:
             output_tail = f"{output_tail}\n[stderr]\n{stderr_tail}".strip() if output_tail else stderr_tail
 
+        full_output = f"{stdout}\n{stderr}" if stderr else stdout
+        parsed_ids = parse_failing_test_ids(full_output, ecosystem=ecosystem, exit_code=exit_code)
+        if outcome == TestOutcome.PASSED or exit_code == 0:
+            parsed_ids = set()
+        elif (outcome == TestOutcome.FAILED or (exit_code is not None and exit_code != 0)):
+            if parsed_ids is not None and len(parsed_ids) == 0:
+                parsed_ids = None
+
         self.last_test_run = {
             "ecosystem": ecosystem,
             "command": command,
@@ -749,6 +837,7 @@ class Workspace:
             "stderr_tail": stderr_tail,
             "output_tail": output_tail,
             "outcome": outcome.value if hasattr(outcome, "value") else str(outcome),
+            "failing_test_ids": list(parsed_ids) if parsed_ids is not None else None,
         }
         return outcome
 
@@ -1572,6 +1661,75 @@ class Workspace:
             )
 
         return self._record_test_run(None, None, None, "", "", TestOutcome.NO_TESTS_COLLECTED)
+
+    def run_baseline_tests(
+        self,
+        base_commit: Optional[str] = None,
+        test_policy: str = "auto",
+    ) -> Dict[str, Any]:
+        """Run tests on the base ref and record failing test IDs.
+
+        Cached per base commit so it runs once per base commit across attempts.
+        Respects test_policy (if 'never', returns exempt without running).
+        """
+        if test_policy == "never":
+            return {
+                "outcome": TestOutcome.EXEMPT_BY_POLICY.value,
+                "failing_ids": set(),
+                "ran": False,
+            }
+
+        commit_key = str(base_commit).strip() if base_commit else (self._get_head_commit() or "HEAD")
+        if commit_key in self._baseline_test_cache:
+            return self._baseline_test_cache[commit_key]
+
+        try:
+            test_outcome = self.run_tests(targets=None)
+            test_run_details = getattr(self, "last_test_run", None) or {}
+            exit_code = test_run_details.get("exit_code")
+            failing_ids = test_run_details.get("failing_test_ids")
+
+            if test_outcome == TestOutcome.PASSED or exit_code == 0:
+                res = {
+                    "outcome": TestOutcome.FULL_SUITE_PASSED.value,
+                    "failing_ids": set(),
+                    "ran": True,
+                    "details": test_run_details,
+                }
+            elif test_outcome == TestOutcome.FAILED or (exit_code is not None and exit_code != 0):
+                if failing_ids is not None:
+                    res = {
+                        "outcome": TestOutcome.FAILED.value,
+                        "failing_ids": set(failing_ids),
+                        "ran": True,
+                        "details": test_run_details,
+                    }
+                else:
+                    res = {
+                        "outcome": TestOutcome.FAILED.value,
+                        "failing_ids": None,
+                        "unparseable": True,
+                        "ran": True,
+                        "details": test_run_details,
+                    }
+            else:
+                res = {
+                    "outcome": test_outcome.value if hasattr(test_outcome, "value") else str(test_outcome),
+                    "failing_ids": set(),
+                    "ran": True,
+                    "details": test_run_details,
+                }
+        except Exception as e:
+            res = {
+                "outcome": TestOutcome.FAILED.value,
+                "failing_ids": None,
+                "error": str(e),
+                "timed_out": "timed out" in str(e).lower(),
+                "ran": True,
+            }
+
+        self._baseline_test_cache[commit_key] = res
+        return res
 
     def run_targeted_tests(self, targets: Sequence[Union[str, Path]]) -> TestOutcome:
         """Run only the explicitly selected, worktree-contained test targets."""
@@ -2864,6 +3022,27 @@ class Workspace:
             if isinstance(test_run_details, dict):
                 test_run_details["ran"] = False
 
+        test_classification: Optional[str] = None
+        full_suite_clean: Optional[bool] = None
+        baseline_failures: Optional[int] = None
+        new_failures: Optional[int] = None
+        baseline_failing_ids: Optional[List[str]] = None
+        new_failing_ids: Optional[List[str]] = None
+
+        if test_policy == "never":
+            test_classification = TestOutcome.EXEMPT_BY_POLICY.value
+            full_suite_clean = None
+            baseline_failures = 0
+            new_failures = 0
+        elif not should_run_tests:
+            if not getattr(subgoal, "expects_tests", True):
+                test_classification = TestOutcome.NO_TESTS_COLLECTED.value
+            else:
+                test_classification = TestOutcome.EXEMPT_BY_POLICY.value
+            full_suite_clean = None
+            baseline_failures = 0
+            new_failures = 0
+
         if should_run_tests and test_outcome == TestOutcome.ENV_NOT_READY:
             err_detail = (
                 (test_run_details.get("stderr_tail") or test_run_details.get("output_tail") or "").strip()
@@ -2885,28 +3064,14 @@ class Workspace:
                 },
                 compile_outcome=compile_res,
                 test_runner_outcome=test_run_details,
-            )
-        elif should_run_tests and test_outcome == TestOutcome.FAILED:
-            output_tail = test_run_details.get("output_tail", "") if isinstance(test_run_details, dict) else ""
-            tail = output_tail[-4000:] if output_tail else ""
-            test_detail = f"Unit tests failed.\n{tail}" if tail else "Unit tests failed."
-            return MechanicalCheckResult(
-                passed=False,
-                failed_check="tests",
-                detail=test_detail,
-                checks_run=["build", "suppression", "unresolved_import", "compile", "tests"],
-                checks={
-                    "build": {"ran": True, "passed": True, "detail": ""},
-                    "suppression": {"ran": True, "passed": True, "detail": ""},
-                    "unresolved_import": {"ran": True, "passed": True, "detail": ""},
-                    "compile": {"ran": True, "passed": True, "detail": compile_res.get("detail", "")},
-                    "tests": {"ran": True, "passed": False, "detail": test_detail},
-                    "scope": {"ran": False, "passed": None},
-                },
-                compile_outcome=compile_res,
-                test_runner_outcome=test_run_details,
+                test_classification=TestOutcome.ENV_NOT_READY.value,
+                full_suite_clean=False,
             )
         elif should_run_tests and test_outcome == TestOutcome.NO_TESTS_COLLECTED:
+            test_classification = TestOutcome.NO_TESTS_COLLECTED.value
+            full_suite_clean = None
+            baseline_failures = 0
+            new_failures = 0
             if subgoal.expects_tests:
                 if not self._is_docs_only_diff(diff):
                     detail_msg = "No tests collected when expects_tests is True and diff contains code changes."
@@ -2925,9 +3090,167 @@ class Workspace:
                         },
                         compile_outcome=compile_res,
                         test_runner_outcome=test_run_details,
+                        test_classification=test_classification,
+                        full_suite_clean=False,
+                        baseline_failures=0,
+                        new_failures=0,
                     )
+        elif should_run_tests and test_outcome in (TestOutcome.PASSED, TestOutcome.FAILED):
+            commit_key = str(base_commit).strip() if base_commit else (self._get_head_commit() or "HEAD")
+            baseline = self._baseline_test_cache.get(commit_key)
+            if baseline is None and base_commit:
+                try:
+                    baseline = self.run_baseline_tests(base_commit=base_commit, test_policy=test_policy)
+                except Exception:
+                    baseline = None
+
+            cand_ids = test_run_details.get("failing_test_ids") if isinstance(test_run_details, dict) else None
+            cand_exit = test_run_details.get("exit_code") if isinstance(test_run_details, dict) else None
+
+            if baseline is not None:
+                base_err = baseline.get("error")
+                base_unp = baseline.get("unparseable")
+                base_timeout = baseline.get("timed_out")
+                base_failing_raw = baseline.get("failing_ids")
+                base_set = set(base_failing_raw) if base_failing_raw is not None else None
+
+                if base_err or base_unp or base_timeout or base_set is None:
+                    reason = base_err or ("timed out" if base_timeout else "unparseable test IDs in baseline")
+                    detail_msg = f"Baseline run failed ({reason}); failing closed as REGRESSION_DETECTED."
+                    return MechanicalCheckResult(
+                        passed=False,
+                        failed_check="tests",
+                        detail=detail_msg,
+                        checks_run=["build", "suppression", "unresolved_import", "compile", "tests"],
+                        checks={
+                            "build": {"ran": True, "passed": True, "detail": ""},
+                            "suppression": {"ran": True, "passed": True, "detail": ""},
+                            "unresolved_import": {"ran": True, "passed": True, "detail": ""},
+                            "compile": {"ran": True, "passed": True, "detail": compile_res.get("detail", "")},
+                            "tests": {"ran": True, "passed": False, "detail": detail_msg},
+                            "scope": {"ran": False, "passed": None},
+                        },
+                        compile_outcome=compile_res,
+                        test_runner_outcome=test_run_details,
+                        test_classification=TestOutcome.REGRESSION_DETECTED.value,
+                        full_suite_clean=False,
+                        baseline_failures=None,
+                        new_failures=1,
+                    )
+
+                if test_outcome == TestOutcome.FAILED or (cand_exit is not None and cand_exit != 0):
+                    if cand_ids is None:
+                        detail_msg = "Test IDs unparseable from failing run; failing closed as REGRESSION_DETECTED."
+                        return MechanicalCheckResult(
+                            passed=False,
+                            failed_check="tests",
+                            detail=detail_msg,
+                            checks_run=["build", "suppression", "unresolved_import", "compile", "tests"],
+                            checks={
+                                "build": {"ran": True, "passed": True, "detail": ""},
+                                "suppression": {"ran": True, "passed": True, "detail": ""},
+                                "unresolved_import": {"ran": True, "passed": True, "detail": ""},
+                                "compile": {"ran": True, "passed": True, "detail": compile_res.get("detail", "")},
+                                "tests": {"ran": True, "passed": False, "detail": detail_msg},
+                                "scope": {"ran": False, "passed": None},
+                            },
+                            compile_outcome=compile_res,
+                            test_runner_outcome=test_run_details,
+                            test_classification=TestOutcome.REGRESSION_DETECTED.value,
+                            full_suite_clean=False,
+                            baseline_failures=len(base_set),
+                            new_failures=1,
+                        )
+
+                    cand_set = set(cand_ids)
+                    new_failing_set = cand_set - base_set
+                    if len(new_failing_set) > 0:
+                        new_list = sorted(list(new_failing_set))
+                        detail_msg = f"Regressions detected ({len(new_failing_set)} new failing test(s)): {', '.join(new_list)}"
+                        return MechanicalCheckResult(
+                            passed=False,
+                            failed_check="tests",
+                            detail=detail_msg,
+                            checks_run=["build", "suppression", "unresolved_import", "compile", "tests"],
+                            checks={
+                                "build": {"ran": True, "passed": True, "detail": ""},
+                                "suppression": {"ran": True, "passed": True, "detail": ""},
+                                "unresolved_import": {"ran": True, "passed": True, "detail": ""},
+                                "compile": {"ran": True, "passed": True, "detail": compile_res.get("detail", "")},
+                                "tests": {"ran": True, "passed": False, "detail": detail_msg},
+                                "scope": {"ran": False, "passed": None},
+                            },
+                            compile_outcome=compile_res,
+                            test_runner_outcome=test_run_details,
+                            test_classification=TestOutcome.REGRESSION_DETECTED.value,
+                            full_suite_clean=(len(base_set) == 0),
+                            baseline_failures=len(base_set),
+                            new_failures=len(new_failing_set),
+                            baseline_failing_ids=sorted(list(base_set)),
+                            new_failing_ids=new_list,
+                        )
+                    else:
+                        test_classification = TestOutcome.REGRESSION_FREE_WITH_BASELINE_FAILURES.value
+                        full_suite_clean = False
+                        baseline_failures = len(base_set)
+                        new_failures = 0
+                        baseline_failing_ids = sorted(list(base_set))
+                        new_failing_ids = []
+                else:
+                    if len(base_set) > 0:
+                        test_classification = TestOutcome.REGRESSION_FREE_WITH_BASELINE_FAILURES.value
+                        full_suite_clean = False
+                        baseline_failures = len(base_set)
+                        new_failures = 0
+                        baseline_failing_ids = sorted(list(base_set))
+                        new_failing_ids = []
+                    else:
+                        test_classification = TestOutcome.FULL_SUITE_PASSED.value
+                        full_suite_clean = True
+                        baseline_failures = 0
+                        new_failures = 0
+                        baseline_failing_ids = []
+                        new_failing_ids = []
+            else:
+                if test_outcome == TestOutcome.FAILED or (cand_exit is not None and cand_exit != 0):
+                    output_tail = test_run_details.get("output_tail", "") if isinstance(test_run_details, dict) else ""
+                    tail = output_tail[-4000:] if output_tail else ""
+                    test_detail = f"Unit tests failed.\n{tail}" if tail else "Unit tests failed."
+                    cand_set = set(cand_ids) if cand_ids else set()
+                    return MechanicalCheckResult(
+                        passed=False,
+                        failed_check="tests",
+                        detail=test_detail,
+                        checks_run=["build", "suppression", "unresolved_import", "compile", "tests"],
+                        checks={
+                            "build": {"ran": True, "passed": True, "detail": ""},
+                            "suppression": {"ran": True, "passed": True, "detail": ""},
+                            "unresolved_import": {"ran": True, "passed": True, "detail": ""},
+                            "compile": {"ran": True, "passed": True, "detail": compile_res.get("detail", "")},
+                            "tests": {"ran": True, "passed": False, "detail": test_detail},
+                            "scope": {"ran": False, "passed": None},
+                        },
+                        compile_outcome=compile_res,
+                        test_runner_outcome=test_run_details,
+                        test_classification=TestOutcome.REGRESSION_DETECTED.value,
+                        full_suite_clean=False,
+                        baseline_failures=0,
+                        new_failures=len(cand_set) if cand_set else 1,
+                        baseline_failing_ids=[],
+                        new_failing_ids=sorted(list(cand_set)) if cand_set else [],
+                    )
+                else:
+                    test_classification = TestOutcome.FULL_SUITE_PASSED.value
+                    full_suite_clean = True
+                    baseline_failures = 0
+                    new_failures = 0
+                    baseline_failing_ids = []
+                    new_failing_ids = []
         elif test_outcome == TestOutcome.NO_TEST_FRAMEWORK:
-            pass
+            test_classification = TestOutcome.NO_TEST_FRAMEWORK.value
+            full_suite_clean = True
+            baseline_failures = 0
+            new_failures = 0
 
         # 6. check_scope
         scope_res = self.check_scope(diff, subgoal.scope)
@@ -2947,6 +3270,12 @@ class Workspace:
                 },
                 compile_outcome=compile_res,
                 test_runner_outcome=test_run_details,
+                test_classification=test_classification,
+                full_suite_clean=full_suite_clean,
+                baseline_failures=baseline_failures,
+                new_failures=new_failures,
+                baseline_failing_ids=baseline_failing_ids,
+                new_failing_ids=new_failing_ids,
             )
 
         untested_flag = (
@@ -2966,20 +3295,33 @@ class Workspace:
                 )
             )
         )
+        success_detail = untested_flag
+        if not success_detail:
+            if test_classification == TestOutcome.REGRESSION_FREE_WITH_BASELINE_FAILURES.value:
+                success_detail = f"Regression-free: {baseline_failures or 0} baseline failure(s) present, 0 new failures."
+            else:
+                success_detail = "passed"
+
         return MechanicalCheckResult(
             passed=True,
             failed_check=None,
-            detail=untested_flag,
+            detail=success_detail,
             checks_run=["build", "suppression", "unresolved_import", "compile", "tests", "scope"] if should_run_tests else ["build", "suppression", "unresolved_import", "compile", "scope"],
             checks={
                 "build": {"ran": True, "passed": True, "detail": ""},
                 "suppression": {"ran": True, "passed": True, "detail": ""},
                 "unresolved_import": {"ran": True, "passed": True, "detail": ""},
                 "compile": {"ran": True, "passed": True, "detail": compile_res.get("detail", "")},
-                "tests": {"ran": should_run_tests, "passed": True, "detail": untested_flag or "passed"},
+                "tests": {"ran": should_run_tests, "passed": True, "detail": success_detail},
                 "scope": {"ran": True, "passed": True, "detail": ""},
             },
             compile_outcome=compile_res,
             test_runner_outcome=test_run_details,
+            test_classification=test_classification,
+            full_suite_clean=full_suite_clean,
+            baseline_failures=baseline_failures,
+            new_failures=new_failures,
+            baseline_failing_ids=baseline_failing_ids,
+            new_failing_ids=new_failing_ids,
         )
 

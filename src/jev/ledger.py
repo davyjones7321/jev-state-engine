@@ -152,6 +152,9 @@ class Recorder(Protocol):
         read_evidence: Optional[Any] = None,
         self_check_evidence: Optional[Any] = None,
         retry_metadata: Optional[Any] = None,
+        baseline_failures: Optional[int] = None,
+        new_failures: Optional[int] = None,
+        full_suite_clean: Optional[bool] = None,
     ) -> None: ...
 
     def has_run(self, run_id: str) -> bool: ...
@@ -266,6 +269,9 @@ class NullRecorder:
         read_evidence: Optional[Any] = None,
         self_check_evidence: Optional[Any] = None,
         retry_metadata: Optional[Any] = None,
+        baseline_failures: Optional[int] = None,
+        new_failures: Optional[int] = None,
+        full_suite_clean: Optional[bool] = None,
     ) -> None:
         pass
 
@@ -416,6 +422,9 @@ class SqliteLedger:
                    read_evidence TEXT,
                    self_check_evidence TEXT,
                    retry_metadata TEXT,
+                   baseline_failures INTEGER,
+                   new_failures INTEGER,
+                   full_suite_clean INTEGER,
                    PRIMARY KEY (run_id, subgoal_id, attempt_no)
                 );
                 """
@@ -427,7 +436,7 @@ class SqliteLedger:
                 conn.execute("ALTER TABLE attempts ADD COLUMN dependency_delta TEXT DEFAULT NULL")
             if "jev_state_keys" not in att_cols:
                 conn.execute("ALTER TABLE attempts ADD COLUMN jev_state_keys TEXT DEFAULT NULL")
-            for name, definition in (("provenance", "TEXT"), ("model_version", "TEXT"), ("retry_number", "INTEGER"), ("evidence_added", "INTEGER"), ("hypothesis_changed", "INTEGER"), ("hypothesis_change", "TEXT"), ("failure_evidence", "TEXT"), ("tool_evidence", "TEXT"), ("read_evidence", "TEXT"), ("self_check_evidence", "TEXT"), ("retry_metadata", "TEXT")):
+            for name, definition in (("provenance", "TEXT"), ("model_version", "TEXT"), ("retry_number", "INTEGER"), ("evidence_added", "INTEGER"), ("hypothesis_changed", "INTEGER"), ("hypothesis_change", "TEXT"), ("failure_evidence", "TEXT"), ("tool_evidence", "TEXT"), ("read_evidence", "TEXT"), ("self_check_evidence", "TEXT"), ("retry_metadata", "TEXT"), ("baseline_failures", "INTEGER"), ("new_failures", "INTEGER"), ("full_suite_clean", "INTEGER")):
                 if name not in att_cols:
                     conn.execute(f"ALTER TABLE attempts ADD COLUMN {name} {definition} DEFAULT NULL")
 
@@ -669,6 +678,9 @@ class SqliteLedger:
         read_evidence: Optional[Any] = None,
         self_check_evidence: Optional[Any] = None,
         retry_metadata: Optional[Any] = None,
+        baseline_failures: Optional[int] = None,
+        new_failures: Optional[int] = None,
+        full_suite_clean: Optional[bool] = None,
     ) -> None:
         now_ts = created_at or datetime.now(timezone.utc).isoformat()
         if not isinstance(jev_state_keys, str):
@@ -703,11 +715,13 @@ class SqliteLedger:
                   feedback_sent, tokens_in, tokens_out, created_at,
                   evidence_level, dependency_delta, jev_state_keys, provenance, model_version, retry_number,
                   evidence_added, hypothesis_changed, hypothesis_change, failure_evidence, tool_evidence,
-                  read_evidence, self_check_evidence, retry_metadata
+                  read_evidence, self_check_evidence, retry_metadata,
+                  baseline_failures, new_failures, full_suite_clean
                  ) VALUES (
                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                   ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                   ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                   ?, ?, ?
                  )
                 """,
                 (
@@ -747,6 +761,9 @@ class SqliteLedger:
                     _bounded_json(read_evidence),
                     _bounded_json(self_check_evidence),
                     _bounded_json(retry_metadata),
+                    baseline_failures,
+                    new_failures,
+                    None if full_suite_clean is None else (1 if full_suite_clean else 0),
                 ),
             )
 

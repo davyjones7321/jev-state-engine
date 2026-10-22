@@ -11,6 +11,10 @@ class TestOutcome(str, Enum):
     NO_TESTS_COLLECTED = "NO_TESTS_COLLECTED"
     NO_TEST_FRAMEWORK = "NO_TEST_FRAMEWORK"
     ENV_NOT_READY = "ENV_NOT_READY"
+    FULL_SUITE_PASSED = "FULL_SUITE_PASSED"
+    REGRESSION_FREE_WITH_BASELINE_FAILURES = "REGRESSION_FREE_WITH_BASELINE_FAILURES"
+    REGRESSION_DETECTED = "REGRESSION_DETECTED"
+    EXEMPT_BY_POLICY = "EXEMPT_BY_POLICY"
 
 
 class CompileOutcome(str, Enum):
@@ -44,6 +48,12 @@ class MechanicalCheckResult(BaseModel):
     checks: Dict[str, Any] = Field(default_factory=dict)
     test_runner_outcome: Optional[Dict[str, Any]] = None
     compile_outcome: Optional[Dict[str, Any]] = None
+    test_classification: Optional[str] = None
+    full_suite_clean: Optional[bool] = None
+    baseline_failures: Optional[int] = None
+    new_failures: Optional[int] = None
+    baseline_failing_ids: Optional[List[str]] = None
+    new_failing_ids: Optional[List[str]] = None
 
 
 class ValidationVerdict(BaseModel):
@@ -110,6 +120,12 @@ class State(TypedDict, total=False):
     pruned_subgoals: List[Subgoal]
     replan_history: List[Dict[str, Any]]
     role_provenance: Optional[Dict[str, Dict[str, Any]]]
+    test_classification: Optional[str]
+    full_suite_clean: Optional[bool]
+    baseline_failures: Optional[int]
+    new_failures: Optional[int]
+    baseline_failing_ids: Optional[List[str]]
+    new_failing_ids: Optional[List[str]]
 
 
 
