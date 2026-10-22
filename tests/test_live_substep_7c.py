@@ -5,6 +5,7 @@ import pytest
 run_substep_7c = pytest.importorskip("run_substep_7c")
 
 
+@pytest.mark.live
 def test_live_substep_7c_investigate_to_plan():
     if os.environ.get("SKIP_LIVE_TEST") == "1":
         pytest.skip("Skipping live pipeline test")

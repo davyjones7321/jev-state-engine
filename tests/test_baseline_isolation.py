@@ -455,3 +455,155 @@ def test_k_ledger_writes_verify_populated(tmp_path):
     assert baseline_failures == 3
     assert new_failures == 0
     assert full_suite_clean == 0  # 0 representing boolean False in sqlite INTEGER
+
+
+# =====================================================================
+# Real Temp Git Repo Tests (Real pytest, no mocking, no prefilled cache)
+# =====================================================================
+
+def _create_real_repo_with_legacy_tests(tmp_path: Path) -> tuple[Path, str]:
+    repo_dir = tmp_path / "legacy_test_repo"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init"], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo_dir, check=True, capture_output=True)
+
+    app_py = repo_dir / "app.py"
+    app_py.write_text("def helper():\n    return 42\n", encoding="utf-8")
+
+    test_py = repo_dir / "test_legacy.py"
+    test_py.write_text(
+        "import sys\n"
+        "from pathlib import Path\n"
+        "sys.path.insert(0, str(Path(__file__).resolve().parent))\n"
+        "from app import helper\n\n"
+        "def test_legacy_fail_one():\n"
+        "    assert False, 'legacy failure 1'\n\n"
+        "def test_legacy_fail_two():\n"
+        "    assert False, 'legacy failure 2'\n\n"
+        "def test_passing():\n"
+        "    assert helper() == 42\n",
+        encoding="utf-8",
+    )
+
+    gitignore = repo_dir / ".gitignore"
+    gitignore.write_text("__pycache__/\n*.pyc\n.pytest_cache/\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "Initial commit with 2 failing and 1 passing test"], cwd=repo_dir, check=True, capture_output=True)
+
+    res = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo_dir, check=True, capture_output=True, text=True)
+    base_commit = res.stdout.strip()
+    return repo_dir, base_commit
+
+
+# 1. repo with 2 failing legacy tests + 1 passing test. Create worktree,
+#    run_baseline_tests, apply a good diff -> regression-free, base=2, new=0
+def test_real_repo_baseline_and_good_diff_regression_free(tmp_path):
+    repo_dir, base_commit = _create_real_repo_with_legacy_tests(tmp_path)
+    ws = Workspace(repo_dir=repo_dir)
+
+    # Create worktree
+    ws.create_subgoal_worktree("sg-good", base_ref=base_commit)
+
+    # Run baseline tests on the base ref in the worktree
+    base_res = ws.run_baseline_tests(base_commit=base_commit)
+    assert base_res["ran"] is True
+    assert base_res["outcome"] == TestOutcome.FAILED.value
+    assert len(base_res["failing_ids"]) == 2
+
+    # Apply a good diff that doesn't break helper
+    ws.stage_file_mutation("app.py", "def helper():\n    return 42\n\ndef new_feature():\n    return 100\n")
+
+    # Mechanical checks
+    subgoal = Subgoal(id="sg-good", description="Add new feature", scope=["app.py"], expects_tests=True)
+    res = ws.run_mechanical_checks(subgoal, base_commit=base_commit)
+
+    # Assert regression-free, base=2, new=0
+    assert res.passed is True
+    assert res.failed_check is None
+    assert res.test_classification == TestOutcome.REGRESSION_FREE_WITH_BASELINE_FAILURES.value
+    assert res.full_suite_clean is False
+    assert res.baseline_failures == 2
+    assert res.new_failures == 0
+
+
+# 2. same, diff breaks the passing test -> REGRESSION_DETECTED, names it
+def test_real_repo_diff_breaks_passing_test_regression_detected(tmp_path):
+    repo_dir, base_commit = _create_real_repo_with_legacy_tests(tmp_path)
+    ws = Workspace(repo_dir=repo_dir)
+
+    # Create worktree
+    ws.create_subgoal_worktree("sg-broken", base_ref=base_commit)
+
+    # Run baseline tests
+    base_res = ws.run_baseline_tests(base_commit=base_commit)
+    assert len(base_res["failing_ids"]) == 2
+
+    # Diff breaks the passing test
+    ws.stage_file_mutation("app.py", "def helper():\n    return 999\n")
+
+    # Mechanical checks
+    subgoal = Subgoal(id="sg-broken", description="Break helper", scope=["app.py"], expects_tests=True)
+    res = ws.run_mechanical_checks(subgoal, base_commit=base_commit)
+
+    # Assert REGRESSION_DETECTED, names it
+    assert res.passed is False
+    assert res.failed_check == "tests"
+    assert res.test_classification == TestOutcome.REGRESSION_DETECTED.value
+    assert res.full_suite_clean is False
+    assert res.new_failures == 1
+    assert any("test_passing" in fid for fid in (res.new_failing_ids or []))
+    assert "test_passing" in res.detail
+
+
+# 3. same, but skip run_baseline_tests (cache miss), diff breaks the
+#    passing test -> must NOT pass (this test fails on current code)
+def test_real_repo_skip_baseline_diff_breaks_fails_closed(tmp_path):
+    repo_dir, base_commit = _create_real_repo_with_legacy_tests(tmp_path)
+    ws = Workspace(repo_dir=repo_dir)
+
+    # Create worktree
+    ws.create_subgoal_worktree("sg-skip-baseline", base_ref=base_commit)
+
+    # Skip run_baseline_tests (cache miss)
+    assert base_commit not in ws._baseline_test_cache
+
+    # Diff breaks the passing test
+    ws.stage_file_mutation("app.py", "def helper():\n    return 999\n")
+
+    # Mechanical checks without pre-filled baseline
+    subgoal = Subgoal(id="sg-skip-baseline", description="Break helper without baseline", scope=["app.py"], expects_tests=True)
+    res = ws.run_mechanical_checks(subgoal, base_commit=base_commit)
+
+    # Must NOT pass; fails closed with "no baseline for <commit>"
+    assert res.passed is False
+    assert res.failed_check == "tests"
+    assert res.test_classification == TestOutcome.REGRESSION_DETECTED.value
+    assert f"no baseline for {base_commit}" in res.detail
+    assert res.full_suite_clean is False
+
+
+# 4. a fresh Workspace object (empty cache) at gate time -> same as 3
+def test_real_repo_fresh_workspace_diff_breaks_fails_closed(tmp_path):
+    repo_dir, base_commit = _create_real_repo_with_legacy_tests(tmp_path)
+    ws = Workspace(repo_dir=repo_dir)
+
+    # Create worktree and apply diff that breaks the passing test
+    wt_path = ws.create_subgoal_worktree("sg-fresh-ws", base_ref=base_commit)
+    ws.stage_file_mutation("app.py", "def helper():\n    return 999\n")
+
+    # A fresh Workspace object (empty cache) at gate time
+    fresh_ws = Workspace(repo_dir=repo_dir)
+    fresh_ws.worktree_dir = wt_path
+    assert len(fresh_ws._baseline_test_cache) == 0
+
+    # Mechanical checks with fresh workspace
+    subgoal = Subgoal(id="sg-fresh-ws", description="Break helper with fresh workspace object", scope=["app.py"], expects_tests=True)
+    res = fresh_ws.run_mechanical_checks(subgoal, base_commit=base_commit)
+
+    # Must NOT pass; same as 3
+    assert res.passed is False
+    assert res.failed_check == "tests"
+    assert res.test_classification == TestOutcome.REGRESSION_DETECTED.value
+    assert f"no baseline for {base_commit}" in res.detail
+    assert res.full_suite_clean is False

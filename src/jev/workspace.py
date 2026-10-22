@@ -3098,11 +3098,6 @@ class Workspace:
         elif should_run_tests and test_outcome in (TestOutcome.PASSED, TestOutcome.FAILED):
             commit_key = str(base_commit).strip() if base_commit else (self._get_head_commit() or "HEAD")
             baseline = self._baseline_test_cache.get(commit_key)
-            if baseline is None and base_commit:
-                try:
-                    baseline = self.run_baseline_tests(base_commit=base_commit, test_policy=test_policy)
-                except Exception:
-                    baseline = None
 
             cand_ids = test_run_details.get("failing_test_ids") if isinstance(test_run_details, dict) else None
             cand_exit = test_run_details.get("exit_code") if isinstance(test_run_details, dict) else None
@@ -3213,9 +3208,8 @@ class Workspace:
                         new_failing_ids = []
             else:
                 if test_outcome == TestOutcome.FAILED or (cand_exit is not None and cand_exit != 0):
-                    output_tail = test_run_details.get("output_tail", "") if isinstance(test_run_details, dict) else ""
-                    tail = output_tail[-4000:] if output_tail else ""
-                    test_detail = f"Unit tests failed.\n{tail}" if tail else "Unit tests failed."
+                    commit_desc = base_commit or commit_key or "unknown"
+                    test_detail = f"no baseline for {commit_desc}"
                     cand_set = set(cand_ids) if cand_ids else set()
                     return MechanicalCheckResult(
                         passed=False,
@@ -3234,7 +3228,7 @@ class Workspace:
                         test_runner_outcome=test_run_details,
                         test_classification=TestOutcome.REGRESSION_DETECTED.value,
                         full_suite_clean=False,
-                        baseline_failures=0,
+                        baseline_failures=None,
                         new_failures=len(cand_set) if cand_set else 1,
                         baseline_failing_ids=[],
                         new_failing_ids=sorted(list(cand_set)) if cand_set else [],
