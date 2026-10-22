@@ -213,7 +213,7 @@ def test_node_investigate_respects_turn_cap():
         for i in range(15)
     ]
     fake_llm = ScriptedChatModel(responses=endless_responses)
-    result_state = node_investigate(state, workspace=ws, llm=fake_llm)
+    result_state = node_investigate(state, workspace=ws, llm=fake_llm, max_investigation_turns=10)
 
     # Must cap at max_turns (10)
     assert len(fake_llm.invocations) <= 10
@@ -319,7 +319,7 @@ def test_node_investigate_turn_cap_does_not_pollute_notes_with_tool_output():
         for i in range(15)
     ]
     fake_llm = ScriptedChatModel(responses=endless_responses)
-    result_state = node_investigate(state, workspace=ws, llm=fake_llm)
+    result_state = node_investigate(state, workspace=ws, llm=fake_llm, max_investigation_turns=10)
 
     # Investigation notes must NOT be raw stdout of list_dir ("fileA.py\nfileB.py")
     assert result_state["investigation_notes"] != "fileA.py\nfileB.py"

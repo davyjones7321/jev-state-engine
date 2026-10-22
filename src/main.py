@@ -20,6 +20,9 @@ import uuid
 from datetime import datetime, timezone
 
 
+DEFAULT_WORKER_MODEL = "gemini-3.5-flash-lite"
+
+
 def generate_default_thread_id() -> str:
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     rnd = uuid.uuid4().hex[:4]
@@ -36,6 +39,25 @@ def positive_int(value: str) -> int:
     return val
 
 
+def non_empty_str(value: str) -> str:
+    if value is None or not value.strip():
+        raise argparse.ArgumentTypeError("Model name cannot be empty or whitespace-only")
+    return value.strip()
+
+
+def resolve_worker_model(cli_model: Optional[str] = None) -> str:
+    if cli_model is not None:
+        if not cli_model.strip():
+            raise argparse.ArgumentTypeError("Model name cannot be empty or whitespace-only")
+        return cli_model.strip()
+    env_model = os.environ.get("JEV_WORKER_MODEL")
+    if env_model is not None:
+        if not env_model.strip():
+            raise argparse.ArgumentTypeError("JEV_WORKER_MODEL cannot be empty or whitespace-only")
+        return env_model.strip()
+    return DEFAULT_WORKER_MODEL
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Jev State Engine: Deterministic State Machine with Two-Tier Gating"
@@ -43,6 +65,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "ticket",
         type=str,
+        nargs="?",
+        default="",
         help="The ticket or task description for the engine to execute",
     )
     parser.add_argument(
@@ -100,9 +124,47 @@ def build_parser() -> argparse.ArgumentParser:
         default="off",
         help="Send dependency delta to Jev as state evidence (on, off; defaults to off).",
     )
+    parser.add_argument(
+        "--model",
+        "--worker-model",
+        dest="model",
+        type=non_empty_str,
+        default=None,
+        help="Worker LLM model name (defaults to JEV_WORKER_MODEL or gemini-3.5-flash-lite).",
+    )
     parser.add_argument("--advisory-base-url", default=None, help="Optional OpenAI-compatible advisory API base URL")
     parser.add_argument("--advisory-model", default=None, help="Optional advisory model name")
     parser.add_argument("--advisory-api-key", default=None, help="Optional advisory API key (never recorded)")
+    parser.add_argument(
+        "--advisory-policy",
+        choices=["off", "on", "required"],
+        default="on",
+        help="Advisory policy for diagnostic assistance on failure (off, on, required; defaults to on).",
+    )
+    parser.add_argument(
+        "--memory-policy",
+        choices=["off", "on"],
+        default="off",
+        help="Episodic in-run memory policy (off, on; defaults to off).",
+    )
+    parser.add_argument(
+        "--replanning-policy",
+        choices=["off", "on"],
+        default="off",
+        help="Dynamic replanning policy on dead ends (off, on; defaults to off).",
+    )
+    parser.add_argument(
+        "--advisor-healthcheck",
+        action="store_true",
+        default=False,
+        help="Perform a one-shot healthcheck against the configured advisory endpoint and exit.",
+    )
+    parser.add_argument(
+        "--env-file",
+        type=str,
+        default=None,
+        help="Path to an explicit environment file containing engine credentials.",
+    )
     return parser
 
 
@@ -111,31 +173,62 @@ def build_advisory_service(base_url: Optional[str], model: Optional[str], api_ke
     if not base_url or not model:
         return None
     try:
-        return AdvisoryService(OpenAICompatibleProvider(base_url, model, api_key=api_key))
+        return AdvisoryService(OpenAICompatibleProvider(base_url, model, api_key=api_key, timeout=20.0))
     except (TypeError, ValueError):
         return None
-
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    # Resolve Engine Root and Environment strictly without cwd/target-repo discovery
+    engine_root = Path(__file__).resolve().parent.parent
+    engine_env = engine_root / ".env"
+    env_file = Path(args.env_file).resolve() if args.env_file else (engine_env if engine_env.exists() else None)
+    parsed_env = dotenv_values(env_file) if env_file and env_file.exists() else {}
+
+    advisory_base_url = args.advisory_base_url or os.environ.get("ADVISORY_BASE_URL") or parsed_env.get("ADVISORY_BASE_URL")
+    advisory_model = args.advisory_model or os.environ.get("ADVISORY_MODEL") or parsed_env.get("ADVISORY_MODEL")
+    advisory_key = args.advisory_api_key or os.environ.get("ADVISORY_API_KEY") or parsed_env.get("ADVISORY_API_KEY")
+
+    if args.advisor_healthcheck:
+        if not advisory_base_url or not advisory_model:
+            print("[ADVISOR HEALTHCHECK] FAILED: Advisory service is not configured (missing base URL or model).", file=sys.stderr)
+            return 1
+        advisory = build_advisory_service(advisory_base_url, advisory_model, advisory_key)
+        if not advisory:
+            print("[ADVISOR HEALTHCHECK] FAILED: Could not initialize advisory service.", file=sys.stderr)
+            return 1
+        res = advisory.request_repair_brief("Healthcheck probe: Return a brief repair brief for a dummy error.")
+        if res.ok:
+            print(f"[ADVISOR HEALTHCHECK] SUCCESS: Advisory model '{res.model}' responded successfully.")
+            return 0
+        else:
+            print(f"[ADVISOR HEALTHCHECK] FAILED: {res.error_code} - {res.error_message}", file=sys.stderr)
+            return 1
+
+    if not args.ticket:
+        parser.error("the following arguments are required: ticket")
+
+    try:
+        model = resolve_worker_model(args.model)
+    except argparse.ArgumentTypeError as e:
+        parser.error(str(e))
+
     repo_dir = Path(args.repo_dir).resolve() if args.repo_dir else Path.cwd().resolve()
 
     # Wire Dependency Injection
     workspace = Workspace(repo_dir=repo_dir, test_timeout=args.test_timeout)
-    engine_env = Path.cwd() / ".env"
-    if not engine_env.exists():
-        engine_env = Path(__file__).resolve().parent.parent / ".env"
-    env_file = engine_env if engine_env.exists() else ((repo_dir / ".env") if (repo_dir / ".env").exists() else None)
     gatekeeper = Gatekeeper(env_file=env_file)
 
-    parsed_env = dotenv_values(env_file) if env_file and env_file.exists() else {}
-    advisory_base_url = args.advisory_base_url or os.environ.get("ADVISORY_BASE_URL") or parsed_env.get("ADVISORY_BASE_URL")
-    advisory_model = args.advisory_model or os.environ.get("ADVISORY_MODEL") or parsed_env.get("ADVISORY_MODEL")
-    advisory_key = args.advisory_api_key or os.environ.get("ADVISORY_API_KEY") or parsed_env.get("ADVISORY_API_KEY")
-    advisory = build_advisory_service(advisory_base_url, advisory_model, advisory_key)
+    if args.advisory_policy == "off":
+        advisory = None
+    else:
+        advisory = build_advisory_service(advisory_base_url, advisory_model, advisory_key)
+        if args.advisory_policy == "required" and advisory is None:
+            print("[ERROR] Advisory policy is 'required' but advisory service could not be initialized.", file=sys.stderr)
+            return 1
 
     if args.no_ledger:
         recorder = NullRecorder()
@@ -146,10 +239,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"ledger disabled: {e}", file=sys.stderr, flush=True)
             recorder = NullRecorder()
 
-    # Wire Gemini LLM (gemini-3.5-flash-lite) via langchain-google-genai
+    # Wire Gemini LLM via langchain-google-genai
     google_api_key = os.environ.get("GOOGLE_API_KEY")
     if not google_api_key and env_file and env_file.exists():
-        parsed_env = dotenv_values(env_file)
         google_api_key = parsed_env.get("GOOGLE_API_KEY")
 
     llm = None
@@ -159,12 +251,21 @@ def main(argv: Optional[List[str]] = None) -> int:
             from langchain_google_genai import ChatGoogleGenerativeAI
 
             llm = ChatGoogleGenerativeAI(
-                model="gemini-3.5-flash-lite",
+                model=model,
                 google_api_key=google_api_key,
             )
         except Exception as e:
             print(f"[WARNING] Could not initialize ChatGoogleGenerativeAI: {e}")
             llm = None
+
+    replan_enabled = (args.replanning_policy == "on")
+    memory = None
+    if args.memory_policy == "on":
+        try:
+            from jev.memory import EpisodicMemory
+            memory = EpisodicMemory(repo_dir / ".jev_memory.jsonl")
+        except Exception:
+            memory = None
 
     engine = JevEngine(
         workspace=workspace,
@@ -177,8 +278,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         repo_profile=args.repo_profile,
         dep_delta_jev=args.dep_delta_jev,
         advisory=advisory,
+        advisory_policy=args.advisory_policy,
+        replan_enabled=replan_enabled,
+        memory=memory,
     )
-
 
     final_state = engine.execute(ticket=args.ticket, thread_id=args.thread_id)
 
