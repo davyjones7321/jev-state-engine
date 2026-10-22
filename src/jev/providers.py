@@ -12,7 +12,7 @@ class OpenAICompatibleProvider:
     """A minimal adapter for local or remote ``/chat/completions`` endpoints."""
 
     def __init__(self, base_url: str, model: str, *, api_key: Optional[str] = None,
-                 timeout: float = 30.0, client: Optional[httpx.Client] = None):
+                 timeout: float = 20.0, client: Optional[httpx.Client] = None):
         if not base_url or not model:
             raise ValueError("base_url and model are required")
         self.base_url = base_url.rstrip("/")

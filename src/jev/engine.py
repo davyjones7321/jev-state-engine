@@ -60,6 +60,19 @@ MAX_IMPLEMENT_READ_CALLS = 12
 MAX_IMPLEMENT_RETRIEVAL_FILES = 100
 MAX_IMPLEMENT_RETRIEVAL_ITEMS = 200
 SELF_CHECK_TIMEOUT_SECONDS = 5
+
+def is_secret_path(p: Union[str, Path]) -> bool:
+    path_obj = Path(p)
+    name = path_obj.name.lower()
+    parts = [part.lower() for part in path_obj.parts]
+    if any(part in (".aws", ".kube", ".ssh") for part in parts):
+        return True
+    if name.startswith(".env") or name in ("credentials.json", "secrets.json", "id_rsa", "id_dsa", "id_ed25519"):
+        return True
+    if name.endswith((".pem", ".key", ".pfx", ".p12", ".pkcs12")):
+        return True
+    return False
+
 MAX_SELF_CHECK_OUTPUT_CHARS = 4_000
 
 
@@ -1272,6 +1285,8 @@ def node_investigate(
         """
         if not path:
             return "Error: path is required for read_file."
+        if is_secret_path(path):
+            return f"Error: Access denied to protected secret file: {path}"
 
         worktree = getattr(workspace, "worktree_dir", getattr(workspace, "repo_dir", None))
         if worktree:
@@ -2401,6 +2416,8 @@ def node_implement(
             budget_error = _consume_implementation_read_budget("read_file")
             if budget_error:
                 return budget_error
+            if is_secret_path(path):
+                return f"Error: Access denied to protected secret file: {path}"
             target, error = _resolve_implementation_read_path(path, expect_directory=False)
             if target is None:
                 return error

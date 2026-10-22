@@ -98,6 +98,18 @@ class StructureRetriever(Protocol):
 ReadText = Callable[[Path], str]
 
 
+def is_secret_path(path: str | Path) -> bool:
+    name = Path(path).name.lower()
+    parts = [part.lower() for part in Path(path).parts]
+    if any(part in (".aws", ".kube", ".ssh") for part in parts):
+        return True
+    if name.startswith(".env") or name in ("credentials.json", "secrets.json", "id_rsa", "id_dsa", "id_ed25519"):
+        return True
+    if name.endswith((".pem", ".key", ".pfx", ".p12", ".pkcs12")):
+        return True
+    return False
+
+
 class AstWorkspaceRetriever:
     """Read-only AST retriever confined to one worktree."""
 
@@ -177,6 +189,8 @@ class AstWorkspaceRetriever:
             raise PermissionError("path resolves outside worktree") from exc
         if Path(self._root / raw.lstrip("./")).is_symlink():
             raise PermissionError("symlink paths are not allowed")
+        if is_secret_path(candidate):
+            raise PermissionError("access to protected secret files is denied")
         return candidate
 
     @staticmethod

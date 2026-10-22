@@ -541,8 +541,7 @@ def extract_from_ledger(
             resolved_repo_key = m.group(1)
 
     # Open SQLite in read-only URI mode
-    uri_path = db_file.resolve().as_posix()
-    ro_uri = f"file:{uri_path}?mode=ro"
+    ro_uri = f"{db_file.resolve().as_uri()}?mode=ro"
 
     conn = sqlite3.connect(ro_uri, uri=True)
     conn.row_factory = sqlite3.Row

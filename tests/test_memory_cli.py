@@ -84,6 +84,10 @@ def repo_and_ledger(tmp_path, isolated_env):
         diff="diff --git a/src/app.py b/src/app.py\n+good_line = 1",
     )
 
+    # Ensure WAL is fully checkpointed so on-disk ledger.db represents complete state
+    with ledger._get_connection() as conn:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+
     return repo_dir, repo_key, ledger_db, base_commit
 
 

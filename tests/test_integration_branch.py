@@ -181,6 +181,8 @@ def test_subgoal_escalation_preserves_integration_branch_and_untouched_main(git_
     gk.validate_subgoal = MagicMock(return_value=ValidationVerdict(valid=False, probability=0.1, reason="Bad logic"))
 
     wt2 = ws.create_subgoal_worktree("sg2", base_ref=int_branch)
+    (wt2 / "src" / "app.py").write_text("def hello():\n    return 'broken2'\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=wt2, check=True, capture_output=True)
     state["current_worktree_path"] = str(wt2)
     state["current_worktree_branch"] = "jev-subgoal-sg2"
 
