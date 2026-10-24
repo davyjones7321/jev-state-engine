@@ -750,11 +750,13 @@ class Workspace:
         repo_dir: Optional[Union[str, Path]] = None,
         worktree_dir: Optional[Union[str, Path]] = None,
         test_timeout: Optional[int] = None,
+        strict_provenance: bool = False,
     ):
         self.repo_dir = Path(repo_dir).resolve() if repo_dir else Path.cwd().resolve()
         self.worktree_dir = (
             Path(worktree_dir).resolve() if worktree_dir else self.repo_dir
         )
+        self.strict_provenance = strict_provenance
         self.base_commit: Optional[str] = self._get_head_commit()
         self.last_test_run: Optional[dict] = None
         self.last_compile_run: Optional[dict] = None
@@ -1063,6 +1065,8 @@ class Workspace:
             if res.returncode != 0:
                 res = self._run_git(["diff", "--cached", "--"] + list(self.worker_staged_paths))
             return res.stdout
+        if self.strict_provenance:
+            return ""
         res = self._run_git(["diff", "HEAD"])
         if res.returncode != 0:
             res = self._run_git(["diff", "--cached"])
@@ -1077,6 +1081,8 @@ class Workspace:
                 if res.returncode == 0 and res.stdout.strip():
                     return res.stdout
             return self.get_staged_diff()
+        if self.strict_provenance:
+            return ""
         if ref:
             res = self._run_git(["diff", ref])
             if res.returncode == 0 and res.stdout.strip():
@@ -1241,6 +1247,8 @@ class Workspace:
             self._run_git(["add", "--"] + list(self.worker_staged_paths))
             self._run_git(["commit", "-m", message])
         else:
+            if self.strict_provenance:
+                return
             self._run_git(["commit", "-m", message])
 
     def rollback_subgoal(self) -> None:
@@ -1401,31 +1409,36 @@ class Workspace:
             if self.worker_staged_paths:
                 subprocess.run(["git", "add", "--"] + list(self.worker_staged_paths), cwd=wt_path, capture_output=True, text=True, encoding="utf-8", errors="replace")
                 diff_check = subprocess.run(["git", "diff", "--cached", "--"] + list(self.worker_staged_paths), cwd=wt_path, capture_output=True, text=True, encoding="utf-8", errors="replace")
+                if diff_check.stdout.strip():
+                    commit_msg = f"Subgoal committed ({br_name})" if br_name else "Subgoal committed"
+                    subprocess.run(["git", "commit", "-m", commit_msg], cwd=wt_path, capture_output=True, text=True, encoding="utf-8", errors="replace")
             else:
-                subprocess.run(["git", "add", "-A"], cwd=wt_path, capture_output=True, text=True, encoding="utf-8", errors="replace")
-                diff_check = subprocess.run(["git", "diff", "--cached"], cwd=wt_path, capture_output=True, text=True, encoding="utf-8", errors="replace")
-            if diff_check.stdout.strip():
-                commit_msg = f"Subgoal committed ({br_name})" if br_name else "Subgoal committed"
-                subprocess.run(["git", "commit", "-m", commit_msg], cwd=wt_path, capture_output=True, text=True, encoding="utf-8", errors="replace")
+                if not self.strict_provenance:
+                    subprocess.run(["git", "add", "-A"], cwd=wt_path, capture_output=True, text=True, encoding="utf-8", errors="replace")
+                    diff_check = subprocess.run(["git", "diff", "--cached"], cwd=wt_path, capture_output=True, text=True, encoding="utf-8", errors="replace")
+                    if diff_check.stdout.strip():
+                        commit_msg = f"Subgoal committed ({br_name})" if br_name else "Subgoal committed"
+                        subprocess.run(["git", "commit", "-m", commit_msg], cwd=wt_path, capture_output=True, text=True, encoding="utf-8", errors="replace")
 
         self.worktree_dir = self.repo_dir
 
         if br_name:
-            anc_check = self._run_repo_git(["merge-base", "--is-ancestor", target_branch, br_name])
-            if anc_check.returncode != 0:
-                raise RuntimeError(
-                    f"Cannot fast-forward merge {br_name} into {target_branch}: {target_branch} is not an ancestor of {br_name}"
-                )
-            subgoal_sha_res = self._run_repo_git(["rev-parse", br_name])
-            if subgoal_sha_res.returncode != 0:
-                raise RuntimeError(f"Could not resolve commit for subgoal branch {br_name}")
-            subgoal_sha = subgoal_sha_res.stdout.strip()
+            if not (self.strict_provenance and not self.worker_staged_paths):
+                anc_check = self._run_repo_git(["merge-base", "--is-ancestor", target_branch, br_name])
+                if anc_check.returncode != 0:
+                    raise RuntimeError(
+                        f"Cannot fast-forward merge {br_name} into {target_branch}: {target_branch} is not an ancestor of {br_name}"
+                    )
+                subgoal_sha_res = self._run_repo_git(["rev-parse", br_name])
+                if subgoal_sha_res.returncode != 0:
+                    raise RuntimeError(f"Could not resolve commit for subgoal branch {br_name}")
+                subgoal_sha = subgoal_sha_res.stdout.strip()
 
-            update_res = self._run_repo_git(["update-ref", f"refs/heads/{target_branch}", subgoal_sha])
-            if update_res.returncode != 0:
-                raise RuntimeError(
-                    f"Failed to fast-forward merge {br_name} into {target_branch}: {update_res.stderr or update_res.stdout}"
-                )
+                update_res = self._run_repo_git(["update-ref", f"refs/heads/{target_branch}", subgoal_sha])
+                if update_res.returncode != 0:
+                    raise RuntimeError(
+                        f"Failed to fast-forward merge {br_name} into {target_branch}: {update_res.stderr or update_res.stdout}"
+                    )
 
         if wt_path:
             self._unlink_node_modules(wt_path)

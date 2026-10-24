@@ -11,6 +11,7 @@ from jev.mech_evidence import (
     MechanicalEvidence,
     MechReason,
     MechStatus,
+    TargetConfidence,
 )
 from jev.ledger import NullRecorder, SqliteLedger
 
@@ -151,7 +152,7 @@ def test_round_trip_pass_fail_and_all_unmeasured_reasons(tmp_path):
             command_identity={"cmd": "pytest", "args": ["-q"]},
             target_scope={"kind": "file", "paths": ["src/app.py"], "new_target": False},
             target_rule="rule_1",
-            target_confidence=0.95,
+            target_confidence=TargetConfidence.EXACT,
             runner_profile_id="pytest",
             registry_version="1.0.0",
             language="python",

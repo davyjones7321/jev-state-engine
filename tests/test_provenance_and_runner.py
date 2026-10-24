@@ -361,3 +361,122 @@ def test_run_test_subprocess_raises_runtime_error_on_timeout(tmp_path):
     cmd = [sys.executable, "-c", "import time; time.sleep(10)"]
     with pytest.raises(RuntimeError, match="timed out after 1 seconds"):
         _run_test_subprocess(cmd, cwd=tmp_path, timeout=1)
+
+
+# ---------------------------------------------------------------------------
+# 11. Strict Provenance vs Non-Strict: Untracked artifact and modified lockfile
+# ---------------------------------------------------------------------------
+
+def test_strict_provenance_worker_stages_nothing_modified_lockfile_and_artifact(tmp_path):
+    from jev.models import Subgoal
+
+    repo_dir = _create_git_repo(tmp_path / "repo")
+    (repo_dir / "package-lock.json").write_text('{"name": "test", "version": "1.0.0"}\n', encoding="utf-8")
+    (repo_dir / "src").mkdir(exist_ok=True)
+    (repo_dir / "src" / "index.js").write_text("console.log('hello');\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "Add lockfile and index"], cwd=repo_dir, check=True, capture_output=True)
+    initial_sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo_dir, capture_output=True, text=True, check=True).stdout.strip()
+    original_lockfile = (repo_dir / "package-lock.json").read_text(encoding="utf-8")
+    target_br = subprocess.run(["git", "branch", "--show-current"], cwd=repo_dir, capture_output=True, text=True, check=True).stdout.strip()
+
+    # -------------------------------------------------------------
+    # 1. STRICT MODE (strict_provenance=True)
+    # -------------------------------------------------------------
+    ws_strict = Workspace(repo_dir=repo_dir, strict_provenance=True)
+    ws_strict.create_subgoal_worktree(subgoal_id="strict-1")
+
+    # Worker stages nothing
+    assert len(ws_strict.worker_staged_paths) == 0
+
+    # A command rewrites a tracked lockfile and drops an untracked artifact
+    (ws_strict.worktree_dir / "package-lock.json").write_text('{"name": "test", "version": "2.0.0", "dirty": true}\n', encoding="utf-8")
+    artifact_strict = ws_strict.worktree_dir / "dist" / "generated.artifact"
+    artifact_strict.parent.mkdir(parents=True, exist_ok=True)
+    artifact_strict.write_text("generated binary strict\n", encoding="utf-8")
+
+    # Strict mode: diff is empty
+    staged_diff_strict = ws_strict.get_staged_diff()
+    assert staged_diff_strict == ""
+    cum_diff_strict = ws_strict.get_cumulative_diff()
+    assert cum_diff_strict == ""
+
+    # Strict mode: check_scope sees no touched files
+    subgoal = Subgoal(id="strict-1", description="do nothing", scope=["src/index.js"])
+    scope_res_strict = ws_strict.check_scope(diff=None, scope=subgoal.scope)
+    assert scope_res_strict.passed is True
+    assert scope_res_strict.out_of_scope == []
+    assert ws_strict._extract_files_from_diff(staged_diff_strict) == set()
+
+    # Mechanical checks: artifact is discarded and lockfile is reverted
+    ws_strict.run_mechanical_checks(subgoal)
+    assert not artifact_strict.exists()
+    assert (ws_strict.worktree_dir / "package-lock.json").read_text(encoding="utf-8") == original_lockfile
+
+    # Nothing commits
+    ws_strict.commit_subgoal("Strict commit should not happen")
+    cur_head_strict = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ws_strict.worktree_dir, capture_output=True, text=True, check=True).stdout.strip()
+    assert cur_head_strict == initial_sha
+
+    # merge_subgoal_worktree does not merge anything to target_branch
+    ws_strict.merge_subgoal_worktree(target_branch=target_br)
+    main_sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo_dir, capture_output=True, text=True, check=True).stdout.strip()
+    assert main_sha == initial_sha
+
+    # -------------------------------------------------------------
+    # 2. NON-STRICT MODE (strict_provenance=False) keeps old result
+    # -------------------------------------------------------------
+    ws_non_strict = Workspace(repo_dir=repo_dir, strict_provenance=False)
+    ws_non_strict.create_subgoal_worktree(subgoal_id="non-strict-1")
+
+    # Worker stages nothing
+    assert len(ws_non_strict.worker_staged_paths) == 0
+
+    # A command rewrites a tracked lockfile and drops an untracked artifact
+    (ws_non_strict.worktree_dir / "package-lock.json").write_text('{"name": "test", "version": "3.0.0", "dirty": true}\n', encoding="utf-8")
+    artifact_ns = ws_non_strict.worktree_dir / "dist" / "generated_ns.artifact"
+    artifact_ns.parent.mkdir(parents=True, exist_ok=True)
+    artifact_ns.write_text("generated binary non-strict\n", encoding="utf-8")
+
+    # Non-strict mode: diff is NOT empty (sees the modified lockfile)
+    staged_diff_ns = ws_non_strict.get_staged_diff()
+    assert "package-lock.json" in staged_diff_ns
+    assert "version" in staged_diff_ns
+
+    # check_scope sees touched files from diff and fails (package-lock.json is out of scope)
+    scope_res_ns = ws_non_strict.check_scope(diff=None, scope=subgoal.scope)
+    assert scope_res_ns.passed is False
+    assert "package-lock.json" in scope_res_ns.out_of_scope
+
+    # Clean up non-strict worktree
+    ws_non_strict._discard_engine_touched()
+    ws_non_strict.merge_subgoal_worktree(target_branch=target_br)
+
+
+# ---------------------------------------------------------------------------
+# 12. Process Runner: POSIX live descendant count ignores zombies
+# ---------------------------------------------------------------------------
+
+def test_count_live_posix_descendants_filters_zombies(tmp_path):
+    from jev.process_runner import _count_live_posix_descendants
+
+    proc_mock = tmp_path / "proc"
+    proc_mock.mkdir(parents=True)
+
+    # When proc is unavailable / empty
+    fake_empty_dir = tmp_path / "empty_proc"
+    assert _count_live_posix_descendants(999999, proc_path=fake_empty_dir) == 0
+
+    # Process 201: state Z (zombie), pgrp 777
+    (proc_mock / "201").mkdir()
+    (proc_mock / "201" / "stat").write_text("201 (dead_child) Z 1 777 777 0 0 0\n", encoding="utf-8")
+
+    # Only zombie exists in pgrp 777 -> count is 0
+    assert _count_live_posix_descendants(777, proc_path=proc_mock) == 0
+
+    # Process 202: state S (sleeping / live), pgrp 777
+    (proc_mock / "202").mkdir()
+    (proc_mock / "202" / "stat").write_text("202 (live_worker) S 1 777 777 0 0 0\n", encoding="utf-8")
+
+    # Now live descendant exists -> count is 1
+    assert _count_live_posix_descendants(777, proc_path=proc_mock) == 1

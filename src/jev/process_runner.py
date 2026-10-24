@@ -88,6 +88,64 @@ class CommandResult:
     stderr: str = ""
 
 
+def _count_live_posix_descendants(pgid: int, proc_path: Optional[Path] = None) -> int:
+    """Count non-zombie processes belonging to pgid.
+
+    Reads /proc/<pid>/stat state != 'Z' for members of the group;
+    if /proc is unavailable, falls back to the killpg result.
+    Never reports 0 when a live descendant exists.
+    """
+    proc_dir = Path(proc_path) if proc_path else Path("/proc")
+    if not proc_dir.is_dir():
+        if hasattr(os, "killpg"):
+            try:
+                os.killpg(pgid, 0)
+                return 1
+            except (ProcessLookupError, OSError):
+                return 0
+        return 0
+
+    live_count = 0
+    checked_any = False
+    try:
+        for entry in os.scandir(proc_dir):
+            if entry.name.isdigit():
+                stat_file = Path(entry.path) / "stat"
+                try:
+                    text = stat_file.read_text(encoding="utf-8", errors="replace")
+                    rparen = text.rfind(")")
+                    if rparen != -1:
+                        rest = text[rparen + 1:].strip().split()
+                        if len(rest) >= 3:
+                            proc_state = rest[0]
+                            proc_pgrp = int(rest[2])
+                            if proc_pgrp == pgid:
+                                checked_any = True
+                                if proc_state != "Z":
+                                    live_count += 1
+                except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError, IndexError):
+                    continue
+    except Exception:
+        if hasattr(os, "killpg"):
+            try:
+                os.killpg(pgid, 0)
+                return 1
+            except (ProcessLookupError, OSError):
+                return 0
+        return 0
+
+    if not checked_any:
+        if hasattr(os, "killpg"):
+            try:
+                os.killpg(pgid, 0)
+                return 1
+            except (ProcessLookupError, OSError):
+                return 0
+        return 0
+
+    return live_count
+
+
 def run_command(
     argv: Union[List[str], str],
     cwd: Optional[Union[str, Path]] = None,
@@ -225,8 +283,16 @@ def run_command(
         else:
             cleanup_method = "process_group"
             try:
-                pgid = os.getpgid(proc.pid)
-                os.killpg(pgid, signal.SIGTERM)
+                try:
+                    pgid = os.getpgid(proc.pid)
+                except (ProcessLookupError, OSError):
+                    pgid = proc.pid
+
+                try:
+                    os.killpg(pgid, signal.SIGTERM)
+                except (ProcessLookupError, OSError):
+                    pass
+
                 grace_deadline = time.perf_counter() + 2.0
                 while time.perf_counter() < grace_deadline:
                     try:
@@ -236,19 +302,41 @@ def run_command(
                         break
                     except Exception:
                         break
+
                 try:
-                    os.killpg(pgid, 0)
                     os.killpg(pgid, signal.SIGKILL)
                 except (ProcessLookupError, OSError):
                     pass
 
+                # Reap the leader first
                 try:
-                    os.killpg(pgid, 0)
-                    descendants_remaining = 1
-                except ProcessLookupError:
+                    proc.wait(timeout=1.0)
+                except Exception:
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=0.5)
+                    except Exception:
+                        pass
+
+                # Poll up to 1s for the group to disappear
+                group_disappeared = False
+                poll_deadline = time.perf_counter() + 1.0
+                while time.perf_counter() < poll_deadline:
+                    try:
+                        os.killpg(pgid, 0)
+                        time.sleep(0.02)
+                    except (ProcessLookupError, OSError):
+                        group_disappeared = True
+                        break
+
+                if group_disappeared:
                     descendants_remaining = 0
-                except OSError:
-                    descendants_remaining = 0
+                else:
+                    try:
+                        os.killpg(pgid, 0)
+                        descendants_remaining = _count_live_posix_descendants(pgid)
+                    except (ProcessLookupError, OSError):
+                        descendants_remaining = 0
             except (ProcessLookupError, OSError):
                 descendants_remaining = 0
 
