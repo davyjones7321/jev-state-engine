@@ -1,4 +1,5 @@
 import ast
+import hashlib
 import json
 import logging
 import os
@@ -17,6 +18,41 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Un
 from pydantic import BaseModel, Field
 
 from jev.models import CompileOutcome, MechanicalCheckResult, Subgoal, TestOutcome
+from jev.process_runner import CommandResult, run_command
+
+PROTECTED_PATHS = (".git/", ".jev/")
+
+
+class PathCollisionError(RuntimeError):
+    """Raised when an engine command modifies or deletes a worker-staged file."""
+    pass
+
+
+class StagedPathsList(list):
+    """List-like container for worker_staged_paths that also indexes by path to return sha256."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._hashes: Dict[str, str] = {}
+
+    def record(self, path: str, sha256_hash: str) -> None:
+        if path not in self:
+            self.append(path)
+        self._hashes[path] = sha256_hash
+
+    def __getitem__(self, item: Any) -> Any:
+        if isinstance(item, str):
+            return self._hashes[item]
+        return super().__getitem__(item)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self._hashes.get(key, default)
+
+    def items(self):
+        return ((p, self._hashes.get(p)) for p in self)
+
+    def clear(self) -> None:
+        super().clear()
+        self._hashes.clear()
 
 logger = logging.getLogger(__name__)
 
@@ -113,56 +149,17 @@ def _run_test_subprocess(
     cwd: Union[str, Path],
     timeout: int,
 ) -> subprocess.CompletedProcess:
-    kwargs: Dict[str, Any] = {
-        "cwd": cwd,
-        "stdout": subprocess.PIPE,
-        "stderr": subprocess.PIPE,
-        "text": True,
-        "encoding": "utf-8",
-        "errors": "replace",
-    }
-    if sys.platform == "win32":
-        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-    else:
-        kwargs["start_new_session"] = True
-
-    proc = subprocess.Popen(cmd, **kwargs)
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-        return subprocess.CompletedProcess(
-            args=cmd,
-            returncode=proc.returncode,
-            stdout=stdout or "",
-            stderr=stderr or "",
-        )
-    except subprocess.TimeoutExpired:
-        if sys.platform == "win32":
-            try:
-                subprocess.run(
-                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                    capture_output=True,
-                    timeout=5,
-                )
-            except Exception:
-                pass
-            try:
-                proc.kill()
-            except Exception:
-                pass
-        else:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except Exception:
-                pass
-            try:
-                proc.kill()
-            except Exception:
-                pass
-        try:
-            stdout, stderr = proc.communicate(timeout=5)
-        except Exception:
-            pass
+    res = run_command(cmd, cwd=cwd, timeout=timeout)
+    if res.timed_out:
         raise RuntimeError(f"Test command timed out after {timeout} seconds and its process tree was terminated")
+    if res.launch_failed:
+        raise FileNotFoundError(f"Command not found: {cmd}")
+    return subprocess.CompletedProcess(
+        args=cmd,
+        returncode=res.exit_code if res.exit_code is not None else -1,
+        stdout=res.stdout,
+        stderr=res.stderr,
+    )
 
 
 
@@ -344,16 +341,12 @@ class BaseCompileHandler:
             resolved = shutil.which(cmd[0])
             if resolved:
                 exec_cmd = [resolved] + cmd[1:]
-        res = subprocess.run(
-            exec_cmd,
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-        )
-        return res.returncode, res.stdout, res.stderr
+        res = run_command(exec_cmd, cwd=cwd, timeout=timeout)
+        if res.timed_out:
+            raise subprocess.TimeoutExpired(cmd=exec_cmd, timeout=timeout or 120)
+        if res.launch_failed:
+            raise FileNotFoundError(f"Command not found: {cmd}")
+        return res.exit_code if res.exit_code is not None else -1, res.stdout, res.stderr
 
 
 class JsTsCompileHandler(BaseCompileHandler):
@@ -766,6 +759,10 @@ class Workspace:
         self.last_test_run: Optional[dict] = None
         self.last_compile_run: Optional[dict] = None
         self._baseline_test_cache: Dict[str, Dict[str, Any]] = {}
+        self.worker_staged_paths = StagedPathsList()
+        self.worker_staged_hashes = self.worker_staged_paths._hashes
+        self.engine_touched_paths: List[str] = []
+        self.collision_paths: List[str] = []
 
         if test_timeout is not None:
             try:
@@ -1018,26 +1015,54 @@ class Workspace:
             return f"Command not found: {cmd}"
 
     def stage_file_mutation(self, path: Union[str, Path], content: str) -> None:
+        import posixpath
         raw_str = str(path).replace("\\", "/").strip()
-        if raw_str.startswith("./"):
-            raw_str = raw_str[2:]
-        if raw_str == "node_modules" or raw_str.startswith("node_modules/"):
+        if Path(path).is_absolute() or raw_str.startswith("/") or re.match(r"^[a-zA-Z]:", raw_str):
+            target_path = self.resolve_in_worktree(path)
+
+        norm_str = posixpath.normpath(raw_str)
+        if norm_str.startswith("./"):
+            norm_str = norm_str[2:]
+
+        if norm_str == "." or norm_str.startswith(".."):
+            raise PermissionError(f"Modifying path with traversal is blocked: '{path}'.")
+
+        for prot in PROTECTED_PATHS:
+            prot_prefix = prot.rstrip("/")
+            if norm_str == prot_prefix or norm_str.startswith(f"{prot_prefix}/"):
+                raise PermissionError(f"Modifying files in {prot} is blocked: '{path}'.")
+
+        if norm_str == "node_modules" or norm_str.startswith("node_modules/"):
             raise PermissionError(f"Modifying files in node_modules is blocked: '{path}'.")
 
-        target_path = self.resolve_in_worktree(path)
+        target_path = self.resolve_in_worktree(norm_str)
         try:
-            target_path.resolve().relative_to((self.repo_dir / "node_modules").resolve())
-            raise PermissionError(f"Modifying files in node_modules is blocked: '{path}'.")
+            rel = target_path.resolve().relative_to(self.worktree_dir.resolve())
+            rel_posix = rel.as_posix()
         except ValueError:
-            pass
+            raise PermissionError(f"Path is outside worktree or traversal rejected: '{path}'.")
+
+        for prot in PROTECTED_PATHS:
+            prot_prefix = prot.rstrip("/")
+            if rel_posix == prot_prefix or rel_posix.startswith(f"{prot_prefix}/"):
+                raise PermissionError(f"Modifying files in {prot} is blocked: '{path}'.")
+
+        if rel_posix == "node_modules" or rel_posix.startswith("node_modules/"):
+            raise PermissionError(f"Modifying files in node_modules is blocked: '{path}'.")
 
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        target_path.write_text(content, encoding="utf-8")
-        rel_to_wt = target_path.relative_to(self.worktree_dir)
-        self._run_git(["add", rel_to_wt.as_posix()])
+        content_bytes = content.encode("utf-8") if isinstance(content, str) else content
+        target_path.write_bytes(content_bytes)
+        sha256_hash = hashlib.sha256(content_bytes).hexdigest()
+        self.worker_staged_paths.record(rel_posix, sha256_hash)
+        self._run_git(["add", rel_posix])
 
     def get_staged_diff(self) -> str:
-        self._run_git(["add", "-A"])
+        if self.worker_staged_paths:
+            res = self._run_git(["diff", "HEAD", "--"] + list(self.worker_staged_paths))
+            if res.returncode != 0:
+                res = self._run_git(["diff", "--cached", "--"] + list(self.worker_staged_paths))
+            return res.stdout
         res = self._run_git(["diff", "HEAD"])
         if res.returncode != 0:
             res = self._run_git(["diff", "--cached"])
@@ -1046,6 +1071,12 @@ class Workspace:
     def get_cumulative_diff(self, base_ref: Optional[str] = None) -> str:
         """Returns the full cumulative diff since workspace initialization or base_ref (both committed and uncommitted)."""
         ref = base_ref or self.base_commit
+        if self.worker_staged_paths:
+            if ref:
+                res = self._run_git(["diff", ref, "--"] + list(self.worker_staged_paths))
+                if res.returncode == 0 and res.stdout.strip():
+                    return res.stdout
+            return self.get_staged_diff()
         if ref:
             res = self._run_git(["diff", ref])
             if res.returncode == 0 and res.stdout.strip():
@@ -1138,9 +1169,79 @@ class Workspace:
 
         return changes
 
+    def _compute_provenance_deltas(self) -> None:
+        if self.worktree_dir == self.repo_dir:
+            return
+        status_res = self._run_git(["status", "--porcelain", "-uall"])
+        if status_res.returncode == 0 and status_res.stdout:
+            for line in status_res.stdout.splitlines():
+                if len(line) < 4:
+                    continue
+                raw_path = line[3:].strip()
+                if raw_path.startswith('"') and raw_path.endswith('"'):
+                    raw_path = raw_path[1:-1]
+                posix_path = Path(raw_path).as_posix()
+                if posix_path not in self.worker_staged_paths:
+                    if posix_path not in self.engine_touched_paths:
+                        self.engine_touched_paths.append(posix_path)
+
+        for staged_path, expected_hash in self.worker_staged_paths.items():
+            fpath = self.worktree_dir / staged_path
+            if not fpath.exists() or not fpath.is_file():
+                if staged_path not in self.collision_paths:
+                    self.collision_paths.append(staged_path)
+            else:
+                try:
+                    curr_hash = hashlib.sha256(fpath.read_bytes()).hexdigest()
+                    if curr_hash != expected_hash:
+                        if staged_path not in self.collision_paths:
+                            self.collision_paths.append(staged_path)
+                except Exception:
+                    if staged_path not in self.collision_paths:
+                        self.collision_paths.append(staged_path)
+
+    def _discard_engine_touched(self) -> None:
+        if not self.engine_touched_paths:
+            return
+        if self.worktree_dir == self.repo_dir:
+            return
+        status_res = self._run_git(["status", "--porcelain", "-uall"])
+        if status_res.returncode != 0 or not status_res.stdout:
+            return
+
+        tracked_to_revert: List[str] = []
+        untracked_to_clean: List[str] = []
+
+        for line in status_res.stdout.splitlines():
+            if len(line) < 4:
+                continue
+            code = line[:2]
+            raw_path = line[3:].strip()
+            if raw_path.startswith('"') and raw_path.endswith('"'):
+                raw_path = raw_path[1:-1]
+            posix_path = Path(raw_path).as_posix()
+            if posix_path in self.engine_touched_paths:
+                if code == "??":
+                    untracked_to_clean.append(posix_path)
+                else:
+                    tracked_to_revert.append(posix_path)
+
+        if tracked_to_revert:
+            self._run_git(["checkout", "--"] + tracked_to_revert)
+        if untracked_to_clean:
+            self._run_git(["clean", "-f", "--"] + untracked_to_clean)
+
     def commit_subgoal(self, message: str = "Subgoal committed") -> None:
-        self._run_git(["add", "-A"])
-        self._run_git(["commit", "-m", message])
+        self._compute_provenance_deltas()
+        if self.collision_paths:
+            raise PathCollisionError(
+                f"Collision detected: worker-staged file(s) modified or deleted by engine: {', '.join(self.collision_paths)}"
+            )
+        if self.worker_staged_paths:
+            self._run_git(["add", "--"] + list(self.worker_staged_paths))
+            self._run_git(["commit", "-m", message])
+        else:
+            self._run_git(["commit", "-m", message])
 
     def rollback_subgoal(self) -> None:
         self._run_git(["reset", "--hard", "HEAD"])
@@ -1270,6 +1371,9 @@ class Workspace:
         self.worktree_dir = worktree_path
         self.current_worktree_path = worktree_path
         self.current_worktree_branch = branch_name
+        self.worker_staged_paths.clear()
+        self.engine_touched_paths = []
+        self.collision_paths = []
         return worktree_path
 
     def merge_subgoal_worktree(
@@ -1289,8 +1393,17 @@ class Workspace:
         br_name = branch_name or getattr(self, "current_worktree_branch", None)
 
         if wt_path and wt_path.exists():
-            subprocess.run(["git", "add", "-A"], cwd=wt_path, capture_output=True, text=True, encoding="utf-8", errors="replace")
-            diff_check = subprocess.run(["git", "diff", "--cached"], cwd=wt_path, capture_output=True, text=True, encoding="utf-8", errors="replace")
+            self._compute_provenance_deltas()
+            if self.collision_paths:
+                raise PathCollisionError(
+                    f"Collision detected: worker-staged file(s) modified or deleted by engine: {', '.join(self.collision_paths)}"
+                )
+            if self.worker_staged_paths:
+                subprocess.run(["git", "add", "--"] + list(self.worker_staged_paths), cwd=wt_path, capture_output=True, text=True, encoding="utf-8", errors="replace")
+                diff_check = subprocess.run(["git", "diff", "--cached", "--"] + list(self.worker_staged_paths), cwd=wt_path, capture_output=True, text=True, encoding="utf-8", errors="replace")
+            else:
+                subprocess.run(["git", "add", "-A"], cwd=wt_path, capture_output=True, text=True, encoding="utf-8", errors="replace")
+                diff_check = subprocess.run(["git", "diff", "--cached"], cwd=wt_path, capture_output=True, text=True, encoding="utf-8", errors="replace")
             if diff_check.stdout.strip():
                 commit_msg = f"Subgoal committed ({br_name})" if br_name else "Subgoal committed"
                 subprocess.run(["git", "commit", "-m", commit_msg], cwd=wt_path, capture_output=True, text=True, encoding="utf-8", errors="replace")
@@ -2872,6 +2985,16 @@ class Workspace:
         self.last_compile_run = record
         return record
 
+    def _finalize_mechanical_result(self, res: MechanicalCheckResult) -> MechanicalCheckResult:
+        self._compute_provenance_deltas()
+        res.checks["provenance"] = {
+            "worker_staged_paths": list(self.worker_staged_paths),
+            "engine_touched_paths": sorted(list(self.engine_touched_paths)),
+            "collision_paths": sorted(list(self.collision_paths)),
+        }
+        self._discard_engine_touched()
+        return res
+
     def run_mechanical_checks(
         self,
         subgoal: Subgoal,
@@ -2885,7 +3008,7 @@ class Workspace:
         # 1. check_build
         build_res = self.check_build(subgoal.scope)
         if not build_res.passed:
-            return MechanicalCheckResult(
+            return self._finalize_mechanical_result(MechanicalCheckResult(
                 passed=False,
                 failed_check="build",
                 detail=build_res.detail,
@@ -2900,13 +3023,13 @@ class Workspace:
                 },
                 compile_outcome=None,
                 test_runner_outcome=None,
-            )
+            ))
 
         # 2. check_suppression
         diff = self.get_staged_diff()
         suppression_res = self.check_suppression(diff=diff)
         if not suppression_res.passed:
-            return MechanicalCheckResult(
+            return self._finalize_mechanical_result(MechanicalCheckResult(
                 passed=False,
                 failed_check="suppression",
                 detail=suppression_res.detail,
@@ -2921,12 +3044,12 @@ class Workspace:
                 },
                 compile_outcome=None,
                 test_runner_outcome=None,
-            )
+            ))
 
         # 3. check_unresolved_imports
         unresolved_res = self.check_unresolved_imports(diff=diff)
         if not unresolved_res.passed:
-            return MechanicalCheckResult(
+            return self._finalize_mechanical_result(MechanicalCheckResult(
                 passed=False,
                 failed_check="unresolved_import",
                 detail=unresolved_res.detail,
@@ -2941,14 +3064,14 @@ class Workspace:
                 },
                 compile_outcome=None,
                 test_runner_outcome=None,
-            )
+            ))
 
         # 4. check_compile
         compile_res = self.check_compile(diff=diff, scope=subgoal.scope, base_commit=base_commit)
         compile_outcome = compile_res.get("outcome")
 
         if compile_outcome == CompileOutcome.FAILED.value:
-            return MechanicalCheckResult(
+            return self._finalize_mechanical_result(MechanicalCheckResult(
                 passed=False,
                 failed_check="compile",
                 detail=compile_res.get("detail", "Compile check failed."),
@@ -2963,9 +3086,9 @@ class Workspace:
                 },
                 compile_outcome=compile_res,
                 test_runner_outcome=None,
-            )
+            ))
         elif compile_outcome == CompileOutcome.NO_COMPILE_COMMAND.value:
-            return MechanicalCheckResult(
+            return self._finalize_mechanical_result(MechanicalCheckResult(
                 passed=False,
                 failed_check="no_compile_command",
                 detail=compile_res.get("detail", "No compile command found."),
@@ -2980,9 +3103,9 @@ class Workspace:
                 },
                 compile_outcome=compile_res,
                 test_runner_outcome=None,
-            )
+            ))
         elif compile_outcome == CompileOutcome.ENV_NOT_READY.value:
-            return MechanicalCheckResult(
+            return self._finalize_mechanical_result(MechanicalCheckResult(
                 passed=False,
                 failed_check="env_not_ready",
                 detail=compile_res.get("detail", "Environment not ready."),
@@ -2997,7 +3120,7 @@ class Workspace:
                 },
                 compile_outcome=compile_res,
                 test_runner_outcome=None,
-            )
+            ))
 
         # 5. run_tests
         should_run_tests = False
@@ -3049,7 +3172,7 @@ class Workspace:
                 if test_run_details
                 else "Test runner executable not found."
             )
-            return MechanicalCheckResult(
+            return self._finalize_mechanical_result(MechanicalCheckResult(
                 passed=False,
                 failed_check="env_not_ready",
                 detail=f"Environment not ready: {err_detail}",
@@ -3066,7 +3189,7 @@ class Workspace:
                 test_runner_outcome=test_run_details,
                 test_classification=TestOutcome.ENV_NOT_READY.value,
                 full_suite_clean=False,
-            )
+            ))
         elif should_run_tests and test_outcome == TestOutcome.NO_TESTS_COLLECTED:
             test_classification = TestOutcome.NO_TESTS_COLLECTED.value
             full_suite_clean = None
@@ -3075,7 +3198,7 @@ class Workspace:
             if subgoal.expects_tests:
                 if not self._is_docs_only_diff(diff):
                     detail_msg = "No tests collected when expects_tests is True and diff contains code changes."
-                    return MechanicalCheckResult(
+                    return self._finalize_mechanical_result(MechanicalCheckResult(
                         passed=False,
                         failed_check="no_tests_collected",
                         detail=detail_msg,
@@ -3094,7 +3217,7 @@ class Workspace:
                         full_suite_clean=False,
                         baseline_failures=0,
                         new_failures=0,
-                    )
+                    ))
         elif should_run_tests and test_outcome in (TestOutcome.PASSED, TestOutcome.FAILED):
             commit_key = str(base_commit).strip() if base_commit else (self._get_head_commit() or "HEAD")
             baseline = self._baseline_test_cache.get(commit_key)
@@ -3112,7 +3235,7 @@ class Workspace:
                 if base_err or base_unp or base_timeout or base_set is None:
                     reason = base_err or ("timed out" if base_timeout else "unparseable test IDs in baseline")
                     detail_msg = f"Baseline run failed ({reason}); failing closed as REGRESSION_DETECTED."
-                    return MechanicalCheckResult(
+                    return self._finalize_mechanical_result(MechanicalCheckResult(
                         passed=False,
                         failed_check="tests",
                         detail=detail_msg,
@@ -3131,12 +3254,12 @@ class Workspace:
                         full_suite_clean=False,
                         baseline_failures=None,
                         new_failures=1,
-                    )
+                    ))
 
                 if test_outcome == TestOutcome.FAILED or (cand_exit is not None and cand_exit != 0):
                     if cand_ids is None:
                         detail_msg = "Test IDs unparseable from failing run; failing closed as REGRESSION_DETECTED."
-                        return MechanicalCheckResult(
+                        return self._finalize_mechanical_result(MechanicalCheckResult(
                             passed=False,
                             failed_check="tests",
                             detail=detail_msg,
@@ -3155,14 +3278,14 @@ class Workspace:
                             full_suite_clean=False,
                             baseline_failures=len(base_set),
                             new_failures=1,
-                        )
+                        ))
 
                     cand_set = set(cand_ids)
                     new_failing_set = cand_set - base_set
                     if len(new_failing_set) > 0:
                         new_list = sorted(list(new_failing_set))
                         detail_msg = f"Regressions detected ({len(new_failing_set)} new failing test(s)): {', '.join(new_list)}"
-                        return MechanicalCheckResult(
+                        return self._finalize_mechanical_result(MechanicalCheckResult(
                             passed=False,
                             failed_check="tests",
                             detail=detail_msg,
@@ -3183,7 +3306,7 @@ class Workspace:
                             new_failures=len(new_failing_set),
                             baseline_failing_ids=sorted(list(base_set)),
                             new_failing_ids=new_list,
-                        )
+                        ))
                     else:
                         test_classification = TestOutcome.REGRESSION_FREE_WITH_BASELINE_FAILURES.value
                         full_suite_clean = False
@@ -3211,7 +3334,7 @@ class Workspace:
                     commit_desc = base_commit or commit_key or "unknown"
                     test_detail = f"no baseline for {commit_desc}"
                     cand_set = set(cand_ids) if cand_ids else set()
-                    return MechanicalCheckResult(
+                    return self._finalize_mechanical_result(MechanicalCheckResult(
                         passed=False,
                         failed_check="tests",
                         detail=test_detail,
@@ -3232,7 +3355,7 @@ class Workspace:
                         new_failures=len(cand_set) if cand_set else 1,
                         baseline_failing_ids=[],
                         new_failing_ids=sorted(list(cand_set)) if cand_set else [],
-                    )
+                    ))
                 else:
                     test_classification = TestOutcome.FULL_SUITE_PASSED.value
                     full_suite_clean = True
@@ -3249,7 +3372,7 @@ class Workspace:
         # 6. check_scope
         scope_res = self.check_scope(diff, subgoal.scope)
         if not scope_res.passed:
-            return MechanicalCheckResult(
+            return self._finalize_mechanical_result(MechanicalCheckResult(
                 passed=False,
                 failed_check="scope",
                 detail=scope_res.detail,
@@ -3270,7 +3393,7 @@ class Workspace:
                 new_failures=new_failures,
                 baseline_failing_ids=baseline_failing_ids,
                 new_failing_ids=new_failing_ids,
-            )
+            ))
 
         untested_flag = (
             f"Untested pass: skipped per test_policy={test_policy}."
@@ -3296,7 +3419,7 @@ class Workspace:
             else:
                 success_detail = "passed"
 
-        return MechanicalCheckResult(
+        return self._finalize_mechanical_result(MechanicalCheckResult(
             passed=True,
             failed_check=None,
             detail=success_detail,
@@ -3317,5 +3440,5 @@ class Workspace:
             new_failures=new_failures,
             baseline_failing_ids=baseline_failing_ids,
             new_failing_ids=new_failing_ids,
-        )
+        ))
 

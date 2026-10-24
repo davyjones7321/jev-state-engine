@@ -18,6 +18,7 @@ from jev.mech_evidence import (
     MechanicalEvidence,
     MechReason,
     MechStatus,
+    TargetConfidence,
 )
 from jev.models import Subgoal
 
@@ -823,7 +824,7 @@ class SqliteLedger:
             m_cmd_identity = json.dumps(mech_evidence.command_identity) if mech_evidence.command_identity is not None else None
             m_target_scope = json.dumps(mech_evidence.target_scope) if mech_evidence.target_scope is not None else None
             m_target_rule = mech_evidence.target_rule
-            m_target_conf = mech_evidence.target_confidence
+            m_target_conf = mech_evidence.target_confidence.value if isinstance(mech_evidence.target_confidence, Enum) else mech_evidence.target_confidence
             m_runner_prof = mech_evidence.runner_profile_id
             m_reg_ver = mech_evidence.registry_version
             m_lang = mech_evidence.language
@@ -999,7 +1000,7 @@ class SqliteLedger:
                 command_identity=_parse_json(row["mech_command_identity_json"]),
                 target_scope=_parse_json(row["mech_target_scope_json"]),
                 target_rule=row["mech_target_rule"],
-                target_confidence=float(row["mech_target_confidence"]) if row["mech_target_confidence"] is not None else None,
+                target_confidence=TargetConfidence(row["mech_target_confidence"]) if row["mech_target_confidence"] else None,
                 runner_profile_id=row["mech_runner_profile_id"],
                 registry_version=row["mech_registry_version"],
                 language=row["mech_language"],

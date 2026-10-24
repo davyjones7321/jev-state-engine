@@ -47,6 +47,13 @@ class Comparison(str, Enum):
     NOT_COMPARED = "NOT_COMPARED"
 
 
+class TargetConfidence(str, Enum):
+    EXACT = "exact"
+    REPOSITORY_DECLARED = "repository_declared"
+    DECLARED_FULL_SUITE = "declared_full_suite"
+    HEURISTIC = "heuristic"
+
+
 class MechanicalEvidence(BaseModel):
     schema_version: int = 1
     mech_status: MechStatus
@@ -57,7 +64,7 @@ class MechanicalEvidence(BaseModel):
     command_identity: Optional[Dict[str, Any]] = None
     target_scope: Optional[Dict[str, Any]] = None
     target_rule: Optional[str] = None
-    target_confidence: Optional[float] = None
+    target_confidence: Optional[TargetConfidence] = None
     runner_profile_id: Optional[str] = None
     registry_version: Optional[str] = None
     language: Optional[str] = None
