@@ -3,6 +3,15 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 
+from jev.mech_evidence import (
+    BaseStatus,
+    Comparison,
+    EvidenceLevel,
+    MechanicalEvidence,
+    MechReason,
+    MechStatus,
+)
+
 
 class TestOutcome(str, Enum):
     __test__ = False
@@ -126,6 +135,3 @@ class State(TypedDict, total=False):
     new_failures: Optional[int]
     baseline_failing_ids: Optional[List[str]]
     new_failing_ids: Optional[List[str]]
-
-
-

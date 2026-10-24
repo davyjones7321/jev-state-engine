@@ -5,14 +5,29 @@ import json
 import os
 import sqlite3
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Protocol, Union
+from typing import Any, Dict, List, Optional, Protocol, Tuple, Union
 
 from jev.evidence import weakest
+from jev.mech_evidence import (
+    BaseStatus,
+    Comparison,
+    EvidenceLevel,
+    MechanicalEvidence,
+    MechReason,
+    MechStatus,
+)
 from jev.models import Subgoal
 
 MAX_EVIDENCE_CHARS = 64_000
+
+
+def _compute_rates(measured: int, eligible: int, total: int) -> Tuple[Optional[float], Optional[float]]:
+    rate_all = (measured / total) if total > 0 else None
+    rate_eligible = (measured / eligible) if eligible > 0 else None
+    return rate_all, rate_eligible
 
 
 def _bounded_text(value: Any, limit: int = MAX_EVIDENCE_CHARS) -> Optional[str]:
@@ -155,7 +170,20 @@ class Recorder(Protocol):
         baseline_failures: Optional[int] = None,
         new_failures: Optional[int] = None,
         full_suite_clean: Optional[bool] = None,
+        mech_evidence: Optional[MechanicalEvidence] = None,
     ) -> None: ...
+
+    def get_attempt_mech_evidence(
+        self,
+        run_id: str,
+        subgoal_id: Optional[str] = None,
+        attempt_no: Optional[int] = None,
+    ) -> Optional[MechanicalEvidence]: ...
+
+    def measured_rate_report(
+        self,
+        since_days: int = 90,
+    ) -> Dict[Tuple[Optional[str], Optional[str]], Dict[str, Any]]: ...
 
     def has_run(self, run_id: str) -> bool: ...
 
@@ -272,8 +300,23 @@ class NullRecorder:
         baseline_failures: Optional[int] = None,
         new_failures: Optional[int] = None,
         full_suite_clean: Optional[bool] = None,
+        mech_evidence: Optional[MechanicalEvidence] = None,
     ) -> None:
         pass
+
+    def get_attempt_mech_evidence(
+        self,
+        run_id: str,
+        subgoal_id: Optional[str] = None,
+        attempt_no: Optional[int] = None,
+    ) -> Optional[MechanicalEvidence]:
+        return None
+
+    def measured_rate_report(
+        self,
+        since_days: int = 90,
+    ) -> Dict[Tuple[Optional[str], Optional[str]], Dict[str, Any]]:
+        return {}
 
     def has_run(self, run_id: str) -> bool:
         return False
@@ -425,6 +468,28 @@ class SqliteLedger:
                    baseline_failures INTEGER,
                    new_failures INTEGER,
                    full_suite_clean INTEGER,
+                   mech_schema_version INTEGER DEFAULT NULL,
+                   mech_status TEXT DEFAULT NULL,
+                   mech_reason TEXT DEFAULT NULL,
+                   mech_evidence_level TEXT DEFAULT NULL,
+                   mech_base_status TEXT DEFAULT NULL,
+                   mech_comparison TEXT DEFAULT NULL,
+                   mech_command_identity_json TEXT DEFAULT NULL,
+                   mech_target_scope_json TEXT DEFAULT NULL,
+                   mech_target_rule TEXT DEFAULT NULL,
+                   mech_target_confidence REAL DEFAULT NULL,
+                   mech_runner_profile_id TEXT DEFAULT NULL,
+                   mech_registry_version TEXT DEFAULT NULL,
+                   mech_language TEXT DEFAULT NULL,
+                   mech_worker_staged_json TEXT DEFAULT NULL,
+                   mech_engine_touched_json TEXT DEFAULT NULL,
+                   mech_test_authorship TEXT DEFAULT NULL,
+                   mech_test_surface_changed INTEGER DEFAULT NULL,
+                   mech_verifier_modified INTEGER DEFAULT NULL,
+                   mech_approval_valid INTEGER DEFAULT NULL,
+                   mech_comparison_valid INTEGER DEFAULT NULL,
+                   mech_mechanically_unverified INTEGER DEFAULT NULL,
+                   mech_verification_inconclusive INTEGER DEFAULT NULL,
                    PRIMARY KEY (run_id, subgoal_id, attempt_no)
                 );
                 """
@@ -439,6 +504,33 @@ class SqliteLedger:
             for name, definition in (("provenance", "TEXT"), ("model_version", "TEXT"), ("retry_number", "INTEGER"), ("evidence_added", "INTEGER"), ("hypothesis_changed", "INTEGER"), ("hypothesis_change", "TEXT"), ("failure_evidence", "TEXT"), ("tool_evidence", "TEXT"), ("read_evidence", "TEXT"), ("self_check_evidence", "TEXT"), ("retry_metadata", "TEXT"), ("baseline_failures", "INTEGER"), ("new_failures", "INTEGER"), ("full_suite_clean", "INTEGER")):
                 if name not in att_cols:
                     conn.execute(f"ALTER TABLE attempts ADD COLUMN {name} {definition} DEFAULT NULL")
+            mech_cols = (
+                ("mech_schema_version", "INTEGER"),
+                ("mech_status", "TEXT"),
+                ("mech_reason", "TEXT"),
+                ("mech_evidence_level", "TEXT"),
+                ("mech_base_status", "TEXT"),
+                ("mech_comparison", "TEXT"),
+                ("mech_command_identity_json", "TEXT"),
+                ("mech_target_scope_json", "TEXT"),
+                ("mech_target_rule", "TEXT"),
+                ("mech_target_confidence", "REAL"),
+                ("mech_runner_profile_id", "TEXT"),
+                ("mech_registry_version", "TEXT"),
+                ("mech_language", "TEXT"),
+                ("mech_worker_staged_json", "TEXT"),
+                ("mech_engine_touched_json", "TEXT"),
+                ("mech_test_authorship", "TEXT"),
+                ("mech_test_surface_changed", "INTEGER"),
+                ("mech_verifier_modified", "INTEGER"),
+                ("mech_approval_valid", "INTEGER"),
+                ("mech_comparison_valid", "INTEGER"),
+                ("mech_mechanically_unverified", "INTEGER"),
+                ("mech_verification_inconclusive", "INTEGER"),
+            )
+            for name, col_type in mech_cols:
+                if name not in att_cols:
+                    conn.execute(f"ALTER TABLE attempts ADD COLUMN {name} {col_type} DEFAULT NULL")
 
     def has_run(self, run_id: str) -> bool:
         with self._get_connection() as conn:
@@ -681,6 +773,7 @@ class SqliteLedger:
         baseline_failures: Optional[int] = None,
         new_failures: Optional[int] = None,
         full_suite_clean: Optional[bool] = None,
+        mech_evidence: Optional[MechanicalEvidence] = None,
     ) -> None:
         now_ts = created_at or datetime.now(timezone.utc).isoformat()
         if not isinstance(jev_state_keys, str):
@@ -696,6 +789,53 @@ class SqliteLedger:
         int_jev_valid = None
         if jev_valid is not None:
             int_jev_valid = 1 if jev_valid else 0
+
+        m_schema_ver = None
+        m_status = None
+        m_reason = None
+        m_ev_level = None
+        m_base_status = None
+        m_comparison = None
+        m_cmd_identity = None
+        m_target_scope = None
+        m_target_rule = None
+        m_target_conf = None
+        m_runner_prof = None
+        m_reg_ver = None
+        m_lang = None
+        m_worker_staged = None
+        m_engine_touched = None
+        m_test_author = None
+        m_test_surface = None
+        m_verifier_mod = None
+        m_approval_valid = None
+        m_comparison_valid = None
+        m_mech_unverified = None
+        m_verif_inconclusive = None
+
+        if mech_evidence is not None:
+            m_schema_ver = mech_evidence.schema_version
+            m_status = mech_evidence.mech_status.value if isinstance(mech_evidence.mech_status, Enum) else mech_evidence.mech_status
+            m_reason = mech_evidence.reason.value if isinstance(mech_evidence.reason, Enum) else mech_evidence.reason
+            m_ev_level = mech_evidence.evidence_level.value if isinstance(mech_evidence.evidence_level, Enum) else mech_evidence.evidence_level
+            m_base_status = mech_evidence.base_status.value if isinstance(mech_evidence.base_status, Enum) else mech_evidence.base_status
+            m_comparison = mech_evidence.comparison.value if isinstance(mech_evidence.comparison, Enum) else mech_evidence.comparison
+            m_cmd_identity = json.dumps(mech_evidence.command_identity) if mech_evidence.command_identity is not None else None
+            m_target_scope = json.dumps(mech_evidence.target_scope) if mech_evidence.target_scope is not None else None
+            m_target_rule = mech_evidence.target_rule
+            m_target_conf = mech_evidence.target_confidence
+            m_runner_prof = mech_evidence.runner_profile_id
+            m_reg_ver = mech_evidence.registry_version
+            m_lang = mech_evidence.language
+            m_worker_staged = json.dumps(mech_evidence.worker_staged_paths) if mech_evidence.worker_staged_paths is not None else None
+            m_engine_touched = json.dumps(mech_evidence.engine_touched_paths) if mech_evidence.engine_touched_paths is not None else None
+            m_test_author = mech_evidence.test_authorship
+            m_test_surface = None if mech_evidence.test_surface_changed is None else (1 if mech_evidence.test_surface_changed else 0)
+            m_verifier_mod = None if mech_evidence.verifier_modified is None else (1 if mech_evidence.verifier_modified else 0)
+            m_approval_valid = None if mech_evidence.approval_valid is None else (1 if mech_evidence.approval_valid else 0)
+            m_comparison_valid = None if mech_evidence.comparison_valid is None else (1 if mech_evidence.comparison_valid else 0)
+            m_mech_unverified = None if mech_evidence.mechanically_unverified is None else (1 if mech_evidence.mechanically_unverified else 0)
+            m_verif_inconclusive = None if mech_evidence.verification_inconclusive is None else (1 if mech_evidence.verification_inconclusive else 0)
 
         with self._get_connection() as conn:
             count = conn.execute(
@@ -716,12 +856,22 @@ class SqliteLedger:
                   evidence_level, dependency_delta, jev_state_keys, provenance, model_version, retry_number,
                   evidence_added, hypothesis_changed, hypothesis_change, failure_evidence, tool_evidence,
                   read_evidence, self_check_evidence, retry_metadata,
-                  baseline_failures, new_failures, full_suite_clean
+                  baseline_failures, new_failures, full_suite_clean,
+                  mech_schema_version, mech_status, mech_reason, mech_evidence_level,
+                  mech_base_status, mech_comparison, mech_command_identity_json,
+                  mech_target_scope_json, mech_target_rule, mech_target_confidence,
+                  mech_runner_profile_id, mech_registry_version, mech_language,
+                  mech_worker_staged_json, mech_engine_touched_json,
+                  mech_test_authorship, mech_test_surface_changed,
+                  mech_verifier_modified, mech_approval_valid, mech_comparison_valid,
+                  mech_mechanically_unverified, mech_verification_inconclusive
                  ) VALUES (
                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                   ?, ?, ?
+                   ?, ?, ?,
+                   ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                   ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                  )
                 """,
                 (
@@ -764,6 +914,28 @@ class SqliteLedger:
                     baseline_failures,
                     new_failures,
                     None if full_suite_clean is None else (1 if full_suite_clean else 0),
+                    m_schema_ver,
+                    m_status,
+                    m_reason,
+                    m_ev_level,
+                    m_base_status,
+                    m_comparison,
+                    m_cmd_identity,
+                    m_target_scope,
+                    m_target_rule,
+                    m_target_conf,
+                    m_runner_prof,
+                    m_reg_ver,
+                    m_lang,
+                    m_worker_staged,
+                    m_engine_touched,
+                    m_test_author,
+                    m_test_surface,
+                    m_verifier_mod,
+                    m_approval_valid,
+                    m_comparison_valid,
+                    m_mech_unverified,
+                    m_verif_inconclusive,
                 ),
             )
 
@@ -782,3 +954,151 @@ class SqliteLedger:
             row = conn.execute("SELECT provenance FROM runs WHERE run_id = ?", (run_id,)).fetchone()
             return row[0] if row else None
 
+
+    def get_attempt_mech_evidence(
+        self,
+        run_id: str,
+        subgoal_id: Optional[str] = None,
+        attempt_no: Optional[int] = None,
+    ) -> Optional[MechanicalEvidence]:
+        with self._get_connection() as conn:
+            conn.row_factory = sqlite3.Row
+            query = "SELECT * FROM attempts WHERE run_id = ?"
+            params: List[Any] = [run_id]
+            if subgoal_id is not None:
+                query += " AND subgoal_id = ?"
+                params.append(subgoal_id)
+            if attempt_no is not None:
+                query += " AND attempt_no = ?"
+                params.append(attempt_no)
+            query += " ORDER BY attempt_no DESC LIMIT 1"
+            row = conn.execute(query, params).fetchone()
+            if not row or row["mech_status"] is None:
+                return None
+
+            def _parse_json(val: Optional[str]) -> Any:
+                if not val:
+                    return None
+                try:
+                    return json.loads(val)
+                except Exception:
+                    return None
+
+            def _to_bool(val: Optional[int]) -> Optional[bool]:
+                if val is None:
+                    return None
+                return bool(val)
+
+            return MechanicalEvidence(
+                schema_version=row["mech_schema_version"] or 1,
+                mech_status=MechStatus(row["mech_status"]),
+                reason=MechReason(row["mech_reason"]) if row["mech_reason"] else None,
+                evidence_level=EvidenceLevel(row["mech_evidence_level"]) if row["mech_evidence_level"] else None,
+                base_status=BaseStatus(row["mech_base_status"]) if row["mech_base_status"] else None,
+                comparison=Comparison(row["mech_comparison"]) if row["mech_comparison"] else None,
+                command_identity=_parse_json(row["mech_command_identity_json"]),
+                target_scope=_parse_json(row["mech_target_scope_json"]),
+                target_rule=row["mech_target_rule"],
+                target_confidence=float(row["mech_target_confidence"]) if row["mech_target_confidence"] is not None else None,
+                runner_profile_id=row["mech_runner_profile_id"],
+                registry_version=row["mech_registry_version"],
+                language=row["mech_language"],
+                worker_staged_paths=_parse_json(row["mech_worker_staged_json"]),
+                engine_touched_paths=_parse_json(row["mech_engine_touched_json"]),
+                test_authorship=row["mech_test_authorship"],
+                test_surface_changed=_to_bool(row["mech_test_surface_changed"]),
+                verifier_modified=_to_bool(row["mech_verifier_modified"]),
+                approval_valid=_to_bool(row["mech_approval_valid"]),
+                comparison_valid=_to_bool(row["mech_comparison_valid"]),
+                mechanically_unverified=_to_bool(row["mech_mechanically_unverified"]),
+                verification_inconclusive=_to_bool(row["mech_verification_inconclusive"]),
+            )
+
+    def measured_rate_report(
+        self,
+        since_days: int = 90,
+    ) -> Dict[Tuple[Optional[str], Optional[str]], Dict[str, Any]]:
+        with self._get_connection() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT
+                    mech_language,
+                    mech_runner_profile_id,
+                    mech_status,
+                    mech_reason,
+                    mech_evidence_level,
+                    created_at
+                FROM attempts
+                WHERE mech_status IS NOT NULL
+                """
+            ).fetchall()
+
+        cutoff_dt = None
+        if since_days is not None and since_days > 0:
+            cutoff_dt = datetime.now(timezone.utc) - timedelta(days=since_days)
+
+        ineligible_reasons = {
+            MechReason.MISSING_TOOL.value,
+            MechReason.NO_COMMAND.value,
+            MechReason.ENVIRONMENT_UNAVAILABLE.value,
+        }
+
+        groups: Dict[Tuple[Optional[str], Optional[str]], Dict[str, Any]] = {}
+
+        for row in rows:
+            created_at_str = row["created_at"]
+            if cutoff_dt and created_at_str:
+                try:
+                    row_dt = datetime.fromisoformat(created_at_str)
+                    if row_dt.tzinfo is None:
+                        row_dt = row_dt.replace(tzinfo=timezone.utc)
+                    if row_dt < cutoff_dt:
+                        continue
+                except Exception:
+                    pass
+
+            key = (row["mech_language"], row["mech_runner_profile_id"])
+            if key not in groups:
+                groups[key] = {
+                    "attempts_all": 0,
+                    "measured": 0,
+                    "unmeasured": 0,
+                    "attempts_eligible": 0,
+                    "exit_only_pass_count": 0,
+                }
+
+            g = groups[key]
+            g["attempts_all"] += 1
+
+            status = row["mech_status"]
+            reason = row["mech_reason"]
+            ev_level = row["mech_evidence_level"]
+
+            if status in (MechStatus.PASS.value, MechStatus.FAIL.value):
+                g["measured"] += 1
+            elif status == MechStatus.UNMEASURED.value:
+                g["unmeasured"] += 1
+
+            if reason not in ineligible_reasons:
+                g["attempts_eligible"] += 1
+
+            if ev_level == EvidenceLevel.EXIT_ONLY.value and status == MechStatus.PASS.value:
+                g["exit_only_pass_count"] += 1
+
+        report: Dict[Tuple[Optional[str], Optional[str]], Dict[str, Any]] = {}
+        for key, g in groups.items():
+            rate_all, rate_eligible = _compute_rates(
+                g["measured"], g["attempts_eligible"], g["attempts_all"]
+            )
+            report[key] = {
+                "attempts_all": g["attempts_all"],
+                "measured": g["measured"],
+                "unmeasured": g["unmeasured"],
+                "attempts_eligible": g["attempts_eligible"],
+                "measured_rate_all": rate_all,
+                "measured_rate_eligible": rate_eligible,
+                "exit_only_pass_count": g["exit_only_pass_count"],
+            }
+
+        return report
