@@ -78,6 +78,7 @@ class MechanicalEvidence(BaseModel):
     mechanically_unverified: Optional[bool] = None
     verification_inconclusive: Optional[bool] = None
     full_suite_verified: bool = False
+    attribution_note: Optional[str] = None
 
     @model_validator(mode="after")
     def validate_invariants(self) -> MechanicalEvidence:

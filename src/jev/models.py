@@ -63,6 +63,7 @@ class MechanicalCheckResult(BaseModel):
     new_failures: Optional[int] = None
     baseline_failing_ids: Optional[List[str]] = None
     new_failing_ids: Optional[List[str]] = None
+    mech_evidence: Optional[Any] = None
 
 
 class ValidationVerdict(BaseModel):

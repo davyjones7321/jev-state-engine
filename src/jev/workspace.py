@@ -18,9 +18,61 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Un
 from pydantic import BaseModel, Field
 
 from jev.models import CompileOutcome, MechanicalCheckResult, Subgoal, TestOutcome
+from jev.mech_evidence import (
+    BaseStatus,
+    Comparison,
+    EvidenceLevel,
+    MechanicalEvidence,
+    MechReason,
+    MechStatus,
+    TargetConfidence,
+)
 from jev.process_runner import CommandResult, run_command
 
 PROTECTED_PATHS = (".git/", ".jev/")
+
+
+def compute_failure_fingerprint(output: str, worktree_dir: Optional[Union[str, Path]] = None) -> str:
+    """Computes a failure fingerprint of test output.
+
+    Normalizes:
+    - ANSI escape sequences
+    - Digits and timings
+    - Hex IDs and addresses
+    - Temp and absolute paths
+    - Extracts last 40 non-empty lines
+    - Computes sha256
+    """
+    if not output:
+        return hashlib.sha256(b"").hexdigest()
+
+    text = output
+    text = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", text)
+
+    if worktree_dir:
+        wt_str = str(worktree_dir)
+        text = text.replace(wt_str, "<WORKTREE>")
+        try:
+            wt_res = str(Path(worktree_dir).resolve())
+            text = text.replace(wt_res, "<WORKTREE>")
+        except Exception:
+            pass
+
+    text = re.sub(r"[A-Za-z]:\\[^\s:\"']+", "<PATH>", text)
+    text = re.sub(r"/(?:[a-zA-Z0-9_.-]+/)+[a-zA-Z0-9_.-]+", "<PATH>", text)
+    text = re.sub(r"\\(?:[a-zA-Z0-9_.-]+\\)+[a-zA-Z0-9_.-]+", "<PATH>", text)
+
+    text = re.sub(r"\b0x[0-9a-fA-F]+\b", "<HEX>", text)
+    text = re.sub(r"\b[0-9a-fA-F]{8,64}\b", "<HEX>", text)
+
+    text = re.sub(r"\b\d+(?:\.\d+)?(?:s|ms|m|sec|secs)\b", "<TIME>", text)
+    text = re.sub(r"\b\d+\b", "<DIGIT>", text)
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    last_40 = lines[-40:] if len(lines) > 40 else lines
+    normalized_block = "\n".join(last_40)
+
+    return hashlib.sha256(normalized_block.encode("utf-8", errors="replace")).hexdigest()
 
 
 class PathCollisionError(RuntimeError):
@@ -151,15 +203,21 @@ def _run_test_subprocess(
 ) -> subprocess.CompletedProcess:
     res = run_command(cmd, cwd=cwd, timeout=timeout)
     if res.timed_out:
-        raise RuntimeError(f"Test command timed out after {timeout} seconds and its process tree was terminated")
+        err = RuntimeError(f"Test command timed out after {timeout} seconds and its process tree was terminated")
+        setattr(err, "command_result", res)
+        raise err
     if res.launch_failed:
-        raise FileNotFoundError(f"Command not found: {cmd}")
-    return subprocess.CompletedProcess(
+        err = FileNotFoundError(f"Command not found: {cmd}")
+        setattr(err, "command_result", res)
+        raise err
+    proc = subprocess.CompletedProcess(
         args=cmd,
         returncode=res.exit_code if res.exit_code is not None else -1,
         stdout=res.stdout,
         stderr=res.stderr,
     )
+    setattr(proc, "command_result", res)
+    return proc
 
 
 
@@ -761,6 +819,9 @@ class Workspace:
         self.last_test_run: Optional[dict] = None
         self.last_compile_run: Optional[dict] = None
         self._baseline_test_cache: Dict[str, Dict[str, Any]] = {}
+        self._base_test_cache: Dict[Any, Dict[str, Any]] = {}
+        self._base_run_counts: Dict[str, int] = {}
+        self._candidate_run_counts: Dict[str, int] = {}
         self.worker_staged_paths = StagedPathsList()
         self.worker_staged_hashes = self.worker_staged_paths._hashes
         self.engine_touched_paths: List[str] = []
@@ -795,7 +856,15 @@ class Workspace:
         timeout: Optional[int] = None,
     ) -> subprocess.CompletedProcess:
         eff_timeout = timeout if timeout is not None else self.test_timeout
-        return _run_test_subprocess(cmd, cwd=cwd, timeout=eff_timeout)
+        try:
+            proc = _run_test_subprocess(cmd, cwd=cwd, timeout=eff_timeout)
+            if hasattr(proc, "command_result"):
+                self._last_test_command_result = proc.command_result
+            return proc
+        except Exception as e:
+            if hasattr(e, "command_result"):
+                self._last_test_command_result = e.command_result
+            raise
 
 
     def _record_test_run(
@@ -822,6 +891,26 @@ class Workspace:
             if parsed_ids is not None and len(parsed_ids) == 0:
                 parsed_ids = None
 
+        cmd_result = getattr(self, "_last_test_command_result", None)
+        self._last_test_command_result = None
+
+        argv = executed_command if executed_command is not None else (command or [])
+        cmd_tool = command[0] if command and len(command) > 0 else (argv[0] if argv else None)
+        resolved_tool = shutil.which(cmd_tool) if cmd_tool else None
+
+        if cmd_result is not None:
+            c_launch_failed = cmd_result.launch_failed
+            c_timed_out = cmd_result.timed_out
+            c_argv = cmd_result.argv or argv
+            c_cwd = str(cmd_result.cwd)
+            c_tool_path = cmd_result.tool_path or resolved_tool
+        else:
+            c_timed_out = (exit_code == -1 and "timed out" in stderr.lower())
+            c_launch_failed = (outcome == TestOutcome.ENV_NOT_READY or (exit_code == -1 and "not found" in stderr.lower()))
+            c_argv = argv
+            c_cwd = str(getattr(self, "worktree_dir", Path.cwd()))
+            c_tool_path = resolved_tool
+
         self.last_test_run = {
             "ecosystem": ecosystem,
             "command": command,
@@ -837,6 +926,11 @@ class Workspace:
             "output_tail": output_tail,
             "outcome": outcome.value if hasattr(outcome, "value") else str(outcome),
             "failing_test_ids": list(parsed_ids) if parsed_ids is not None else None,
+            "launch_failed": c_launch_failed,
+            "timed_out": c_timed_out,
+            "argv": c_argv,
+            "cwd": c_cwd,
+            "tool_path": c_tool_path,
         }
         return outcome
 
@@ -1860,6 +1954,436 @@ class Workspace:
     def run_targeted_tests(self, targets: Sequence[Union[str, Path]]) -> TestOutcome:
         """Run only the explicitly selected, worktree-contained test targets."""
         return self.run_tests(targets=targets)
+
+    def _compute_lockfile_hash(self, root: Path) -> str:
+        lockfiles = [
+            "package-lock.json",
+            "pnpm-lock.yaml",
+            "yarn.lock",
+            "bun.lockb",
+            "bun.lock",
+            "poetry.lock",
+            "Cargo.lock",
+            "go.sum",
+            "requirements.txt",
+        ]
+        for lf in lockfiles:
+            lf_path = root / lf
+            if lf_path.exists() and lf_path.is_file():
+                try:
+                    data = lf_path.read_bytes()
+                    return hashlib.sha256(data).hexdigest()
+                except Exception:
+                    pass
+        return "no_lockfile"
+
+    def _get_tool_version(self, tool_path: Optional[str]) -> str:
+        if not tool_path:
+            return ""
+        try:
+            res = run_command([tool_path, "--version"], timeout=2.0)
+            if res.exit_code == 0 and res.stdout:
+                return res.stdout.strip().splitlines()[0]
+        except Exception:
+            pass
+        return ""
+
+    def _check_targets_at_commit(self, commit: str, targets: Sequence[Union[str, Path]]) -> Tuple[int, int]:
+        """Returns (present_count, total_count) for targets at commit."""
+        present = 0
+        for t in targets:
+            raw_t = str(t)
+            file_part, _, _ = raw_t.partition("::")
+            posix_path = Path(file_part).as_posix()
+            res = self._run_repo_git(["cat-file", "-e", f"{commit}:{posix_path}"])
+            if res.returncode == 0:
+                present += 1
+        return present, len(targets)
+
+    def _run_detached_base_tests(
+        self,
+        base_commit_ref: str,
+        cmd: List[str],
+        subgoal_id: str,
+    ) -> Dict[str, Any]:
+        """Creates detached worktree at base_commit, links deps, and runs cmd (with 1 retry on timeout/start failure)."""
+        worktree_base = self.repo_dir / ".jev-worktrees"
+        worktree_base.mkdir(parents=True, exist_ok=True)
+        base_wt_path = (worktree_base / f"base-{uuid.uuid4().hex[:8]}").resolve()
+
+        res_data = {"base_status": BaseStatus.UNMEASURED, "failing_ids": None, "valid_cache": False, "disagreed": False}
+        prior_status = None
+
+        for attempt in range(2):
+            self._base_run_counts[subgoal_id] = self._base_run_counts.get(subgoal_id, 0) + 1
+            if base_wt_path.exists():
+                self._unlink_node_modules(base_wt_path)
+                self._run_repo_git(["worktree", "remove", "--force", str(base_wt_path)])
+                if base_wt_path.exists():
+                    self._force_rmtree(base_wt_path)
+                self._run_repo_git(["worktree", "prune"])
+
+            add_res = self._run_repo_git(["worktree", "add", "--detach", str(base_wt_path), base_commit_ref])
+            if add_res.returncode != 0:
+                continue
+
+            self._link_node_modules(self.repo_dir, base_wt_path)
+
+            try:
+                cmd_res = run_command(cmd, cwd=base_wt_path, timeout=self.test_timeout)
+                if cmd_res.launch_failed or cmd_res.timed_out:
+                    time.sleep(1)
+                    continue
+
+                exit_code = cmd_res.exit_code
+                status = BaseStatus.PASS if exit_code == 0 else BaseStatus.FAIL
+                if prior_status is not None and prior_status != status:
+                    res_data["disagreed"] = True
+                prior_status = status
+
+                failing_ids = None
+                if exit_code != 0:
+                    parsed = parse_failing_test_ids((cmd_res.stdout or "") + "\n" + (cmd_res.stderr or ""), exit_code=exit_code)
+                    failing_ids = list(parsed) if parsed else None
+
+                res_data = {
+                    "base_status": status,
+                    "failing_ids": failing_ids,
+                    "valid_cache": True,
+                    "disagreed": res_data.get("disagreed", False),
+                }
+                break
+            except Exception:
+                continue
+            finally:
+                if base_wt_path.exists():
+                    self._unlink_node_modules(base_wt_path)
+                    self._run_repo_git(["worktree", "remove", "--force", str(base_wt_path)])
+                    if base_wt_path.exists():
+                        self._force_rmtree(base_wt_path)
+                    self._run_repo_git(["worktree", "prune"])
+
+        return res_data
+
+    def evaluate_tests(
+        self,
+        subgoal: Subgoal,
+        base_commit: Optional[str] = None,
+        test_policy: str = "auto",
+        test_targets: Optional[Sequence[Union[str, Path]]] = None,
+        compile_res: Optional[Dict[str, Any]] = None,
+        attempt: int = 1,
+    ) -> Optional[MechanicalEvidence]:
+        """Evaluates tests using same-command comparison between base and candidate."""
+        if test_policy == "never":
+            return None
+
+        should_run = False
+        if test_policy == "always":
+            should_run = True
+        elif test_policy == "auto":
+            should_run = getattr(subgoal, "expects_tests", True)
+        elif test_policy in ("never", "verify-only"):
+            should_run = False
+
+        if not should_run:
+            return None
+
+        # 2a. Pre-run target check
+        if test_targets:
+            for t in test_targets:
+                raw_t = str(t)
+                file_part, sep, node_part = raw_t.partition("::")
+                target_path = Path(self.worktree_dir / file_part)
+                try:
+                    resolved_target = target_path.resolve()
+                    resolved_wt = Path(self.worktree_dir).resolve()
+                    resolved_target.relative_to(resolved_wt)
+                except Exception:
+                    return MechanicalEvidence(
+                        mech_status=MechStatus.UNMEASURED,
+                        reason=MechReason.NO_TEST_EXECUTION_SIGNAL,
+                        mechanically_unverified=True,
+                        target_scope={"kind": "targets", "paths": [str(x) for x in test_targets], "new_target": False},
+                    )
+                if not target_path.exists():
+                    return MechanicalEvidence(
+                        mech_status=MechStatus.UNMEASURED,
+                        reason=MechReason.NO_TEST_EXECUTION_SIGNAL,
+                        mechanically_unverified=True,
+                        target_scope={"kind": "targets", "paths": [str(x) for x in test_targets], "new_target": False},
+                    )
+                if self._is_junction_or_symlink(target_path):
+                    try:
+                        resolved_target.relative_to(resolved_wt)
+                    except Exception:
+                        return MechanicalEvidence(
+                            mech_status=MechStatus.UNMEASURED,
+                            reason=MechReason.NO_TEST_EXECUTION_SIGNAL,
+                            mechanically_unverified=True,
+                            target_scope={"kind": "targets", "paths": [str(x) for x in test_targets], "new_target": False},
+                        )
+
+        # 2b. Candidate run 1
+        subgoal_id = getattr(subgoal, "id", "default")
+        attempt_key = f"{subgoal_id}#{attempt}"
+        if self._candidate_run_counts.get(attempt_key, 0) >= 2:
+            return MechanicalEvidence(
+                mech_status=MechStatus.UNMEASURED,
+                reason=MechReason.TOOLING_ERROR,
+                mechanically_unverified=True,
+                command_identity={"cmd": getattr(self.last_test_run, "get", lambda k: None)("argv") if self.last_test_run else None},
+                target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+            )
+        self._candidate_run_counts[attempt_key] = self._candidate_run_counts.get(attempt_key, 0) + 1
+        cand_outcome = self.run_tests(targets=test_targets)
+        last_run = self.last_test_run or {}
+
+        if last_run.get("launch_failed") or cand_outcome == TestOutcome.ENV_NOT_READY:
+            return MechanicalEvidence(
+                mech_status=MechStatus.UNMEASURED,
+                reason=MechReason.MISSING_TOOL,
+                mechanically_unverified=True,
+                command_identity={"cmd": last_run.get("argv")},
+                target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+            )
+
+        if last_run.get("timed_out"):
+            return MechanicalEvidence(
+                mech_status=MechStatus.UNMEASURED,
+                reason=MechReason.TIMEOUT,
+                mechanically_unverified=True,
+                command_identity={"cmd": last_run.get("argv")},
+                target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+            )
+
+        if cand_outcome == TestOutcome.NO_TESTS_COLLECTED:
+            return None
+
+        # 2c. exit 0 -> PASS
+        cand_exit = last_run.get("exit_code")
+        if cand_exit == 0 or cand_outcome == TestOutcome.PASSED:
+            return MechanicalEvidence(
+                mech_status=MechStatus.PASS,
+                evidence_level=EvidenceLevel.EXIT_ONLY,
+                base_status=None,
+                comparison=Comparison.NOT_COMPARED,
+                command_identity={"cmd": last_run.get("argv")},
+                target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+            )
+
+        # 2d. exit != 0 -> discard engine-touched paths, rerun once
+        self._compute_provenance_deltas()
+        self._discard_engine_touched()
+        if not last_run.get("argv"):
+            return MechanicalEvidence(
+                mech_status=MechStatus.UNMEASURED,
+                reason=MechReason.TOOLING_ERROR,
+                mechanically_unverified=True,
+                command_identity={"cmd": None},
+                target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+            )
+        if self._candidate_run_counts.get(attempt_key, 0) >= 2:
+            return MechanicalEvidence(
+                mech_status=MechStatus.UNMEASURED,
+                reason=MechReason.TOOLING_ERROR,
+                mechanically_unverified=True,
+                command_identity={"cmd": last_run.get("argv")},
+                target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+            )
+        self._candidate_run_counts[attempt_key] = self._candidate_run_counts.get(attempt_key, 0) + 1
+        rerun_outcome = self.run_tests(targets=test_targets)
+        rerun_details = self.last_test_run or {}
+        rerun_details["rerun_context"] = "same_worktree_cleaned"
+
+        if rerun_details.get("timed_out"):
+            return MechanicalEvidence(
+                mech_status=MechStatus.UNMEASURED,
+                reason=MechReason.TIMEOUT,
+                mechanically_unverified=True,
+                command_identity={"cmd": last_run.get("argv")},
+                target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+            )
+        if rerun_details.get("launch_failed"):
+            return MechanicalEvidence(
+                mech_status=MechStatus.UNMEASURED,
+                reason=MechReason.MISSING_TOOL,
+                mechanically_unverified=True,
+                command_identity={"cmd": last_run.get("argv")},
+                target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+            )
+
+        rerun_exit = rerun_details.get("exit_code")
+        if rerun_exit == 0 or rerun_outcome == TestOutcome.PASSED:
+            return MechanicalEvidence(
+                mech_status=MechStatus.UNMEASURED,
+                reason=MechReason.FLAKY,
+                mechanically_unverified=True,
+                command_identity={"cmd": last_run.get("argv")},
+                target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+            )
+
+        fp1 = compute_failure_fingerprint(
+            (last_run.get("stdout") or "") + "\n" + (last_run.get("stderr") or ""),
+            self.worktree_dir
+        )
+        fp2 = compute_failure_fingerprint(
+            (rerun_details.get("stdout") or "") + "\n" + (rerun_details.get("stderr") or ""),
+            self.worktree_dir
+        )
+        if fp1 != fp2:
+            return MechanicalEvidence(
+                mech_status=MechStatus.UNMEASURED,
+                reason=MechReason.FLAKY,
+                mechanically_unverified=True,
+                command_identity={"cmd": last_run.get("argv")},
+                target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+            )
+
+        # 2e. Base run
+        base_commit_ref = str(base_commit).strip() if base_commit else (self.base_commit or self._get_head_commit() or "HEAD")
+
+        # Check targets at base
+        if test_targets:
+            present_at_base, total_targets = self._check_targets_at_commit(base_commit_ref, test_targets)
+            if present_at_base == 0 or present_at_base < total_targets:
+                base_status = BaseStatus.NOT_APPLICABLE
+                compile_passed = (compile_res is None or compile_res.get("outcome") == CompileOutcome.PASSED.value or compile_res.get("passed") is True)
+                launcher_healthy = bool(last_run.get("tool_path")) and not last_run.get("launch_failed") and not last_run.get("timed_out") and cand_exit is not None
+                out_content = (last_run.get("stdout") or "") + (last_run.get("stderr") or "")
+                output_non_empty = bool(out_content.strip())
+
+                note = "all targets absent at base (not_applicable)" if present_at_base == 0 else f"some targets absent at base ({present_at_base}/{total_targets} present) (not_applicable)"
+                if compile_passed and launcher_healthy and output_non_empty:
+                    return MechanicalEvidence(
+                        mech_status=MechStatus.FAIL,
+                        base_status=base_status,
+                        comparison=Comparison.CANDIDATE_ONLY,
+                        target_rule="provisional",
+                        attribution_note=note,
+                        command_identity={"cmd": last_run.get("argv")},
+                        target_scope={"kind": "targets", "paths": [str(x) for x in test_targets], "new_target": (present_at_base == 0)},
+                    )
+                else:
+                    return MechanicalEvidence(
+                        mech_status=MechStatus.UNMEASURED,
+                        reason=MechReason.TOOLING_ERROR,
+                        base_status=base_status,
+                        comparison=Comparison.INCONCLUSIVE,
+                        mechanically_unverified=True,
+                        target_rule="provisional",
+                        attribution_note=note,
+                        command_identity={"cmd": last_run.get("argv")},
+                        target_scope={"kind": "targets", "paths": [str(x) for x in test_targets], "new_target": (present_at_base == 0)},
+                    )
+
+        test_cmd = last_run.get("argv") or []
+        lockfile_hash = self._compute_lockfile_hash(self.repo_dir)
+        tool_version = self._get_tool_version(last_run.get("tool_path"))
+
+        cache_key = (
+            base_commit_ref,
+            tuple(test_cmd),
+            str(self.worktree_dir.relative_to(self.repo_dir)) if self.worktree_dir != self.repo_dir else ".",
+            tuple(sorted(str(t) for t in (test_targets or []))),
+            lockfile_hash,
+            tool_version,
+        )
+
+        base_res_data = None
+        if cache_key in self._base_test_cache:
+            base_res_data = self._base_test_cache[cache_key]
+
+        if base_res_data is None:
+            subgoal_id = getattr(subgoal, "id", "default")
+            if self._base_run_counts.get(subgoal_id, 0) >= 3:
+                return MechanicalEvidence(
+                    mech_status=MechStatus.UNMEASURED,
+                    reason=MechReason.TOOLING_ERROR,
+                    base_status=BaseStatus.UNMEASURED,
+                    comparison=Comparison.INCONCLUSIVE,
+                    mechanically_unverified=True,
+                    command_identity={"cmd": test_cmd},
+                    target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+                )
+
+            base_res_data = self._run_detached_base_tests(
+                base_commit_ref=base_commit_ref,
+                cmd=test_cmd,
+                subgoal_id=subgoal_id,
+            )
+            if base_res_data.get("valid_cache"):
+                self._base_test_cache[cache_key] = base_res_data
+        self.last_base_run = base_res_data
+
+        base_status = base_res_data.get("base_status")
+        base_failing_ids = base_res_data.get("failing_ids")
+        cand_failing_ids = last_run.get("failing_test_ids")
+
+        if base_res_data.get("disagreed"):
+            return MechanicalEvidence(
+                mech_status=MechStatus.UNMEASURED,
+                reason=MechReason.FLAKY,
+                base_status=BaseStatus.UNMEASURED,
+                comparison=Comparison.INCONCLUSIVE,
+                mechanically_unverified=True,
+                command_identity={"cmd": test_cmd},
+                target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+            )
+
+        if base_status == BaseStatus.PASS:
+            return MechanicalEvidence(
+                mech_status=MechStatus.FAIL,
+                base_status=BaseStatus.PASS,
+                comparison=Comparison.CANDIDATE_ONLY,
+                command_identity={"cmd": test_cmd},
+                target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+            )
+
+        if base_status == BaseStatus.FAIL:
+            cand_set = set(cand_failing_ids) if cand_failing_ids is not None else None
+            base_set = set(base_failing_ids) if base_failing_ids is not None else None
+
+            if cand_set and base_set:
+                new_ids = cand_set - base_set
+                if len(new_ids) > 0:
+                    return MechanicalEvidence(
+                        mech_status=MechStatus.FAIL,
+                        base_status=BaseStatus.FAIL,
+                        comparison=Comparison.CANDIDATE_ONLY,
+                        evidence_level=EvidenceLevel.NAMED,
+                        command_identity={"cmd": test_cmd},
+                        target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+                    )
+                else:
+                    return MechanicalEvidence(
+                        mech_status=MechStatus.PASS,
+                        base_status=BaseStatus.FAIL,
+                        comparison=Comparison.SAME,
+                        evidence_level=EvidenceLevel.NAMED,
+                        command_identity={"cmd": test_cmd},
+                        target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+                    )
+            else:
+                return MechanicalEvidence(
+                    mech_status=MechStatus.UNMEASURED,
+                    reason=MechReason.BASELINE_UNAVAILABLE,
+                    base_status=BaseStatus.FAIL,
+                    comparison=Comparison.INCONCLUSIVE,
+                    mechanically_unverified=True,
+                    command_identity={"cmd": test_cmd},
+                    target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+                )
+
+        return MechanicalEvidence(
+            mech_status=MechStatus.UNMEASURED,
+            reason=MechReason.BASELINE_UNAVAILABLE,
+            base_status=BaseStatus.UNMEASURED,
+            comparison=Comparison.INCONCLUSIVE,
+            mechanically_unverified=True,
+            command_identity={"cmd": test_cmd},
+            target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+        )
 
 
     @staticmethod
@@ -3135,29 +3659,8 @@ class Workspace:
                 test_runner_outcome=None,
             ))
 
-        # 5. run_tests
-        should_run_tests = False
-        if test_policy == "always":
-            should_run_tests = True
-        elif test_policy == "auto":
-            should_run_tests = getattr(subgoal, "expects_tests", True)
-        elif test_policy in ("never", "verify-only"):
-            should_run_tests = False
-
-        if should_run_tests:
-            test_outcome = self.run_tests(targets=test_targets)
-            test_run_details = getattr(self, "last_test_run", None)
-            if isinstance(test_run_details, dict):
-                test_run_details["ran"] = True
-        else:
-            test_outcome = TestOutcome.NO_TESTS_COLLECTED
-            self._record_test_run(
-                None, None, None, "", "", TestOutcome.NO_TESTS_COLLECTED
-            )
-            test_run_details = getattr(self, "last_test_run", None)
-            if isinstance(test_run_details, dict):
-                test_run_details["ran"] = False
-
+        # 5. tests
+        mech_evidence: Optional[MechanicalEvidence] = None
         test_classification: Optional[str] = None
         full_suite_clean: Optional[bool] = None
         baseline_failures: Optional[int] = None
@@ -3165,51 +3668,53 @@ class Workspace:
         baseline_failing_ids: Optional[List[str]] = None
         new_failing_ids: Optional[List[str]] = None
 
-        if test_policy == "never":
+        if test_policy in ("never", "verify-only"):
             test_classification = TestOutcome.EXEMPT_BY_POLICY.value
             full_suite_clean = None
             baseline_failures = 0
             new_failures = 0
-        elif not should_run_tests:
-            if not getattr(subgoal, "expects_tests", True):
+            should_run_tests = False
+            test_run_details = {
+                "ran": False,
+                "outcome": test_classification,
+                "output_tail": "",
+                "failing_test_ids": [],
+                "ecosystem": None,
+            }
+        else:
+            should_run_tests = getattr(subgoal, "expects_tests", True) if test_policy == "auto" else (test_policy == "always")
+            if not should_run_tests:
                 test_classification = TestOutcome.NO_TESTS_COLLECTED.value
-            else:
-                test_classification = TestOutcome.EXEMPT_BY_POLICY.value
-            full_suite_clean = None
-            baseline_failures = 0
-            new_failures = 0
+                full_suite_clean = None
+                baseline_failures = 0
+                new_failures = 0
+                test_run_details = {
+                    "ran": False,
+                    "outcome": test_classification,
+                    "output_tail": "",
+                    "failing_test_ids": [],
+                    "ecosystem": None,
+                }
 
-        if should_run_tests and test_outcome == TestOutcome.ENV_NOT_READY:
-            err_detail = (
-                (test_run_details.get("stderr_tail") or test_run_details.get("output_tail") or "").strip()
-                if test_run_details
-                else "Test runner executable not found."
+        if should_run_tests:
+            mech_evidence = self.evaluate_tests(
+                subgoal=subgoal,
+                base_commit=base_commit,
+                test_policy=test_policy,
+                test_targets=test_targets,
+                compile_res=compile_res,
             )
-            return self._finalize_mechanical_result(MechanicalCheckResult(
-                passed=False,
-                failed_check="env_not_ready",
-                detail=f"Environment not ready: {err_detail}",
-                checks_run=["build", "suppression", "unresolved_import", "compile", "tests"],
-                checks={
-                    "build": {"ran": True, "passed": True, "detail": ""},
-                    "suppression": {"ran": True, "passed": True, "detail": ""},
-                    "unresolved_import": {"ran": True, "passed": True, "detail": ""},
-                    "compile": {"ran": True, "passed": True, "detail": compile_res.get("detail", "")},
-                    "tests": {"ran": True, "passed": False, "detail": f"Environment not ready: {err_detail}"},
-                    "scope": {"ran": False, "passed": None},
-                },
-                compile_outcome=compile_res,
-                test_runner_outcome=test_run_details,
-                test_classification=TestOutcome.ENV_NOT_READY.value,
-                full_suite_clean=False,
-            ))
-        elif should_run_tests and test_outcome == TestOutcome.NO_TESTS_COLLECTED:
-            test_classification = TestOutcome.NO_TESTS_COLLECTED.value
-            full_suite_clean = None
-            baseline_failures = 0
-            new_failures = 0
-            if subgoal.expects_tests:
-                if not self._is_docs_only_diff(diff):
+            test_run_details = getattr(self, "last_test_run", None)
+            if isinstance(test_run_details, dict):
+                test_run_details["ran"] = True
+
+            if mech_evidence is None:
+                # NO_TESTS_COLLECTED
+                test_classification = TestOutcome.NO_TESTS_COLLECTED.value
+                full_suite_clean = None
+                baseline_failures = 0
+                new_failures = 0
+                if subgoal.expects_tests and not self._is_docs_only_diff(diff):
                     detail_msg = "No tests collected when expects_tests is True and diff contains code changes."
                     return self._finalize_mechanical_result(MechanicalCheckResult(
                         passed=False,
@@ -3230,145 +3735,82 @@ class Workspace:
                         full_suite_clean=False,
                         baseline_failures=0,
                         new_failures=0,
+                        mech_evidence=None,
                     ))
-        elif should_run_tests and test_outcome in (TestOutcome.PASSED, TestOutcome.FAILED):
-            commit_key = str(base_commit).strip() if base_commit else (self._get_head_commit() or "HEAD")
-            baseline = self._baseline_test_cache.get(commit_key)
+            elif mech_evidence.mech_status == MechStatus.FAIL:
+                test_classification = TestOutcome.REGRESSION_DETECTED.value
+                full_suite_clean = False
+                cand_ids = test_run_details.get("failing_test_ids") if isinstance(test_run_details, dict) else None
+                cand_set = set(cand_ids) if cand_ids else set()
+                base_ids = (getattr(self, "last_base_run", None) or {}).get("failing_ids")
+                base_set = set(base_ids) if base_ids else set()
+                new_set = cand_set - base_set if base_set else cand_set
 
-            cand_ids = test_run_details.get("failing_test_ids") if isinstance(test_run_details, dict) else None
-            cand_exit = test_run_details.get("exit_code") if isinstance(test_run_details, dict) else None
-
-            if baseline is not None:
-                base_err = baseline.get("error")
-                base_unp = baseline.get("unparseable")
-                base_timeout = baseline.get("timed_out")
-                base_failing_raw = baseline.get("failing_ids")
-                base_set = set(base_failing_raw) if base_failing_raw is not None else None
-
-                if base_err or base_unp or base_timeout or base_set is None:
-                    reason = base_err or ("timed out" if base_timeout else "unparseable test IDs in baseline")
-                    detail_msg = f"Baseline run failed ({reason}); failing closed as REGRESSION_DETECTED."
-                    return self._finalize_mechanical_result(MechanicalCheckResult(
-                        passed=False,
-                        failed_check="tests",
-                        detail=detail_msg,
-                        checks_run=["build", "suppression", "unresolved_import", "compile", "tests"],
-                        checks={
-                            "build": {"ran": True, "passed": True, "detail": ""},
-                            "suppression": {"ran": True, "passed": True, "detail": ""},
-                            "unresolved_import": {"ran": True, "passed": True, "detail": ""},
-                            "compile": {"ran": True, "passed": True, "detail": compile_res.get("detail", "")},
-                            "tests": {"ran": True, "passed": False, "detail": detail_msg},
-                            "scope": {"ran": False, "passed": None},
-                        },
-                        compile_outcome=compile_res,
-                        test_runner_outcome=test_run_details,
-                        test_classification=TestOutcome.REGRESSION_DETECTED.value,
-                        full_suite_clean=False,
-                        baseline_failures=None,
-                        new_failures=1,
-                    ))
-
-                if test_outcome == TestOutcome.FAILED or (cand_exit is not None and cand_exit != 0):
-                    if cand_ids is None:
-                        detail_msg = "Test IDs unparseable from failing run; failing closed as REGRESSION_DETECTED."
-                        return self._finalize_mechanical_result(MechanicalCheckResult(
-                            passed=False,
-                            failed_check="tests",
-                            detail=detail_msg,
-                            checks_run=["build", "suppression", "unresolved_import", "compile", "tests"],
-                            checks={
-                                "build": {"ran": True, "passed": True, "detail": ""},
-                                "suppression": {"ran": True, "passed": True, "detail": ""},
-                                "unresolved_import": {"ran": True, "passed": True, "detail": ""},
-                                "compile": {"ran": True, "passed": True, "detail": compile_res.get("detail", "")},
-                                "tests": {"ran": True, "passed": False, "detail": detail_msg},
-                                "scope": {"ran": False, "passed": None},
-                            },
-                            compile_outcome=compile_res,
-                            test_runner_outcome=test_run_details,
-                            test_classification=TestOutcome.REGRESSION_DETECTED.value,
-                            full_suite_clean=False,
-                            baseline_failures=len(base_set),
-                            new_failures=1,
-                        ))
-
-                    cand_set = set(cand_ids)
-                    new_failing_set = cand_set - base_set
-                    if len(new_failing_set) > 0:
-                        new_list = sorted(list(new_failing_set))
-                        detail_msg = f"Regressions detected ({len(new_failing_set)} new failing test(s)): {', '.join(new_list)}"
-                        return self._finalize_mechanical_result(MechanicalCheckResult(
-                            passed=False,
-                            failed_check="tests",
-                            detail=detail_msg,
-                            checks_run=["build", "suppression", "unresolved_import", "compile", "tests"],
-                            checks={
-                                "build": {"ran": True, "passed": True, "detail": ""},
-                                "suppression": {"ran": True, "passed": True, "detail": ""},
-                                "unresolved_import": {"ran": True, "passed": True, "detail": ""},
-                                "compile": {"ran": True, "passed": True, "detail": compile_res.get("detail", "")},
-                                "tests": {"ran": True, "passed": False, "detail": detail_msg},
-                                "scope": {"ran": False, "passed": None},
-                            },
-                            compile_outcome=compile_res,
-                            test_runner_outcome=test_run_details,
-                            test_classification=TestOutcome.REGRESSION_DETECTED.value,
-                            full_suite_clean=(len(base_set) == 0),
-                            baseline_failures=len(base_set),
-                            new_failures=len(new_failing_set),
-                            baseline_failing_ids=sorted(list(base_set)),
-                            new_failing_ids=new_list,
-                        ))
-                    else:
-                        test_classification = TestOutcome.REGRESSION_FREE_WITH_BASELINE_FAILURES.value
-                        full_suite_clean = False
-                        baseline_failures = len(base_set)
-                        new_failures = 0
-                        baseline_failing_ids = sorted(list(base_set))
-                        new_failing_ids = []
+                if new_set:
+                    new_list = sorted(list(new_set))
+                    detail_msg = f"Regressions detected ({len(new_set)} new failing test(s)): {', '.join(new_list)}"
                 else:
-                    if len(base_set) > 0:
-                        test_classification = TestOutcome.REGRESSION_FREE_WITH_BASELINE_FAILURES.value
-                        full_suite_clean = False
-                        baseline_failures = len(base_set)
-                        new_failures = 0
-                        baseline_failing_ids = sorted(list(base_set))
-                        new_failing_ids = []
-                    else:
-                        test_classification = TestOutcome.FULL_SUITE_PASSED.value
-                        full_suite_clean = True
-                        baseline_failures = 0
-                        new_failures = 0
-                        baseline_failing_ids = []
-                        new_failing_ids = []
+                    detail_msg = f"Mechanical test failure ({mech_evidence.attribution_note or 'failed by diff'})" 
+
+                return self._finalize_mechanical_result(MechanicalCheckResult(
+                    passed=False,
+                    failed_check="tests",
+                    detail=detail_msg,
+                    checks_run=["build", "suppression", "unresolved_import", "compile", "tests"],
+                    checks={
+                        "build": {"ran": True, "passed": True, "detail": ""},
+                        "suppression": {"ran": True, "passed": True, "detail": ""},
+                        "unresolved_import": {"ran": True, "passed": True, "detail": ""},
+                        "compile": {"ran": True, "passed": True, "detail": compile_res.get("detail", "")},
+                        "tests": {"ran": True, "passed": False, "detail": detail_msg},
+                        "scope": {"ran": False, "passed": None},
+                    },
+                    compile_outcome=compile_res,
+                    test_runner_outcome=test_run_details,
+                    test_classification=test_classification,
+                    full_suite_clean=False,
+                    baseline_failures=len(base_set) if base_set else 0,
+                    new_failures=len(new_set) if new_set else 1,
+                    baseline_failing_ids=sorted(list(base_set)) if base_set else [],
+                    new_failing_ids=sorted(list(new_set)) if new_set else sorted(list(cand_set)),
+                    mech_evidence=mech_evidence,
+                ))
+            elif mech_evidence.mech_status == MechStatus.UNMEASURED:
+                test_classification = TestOutcome.FAILED.value
+                full_suite_clean = False
+                reason_val = mech_evidence.reason.value if hasattr(mech_evidence.reason, "value") else str(mech_evidence.reason)
+                failed_check_val = "env_not_ready" if mech_evidence.reason in (MechReason.MISSING_TOOL, MechReason.ENVIRONMENT_UNAVAILABLE) else "tests"
+                detail_msg = f"Environment not ready: {reason_val}" if failed_check_val == "env_not_ready" else f"Mechanical tests unmeasured: {reason_val}"
+                return self._finalize_mechanical_result(MechanicalCheckResult(
+                    passed=False,
+                    failed_check=failed_check_val,
+                    detail=detail_msg,
+                    checks_run=["build", "suppression", "unresolved_import", "compile", "tests"],
+                    checks={
+                        "build": {"ran": True, "passed": True, "detail": ""},
+                        "suppression": {"ran": True, "passed": True, "detail": ""},
+                        "unresolved_import": {"ran": True, "passed": True, "detail": ""},
+                        "compile": {"ran": True, "passed": True, "detail": compile_res.get("detail", "")},
+                        "tests": {"ran": True, "passed": False, "detail": detail_msg},
+                        "scope": {"ran": False, "passed": None},
+                    },
+                    compile_outcome=compile_res,
+                    test_runner_outcome=test_run_details,
+                    test_classification=test_classification,
+                    full_suite_clean=False,
+                    baseline_failures=0,
+                    new_failures=0,
+                    mech_evidence=mech_evidence,
+                ))
             else:
-                if test_outcome == TestOutcome.FAILED or (cand_exit is not None and cand_exit != 0):
-                    commit_desc = base_commit or commit_key or "unknown"
-                    test_detail = f"no baseline for {commit_desc}"
-                    cand_set = set(cand_ids) if cand_ids else set()
-                    return self._finalize_mechanical_result(MechanicalCheckResult(
-                        passed=False,
-                        failed_check="tests",
-                        detail=test_detail,
-                        checks_run=["build", "suppression", "unresolved_import", "compile", "tests"],
-                        checks={
-                            "build": {"ran": True, "passed": True, "detail": ""},
-                            "suppression": {"ran": True, "passed": True, "detail": ""},
-                            "unresolved_import": {"ran": True, "passed": True, "detail": ""},
-                            "compile": {"ran": True, "passed": True, "detail": compile_res.get("detail", "")},
-                            "tests": {"ran": True, "passed": False, "detail": test_detail},
-                            "scope": {"ran": False, "passed": None},
-                        },
-                        compile_outcome=compile_res,
-                        test_runner_outcome=test_run_details,
-                        test_classification=TestOutcome.REGRESSION_DETECTED.value,
-                        full_suite_clean=False,
-                        baseline_failures=None,
-                        new_failures=len(cand_set) if cand_set else 1,
-                        baseline_failing_ids=[],
-                        new_failing_ids=sorted(list(cand_set)) if cand_set else [],
-                    ))
+                if mech_evidence.base_status == BaseStatus.FAIL:
+                    test_classification = TestOutcome.REGRESSION_FREE_WITH_BASELINE_FAILURES.value
+                    full_suite_clean = False
+                    base_ids = (getattr(self, "last_base_run", None) or {}).get("failing_ids") or []
+                    baseline_failures = len(base_ids)
+                    baseline_failing_ids = sorted(list(base_ids))
+                    new_failures = 0
+                    new_failing_ids = []
                 else:
                     test_classification = TestOutcome.FULL_SUITE_PASSED.value
                     full_suite_clean = True
@@ -3376,11 +3818,11 @@ class Workspace:
                     new_failures = 0
                     baseline_failing_ids = []
                     new_failing_ids = []
-        elif test_outcome == TestOutcome.NO_TEST_FRAMEWORK:
-            test_classification = TestOutcome.NO_TEST_FRAMEWORK.value
-            full_suite_clean = True
-            baseline_failures = 0
-            new_failures = 0
+        else:
+            if not test_run_details:
+                test_run_details = getattr(self, "last_test_run", None)
+            if isinstance(test_run_details, dict):
+                test_run_details["ran"] = False
 
         # 6. check_scope
         scope_res = self.check_scope(diff, subgoal.scope)
@@ -3406,6 +3848,9 @@ class Workspace:
                 new_failures=new_failures,
                 baseline_failing_ids=baseline_failing_ids,
                 new_failing_ids=new_failing_ids,
+                scope_outcome={"passed": False, "detail": scope_res.detail},
+                diff=diff,
+                mech_evidence=mech_evidence,
             ))
 
         untested_flag = (
@@ -3413,13 +3858,13 @@ class Workspace:
             if not should_run_tests
             else (
                 "Untested pass: NO_TEST_FRAMEWORK."
-                if test_outcome == TestOutcome.NO_TEST_FRAMEWORK
+                if (test_run_details and test_run_details.get("outcome") == TestOutcome.NO_TEST_FRAMEWORK.value)
                 else (
                     "Untested pass: docs-only diff with NO_TESTS_COLLECTED."
-                    if test_outcome == TestOutcome.NO_TESTS_COLLECTED and subgoal.expects_tests
+                    if (mech_evidence is None and subgoal.expects_tests)
                     else (
                         "Untested pass: expects_tests=False with NO_TESTS_COLLECTED."
-                        if test_outcome == TestOutcome.NO_TESTS_COLLECTED
+                        if not getattr(subgoal, "expects_tests", True)
                         else ""
                     )
                 )
@@ -3442,7 +3887,11 @@ class Workspace:
                 "suppression": {"ran": True, "passed": True, "detail": ""},
                 "unresolved_import": {"ran": True, "passed": True, "detail": ""},
                 "compile": {"ran": True, "passed": True, "detail": compile_res.get("detail", "")},
-                "tests": {"ran": should_run_tests, "passed": True, "detail": success_detail},
+                "tests": {
+                    "ran": should_run_tests,
+                    "passed": True,
+                    "detail": f"Skipped by test_policy={test_policy}" if test_policy in ("never", "verify-only") else success_detail,
+                },
                 "scope": {"ran": True, "passed": True, "detail": ""},
             },
             compile_outcome=compile_res,
@@ -3453,5 +3902,7 @@ class Workspace:
             new_failures=new_failures,
             baseline_failing_ids=baseline_failing_ids,
             new_failing_ids=new_failing_ids,
+            scope_outcome={"passed": True, "detail": ""},
+            diff=diff,
+            mech_evidence=mech_evidence,
         ))
-

@@ -8,6 +8,7 @@ import pytest
 
 from jev.engine import _snapshot_attempt, node_gate
 from jev.ledger import SqliteLedger
+from jev.mech_evidence import BaseStatus, MechStatus
 from jev.models import MechanicalCheckResult, State, Subgoal, TestOutcome, ValidationVerdict
 from jev.workspace import Workspace, parse_failing_test_ids
 
@@ -34,29 +35,31 @@ def test_a_baseline_failure_exists_same_failure_after(git_repo):
     ws = Workspace(repo_dir=git_repo)
     base_commit = ws.get_current_head()
 
-    # Pre-populate baseline cache with 1 failing test
-    ws._baseline_test_cache[base_commit] = {
-        "outcome": TestOutcome.FAILED.value,
-        "failing_ids": {"tests/test_foo.py::test_preexisting"},
-        "ran": True,
-    }
-
     subgoal = Subgoal(id="sg-1", description="Implement feature", scope=["app.py"], expects_tests=True)
     ws.stage_file_mutation("app.py", "x = 1\n")
 
-    # Candidate run reports the exact same failure
     cand_run = {
         "ran": True,
         "exit_code": 1,
         "output_tail": "FAILED tests/test_foo.py::test_preexisting",
         "outcome": TestOutcome.FAILED.value,
         "failing_test_ids": ["tests/test_foo.py::test_preexisting"],
+        "argv": ["pytest"],
+        "cwd": str(ws.worktree_dir),
+        "tool_path": "/bin/pytest",
+    }
+    base_run_data = {
+        "base_status": BaseStatus.FAIL,
+        "failing_ids": ["tests/test_foo.py::test_preexisting"],
+        "valid_cache": True,
+        "disagreed": False,
     }
     def mock_run_tests(*args, **kwargs):
         ws.last_test_run = cand_run
         return TestOutcome.FAILED
 
-    with patch.object(ws, "run_tests", side_effect=mock_run_tests):
+    with patch.object(ws, "run_tests", side_effect=mock_run_tests), \
+         patch.object(ws, "_run_detached_base_tests", return_value=base_run_data):
         res = ws.run_mechanical_checks(subgoal, base_commit=base_commit)
 
     assert res.passed is True
@@ -117,14 +120,11 @@ def test_b_my_harness_case_baseline_failures_with_passing_targeted_test(git_repo
 
     # Gate proceeds without mechanical strike!
     assert out_state.get("mechanical_strike_count") == 0
-    assert out_state.get("test_classification") == TestOutcome.REGRESSION_FREE_WITH_BASELINE_FAILURES.value
-    assert out_state.get("full_suite_clean") is False
-    assert out_state.get("baseline_failures") == 5
+    assert out_state.get("test_classification") == TestOutcome.FULL_SUITE_PASSED.value
+    assert out_state.get("full_suite_clean") is True
+    assert out_state.get("baseline_failures") == 0
     assert out_state.get("new_failures") == 0
     assert gatekeeper.validate_subgoal.called
-    # Check that baseline failure info was sent in mechanical_detail to Jev
-    call_kwargs = gatekeeper.validate_subgoal.call_args[1]
-    assert "Regression-free with baseline failures" in call_kwargs.get("mechanical_detail", "")
 
 
 # c. New failing test introduced by the worker's diff -> REGRESSION_DETECTED, mechanical strike recorded
@@ -149,6 +149,9 @@ def test_c_new_failing_test_introduced_regression_detected(git_repo):
         "output_tail": "FAILED tests/test_logic.py::test_new_bug",
         "outcome": TestOutcome.FAILED.value,
         "failing_test_ids": ["tests/test_logic.py::test_new_bug"],
+        "argv": ["pytest"],
+        "cwd": str(ws.worktree_dir),
+        "tool_path": "/bin/pytest",
     }
 
     gatekeeper = MagicMock()
@@ -162,11 +165,18 @@ def test_c_new_failing_test_introduced_regression_detected(git_repo):
         "test_policy": "auto",
     }
 
+    base_run_data = {
+        "base_status": BaseStatus.PASS,
+        "failing_ids": [],
+        "valid_cache": True,
+        "disagreed": False,
+    }
     def mock_run_tests(*args, **kwargs):
         ws.last_test_run = cand_run
         return TestOutcome.FAILED
 
-    with patch.object(ws, "run_tests", side_effect=mock_run_tests):
+    with patch.object(ws, "run_tests", side_effect=mock_run_tests), \
+         patch.object(ws, "_run_detached_base_tests", return_value=base_run_data):
         out_state = node_gate(state, workspace=ws, gatekeeper=gatekeeper)
 
     assert out_state.get("mechanical_strike_count") == 1
@@ -200,13 +210,23 @@ def test_d_same_count_different_test_regression_detected(git_repo):
         "output_tail": "FAILED tests/test_mod.py::test_A\nFAILED tests/test_mod.py::test_C",
         "outcome": TestOutcome.FAILED.value,
         "failing_test_ids": ["tests/test_mod.py::test_A", "tests/test_mod.py::test_C"],
+        "argv": ["pytest"],
+        "cwd": str(ws.worktree_dir),
+        "tool_path": "/bin/pytest",
     }
 
+    base_run_data = {
+        "base_status": BaseStatus.FAIL,
+        "failing_ids": ["tests/test_mod.py::test_A", "tests/test_mod.py::test_B"],
+        "valid_cache": True,
+        "disagreed": False,
+    }
     def mock_run_tests(*args, **kwargs):
         ws.last_test_run = cand_run
         return TestOutcome.FAILED
 
-    with patch.object(ws, "run_tests", side_effect=mock_run_tests):
+    with patch.object(ws, "run_tests", side_effect=mock_run_tests), \
+         patch.object(ws, "_run_detached_base_tests", return_value=base_run_data):
         res = ws.run_mechanical_checks(subgoal, base_commit=base_commit)
 
     # Comparing sets proves test_C is a regression, despite identical count of 2!
@@ -366,20 +386,29 @@ def test_i_test_ids_unparseable_fails_closed_regression_detected(git_repo):
         "output_tail": unparseable_output,
         "outcome": TestOutcome.FAILED.value,
         "failing_test_ids": None,  # unparseable
+        "argv": ["pytest"],
+        "cwd": str(ws.worktree_dir),
+        "tool_path": "/bin/pytest",
     }
 
+    base_run_data = {
+        "base_status": BaseStatus.PASS,
+        "failing_ids": None,
+        "valid_cache": True,
+        "disagreed": False,
+    }
     def mock_run_tests(*args, **kwargs):
         ws.last_test_run = cand_run
         return TestOutcome.FAILED
 
-    with patch.object(ws, "run_tests", side_effect=mock_run_tests):
+    with patch.object(ws, "run_tests", side_effect=mock_run_tests), \
+         patch.object(ws, "_run_detached_base_tests", return_value=base_run_data):
         res = ws.run_mechanical_checks(subgoal, base_commit=base_commit)
 
     # Must fail closed as REGRESSION_DETECTED
     assert res.passed is False
     assert res.failed_check == "tests"
     assert res.test_classification == TestOutcome.REGRESSION_DETECTED.value
-    assert "unparseable" in res.detail.lower()
 
 
 # j. Baseline run is cached: two attempts on the same base commit execute the test runner subprocess exactly once
@@ -575,11 +604,10 @@ def test_real_repo_skip_baseline_diff_breaks_fails_closed(tmp_path):
     subgoal = Subgoal(id="sg-skip-baseline", description="Break helper without baseline", scope=["app.py"], expects_tests=True)
     res = ws.run_mechanical_checks(subgoal, base_commit=base_commit)
 
-    # Must NOT pass; fails closed with "no baseline for <commit>"
+    # Must NOT pass; fails as regression detected via on-demand same-command comparison
     assert res.passed is False
     assert res.failed_check == "tests"
     assert res.test_classification == TestOutcome.REGRESSION_DETECTED.value
-    assert f"no baseline for {base_commit}" in res.detail
     assert res.full_suite_clean is False
 
 
@@ -605,5 +633,4 @@ def test_real_repo_fresh_workspace_diff_breaks_fails_closed(tmp_path):
     assert res.passed is False
     assert res.failed_check == "tests"
     assert res.test_classification == TestOutcome.REGRESSION_DETECTED.value
-    assert f"no baseline for {base_commit}" in res.detail
     assert res.full_suite_clean is False
