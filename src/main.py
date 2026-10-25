@@ -219,7 +219,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     repo_dir = Path(args.repo_dir).resolve() if args.repo_dir else Path.cwd().resolve()
 
     # Wire Dependency Injection
-    workspace = Workspace(repo_dir=repo_dir, test_timeout=args.test_timeout)
+    workspace = Workspace(repo_dir=repo_dir, test_timeout=args.test_timeout, strict_provenance=True)
     gatekeeper = Gatekeeper(env_file=env_file)
 
     if args.advisory_policy == "off":
@@ -294,6 +294,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     if hasattr(recorder, "get_run_evidence_level"):
         ev_level = recorder.get_run_evidence_level(target_run_id)
     print(format_evidence_summary(ev_level, test_policy=args.test_policy))
+
+    unverified_subgoals = final_state.get("mechanically_unverified_subgoals") or []
+    if len(unverified_subgoals) > 0:
+        ids_str = ", ".join(unverified_subgoals)
+        print(f"Mechanically unverified subgoals: {len(unverified_subgoals)} ({ids_str})")
 
     dep_delta_json = None
     if hasattr(recorder, "get_run_dependency_delta"):

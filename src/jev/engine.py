@@ -36,6 +36,14 @@ from jev.evidence import evidence_level
 from jev.ledger import NullRecorder, Recorder
 from jev.retrieval import AstWorkspaceRetriever, RetrievalLimits
 from jev.replanning import replan_remaining_queue
+from jev.mech_evidence import (
+    BaseStatus,
+    Comparison,
+    EvidenceLevel,
+    MechanicalEvidence,
+    MechReason,
+    MechStatus,
+)
 
 from jev.models import (
     CompileOutcome,
@@ -2243,14 +2251,6 @@ def node_implement(
             wt_path = workspace.create_subgoal_worktree(subgoal_id, base_ref=base_ref)
             state["current_worktree_path"] = str(wt_path)
             state["current_worktree_branch"] = f"jev-subgoal-{subgoal_id}"
-            if hasattr(workspace, "run_baseline_tests") and state.get("test_policy") != "never":
-                try:
-                    workspace.run_baseline_tests(
-                        base_commit=state.get("subgoal_base_commit"),
-                        test_policy=state.get("test_policy", "auto"),
-                    )
-                except Exception as e:
-                    logger.warning(f"Baseline test run failed: {e}")
         elif hasattr(workspace, "worktree_dir") and state.get("current_worktree_path"):
             workspace.worktree_dir = Path(state["current_worktree_path"])
 
@@ -2967,6 +2967,7 @@ def _snapshot_attempt(
     baseline_failures: Optional[int] = None,
     new_failures: Optional[int] = None,
     full_suite_clean: Optional[bool] = None,
+    mech_evidence: Optional[Any] = None,
 ) -> None:
     """Helper to snapshot an attempt row to the ledger."""
     if not recorder:
@@ -3036,6 +3037,16 @@ def _snapshot_attempt(
                 self_check_evidence.append(tool_call)
         break
 
+    mech_ev_obj = None
+    if mech_evidence is not None:
+        if isinstance(mech_evidence, MechanicalEvidence):
+            mech_ev_obj = mech_evidence
+        elif isinstance(mech_evidence, dict):
+            try:
+                mech_ev_obj = MechanicalEvidence(**mech_evidence)
+            except Exception:
+                mech_ev_obj = None
+
     safe_rec.record_attempt(
         run_id=run_id,
         subgoal_id=subgoal_id,
@@ -3072,6 +3083,7 @@ def _snapshot_attempt(
         baseline_failures=baseline_failures,
         new_failures=new_failures,
         full_suite_clean=full_suite_clean,
+        mech_evidence=mech_ev_obj,
     )
 
 
@@ -3458,6 +3470,16 @@ def node_gate(
         tests_ran=tests_ran,
     )
 
+    mech_ev = getattr(mech_result, "mech_evidence", None)
+    is_unmeasured = (
+        mech_result.failed_check == "tests_unmeasured"
+        or (
+            mech_ev is not None
+            and getattr(mech_ev, "mech_status", None) == MechStatus.UNMEASURED
+            and mech_result.failed_check not in ("env_not_ready", "no_compile_command")
+        )
+    )
+
     if not mech_result.passed:
         if mech_result.failed_check in ("no_compile_command", "env_not_ready"):
             state["status"] = "escalated"
@@ -3495,6 +3517,7 @@ def node_gate(
                 feedback_sent=state["last_feedback"],
                 failure_evidence=mechanical_evidence,
                 retry_metadata=retry_progress,
+                mech_evidence=mech_ev,
             )
             _teardown_worktree(state, workspace)
             subgoal.status = "failed"
@@ -3510,6 +3533,7 @@ def node_gate(
                 "compile": compile_telemetry,
                 "test_runner": test_runner_telemetry,
                 "failure_evidence": mechanical_evidence,
+                "mech_evidence": mech_ev.model_dump() if mech_ev and hasattr(mech_ev, "model_dump") else None,
                 "retry_metadata": retry_progress,
                 "jev_request": None,
                 "jev_verdict": None,
@@ -3527,6 +3551,121 @@ def node_gate(
                                 failure_class=mech_result.failed_check, summary=state.get("last_feedback", ""),
                                 diff=diff, subgoal=subgoal)
             return state
+
+        elif is_unmeasured:
+            current_unmeasured_retries = state.get("unmeasured_retry_count", 0) + 1
+            state["unmeasured_retry_count"] = current_unmeasured_retries
+
+            reason_val = "unmeasured"
+            if mech_ev and getattr(mech_ev, "reason", None):
+                reason_val = mech_ev.reason.value if hasattr(mech_ev.reason, "value") else str(mech_ev.reason)
+
+            base_fb = mech_result.detail or "Unit tests could not be measured."
+            output_tail = None
+            if isinstance(test_runner_telemetry, dict):
+                output_tail = test_runner_telemetry.get("output_tail")
+            elif hasattr(mech_result, "test_runner_outcome") and isinstance(mech_result.test_runner_outcome, dict):
+                output_tail = mech_result.test_runner_outcome.get("output_tail")
+            if output_tail:
+                tail_capped = output_tail[-4000:]
+                if tail_capped not in base_fb:
+                    formatted_fb = f"{base_fb}\n\n{tail_capped}"
+                else:
+                    formatted_fb = base_fb
+            else:
+                formatted_fb = base_fb
+
+            state["last_feedback"] = f"Verification could not attribute this failure to your change (reason: {reason_val}). Fix it if it is yours.\n\n{formatted_fb}"
+            advisory_telemetry = _apply_advisory(advisory, mechanical_evidence, state)
+            _teardown_worktree(state, workspace)
+
+            if current_unmeasured_retries >= 3:
+                state["status"] = "escalated"
+                state["gate_status"] = "verification_inconclusive"
+                subgoal.status = "failed"
+                state["current_subgoal"] = subgoal
+                if safe_rec:
+                    safe_rec.record_subgoal_status(run_id, subgoal_id, "failed")
+
+                _snapshot_attempt(
+                    safe_rec,
+                    state,
+                    subgoal_id,
+                    tier="mechanical",
+                    outcome="verification_inconclusive",
+                    failed_check="tests_unmeasured",
+                    diff=diff,
+                    compile_info=compile_telemetry,
+                    tests_ran=tests_ran,
+                    test_outcome=test_runner_telemetry.get("outcome") if isinstance(test_runner_telemetry, dict) else None,
+                    feedback_sent=state["last_feedback"],
+                    failure_evidence=mechanical_evidence,
+                    mech_evidence=mech_ev,
+                )
+
+                state["trajectory"].append({
+                    "node": "gate",
+                    "subgoal": subgoal.model_dump() if hasattr(subgoal, "model_dump") else dict(subgoal),
+                    "gate_status": "verification_inconclusive",
+                    "status": "escalated",
+                    "tier0_result": tier0_telemetry,
+                    "compile": compile_telemetry,
+                    "test_runner": test_runner_telemetry,
+                    "failure_evidence": mechanical_evidence,
+                    "mech_evidence": mech_ev.model_dump() if mech_ev and hasattr(mech_ev, "model_dump") else None,
+                    "retry_metadata": retry_progress,
+                    "jev_request": None,
+                    "jev_verdict": None,
+                    "advisory": advisory_telemetry,
+                })
+
+                _safe_escalate_deadlock(
+                    gatekeeper,
+                    trajectory=state.get("trajectory", []),
+                    triggering_tier="verification",
+                    integration_branch=state.get("integration_branch"),
+                    thread_id=state.get("thread_id"),
+                )
+                _safe_record_memory(memory, state, outcome="verification_inconclusive",
+                                    failure_class="tests_unmeasured", summary=state.get("last_feedback", ""),
+                                    diff=diff, subgoal=subgoal)
+                return state
+            else:
+                state["gate_status"] = "unmeasured"
+                _snapshot_attempt(
+                    safe_rec,
+                    state,
+                    subgoal_id,
+                    tier="mechanical",
+                    outcome="unmeasured",
+                    failed_check="tests_unmeasured",
+                    diff=diff,
+                    compile_info=compile_telemetry,
+                    tests_ran=tests_ran,
+                    test_outcome=test_runner_telemetry.get("outcome") if isinstance(test_runner_telemetry, dict) else None,
+                    feedback_sent=state["last_feedback"],
+                    failure_evidence=mechanical_evidence,
+                    mech_evidence=mech_ev,
+                )
+
+                state["trajectory"].append({
+                    "node": "gate",
+                    "subgoal": subgoal.model_dump() if hasattr(subgoal, "model_dump") else dict(subgoal),
+                    "gate_status": "unmeasured",
+                    "tier0_result": tier0_telemetry,
+                    "compile": compile_telemetry,
+                    "test_runner": test_runner_telemetry,
+                    "failure_evidence": mechanical_evidence,
+                    "mech_evidence": mech_ev.model_dump() if mech_ev and hasattr(mech_ev, "model_dump") else None,
+                    "retry_metadata": retry_progress,
+                    "jev_request": None,
+                    "jev_verdict": None,
+                    "advisory": advisory_telemetry,
+                })
+                _safe_record_memory(memory, state, outcome="unmeasured",
+                                    failure_class="tests_unmeasured", summary=state.get("last_feedback", ""),
+                                    diff=diff, subgoal=subgoal)
+                return state
 
         current_mech_strikes = state.get("mechanical_strike_count", 0) + 1
         state["mechanical_strike_count"] = current_mech_strikes
@@ -3590,6 +3729,7 @@ def node_gate(
             test_outcome=test_runner_telemetry.get("outcome") if isinstance(test_runner_telemetry, dict) else None,
             feedback_sent=state.get("last_feedback"),
             failure_evidence=mechanical_evidence,
+            mech_evidence=mech_ev,
         )
         _teardown_worktree(state, workspace)
 
@@ -3601,6 +3741,7 @@ def node_gate(
             "compile": compile_telemetry,
             "test_runner": test_runner_telemetry,
             "failure_evidence": mechanical_evidence,
+            "mech_evidence": mech_ev.model_dump() if mech_ev and hasattr(mech_ev, "model_dump") else None,
             "retry_metadata": retry_progress,
             "jev_request": None,
             "jev_verdict": None,
@@ -3675,6 +3816,41 @@ def node_gate(
 
     if test_policy == "never":
         mechanical_detail = "tests_excluded_by_policy=true"
+    elif mech_ev is not None:
+        m_status = mech_ev.mech_status.value if hasattr(mech_ev.mech_status, "value") else str(mech_ev.mech_status)
+        m_ev_level = mech_ev.evidence_level.value if hasattr(mech_ev.evidence_level, "value") else str(mech_ev.evidence_level)
+        m_unverified = mech_ev.mechanically_unverified
+        m_comp = mech_ev.comparison.value if hasattr(mech_ev.comparison, "value") else (str(mech_ev.comparison) if mech_ev.comparison else "none")
+        m_base = mech_ev.base_status.value if hasattr(mech_ev.base_status, "value") else (str(mech_ev.base_status) if mech_ev.base_status else "none")
+        m_target_mode = "targeted" if targeted_run else "untargeted"
+        m_tests_ran = tests_ran
+
+        standard_block = (
+            f"Mechanical Evidence:\n"
+            f"- mechanical_status: {m_status}\n"
+            f"- evidence_level: {m_ev_level}\n"
+            f"- mechanically_unverified: {m_unverified}\n"
+            f"- comparison/base_status: {m_comp}/{m_base}\n"
+            f"- target_mode: {m_target_mode}\n"
+            f"- tests_ran: {m_tests_ran}"
+        )
+        if m_ev_level == "exit_only":
+            standard_block += "\n- note: not a full-suite verification"
+
+        if classification == "REGRESSION_FREE_WITH_BASELINE_FAILURES":
+            base_desc = f"Regression-free with baseline failures (baseline_failures={baseline_failures}, new_failures=0)."
+            mechanical_detail = f"{standard_block}\n{base_desc}\n{mech_result.detail}".strip()
+        elif m_ev_level == "exit_only":
+            detail_text = (mech_result.detail or "").replace("FULL_SUITE_PASSED", "PASSED_EXIT_ONLY")
+            detail_text = re.sub(r"\bfull suite\b", "suite", detail_text, flags=re.IGNORECASE)
+            mechanical_detail = f"{standard_block}\n{detail_text}".strip()
+        elif tests_ran or subgoal.expects_tests or test_policy == "verify-only":
+            mechanical_detail = (
+                f"{standard_block}\n{mech_result.detail}\nTest evidence: "
+                f"{json.dumps(test_runner_telemetry, sort_keys=True)}"
+            ).strip()
+        else:
+            mechanical_detail = f"{standard_block}\n{mech_result.detail}".strip()
     elif classification == "REGRESSION_FREE_WITH_BASELINE_FAILURES":
         base_desc = f"Regression-free with baseline failures (baseline_failures={baseline_failures}, new_failures=0)."
         mechanical_detail = (
@@ -3851,6 +4027,7 @@ def node_gate(
         state["current_worktree_branch"] = None
         state["mechanical_strike_count"] = 0
         state["semantic_strike_count"] = 0
+        state["unmeasured_retry_count"] = 0
         if "failed_attempts" in state or retry_intel != "off":
             state["failed_attempts"] = []
         state["gate_status"] = "passed"
@@ -3858,6 +4035,17 @@ def node_gate(
         subgoal.status = "committed"
         state["current_subgoal"] = subgoal
         state["committed_subgoals"] = list(state.get("committed_subgoals", [])) + [subgoal.model_copy(deep=True)]
+
+        is_unv = False
+        if mech_ev is not None:
+            is_unv = bool(getattr(mech_ev, "mechanically_unverified", False))
+        elif ev_level in ("exit_only", "none"):
+            is_unv = True
+        if is_unv and getattr(subgoal, "id", None):
+            curr_unv = list(state.get("mechanically_unverified_subgoals") or [])
+            if subgoal.id not in curr_unv:
+                curr_unv.append(subgoal.id)
+            state["mechanically_unverified_subgoals"] = curr_unv
 
         _snapshot_attempt(
             safe_rec,
@@ -3873,6 +4061,7 @@ def node_gate(
             evidence_level=ev_level,
             dependency_delta=attempt_dep_delta,
             jev_state_keys=jev_keys,
+            mech_evidence=mech_ev,
         )
         if safe_rec:
             safe_rec.record_subgoal_committed(run_id, subgoal_id, parent_sha=parent_sha, commit_sha=commit_sha)
@@ -3884,6 +4073,7 @@ def node_gate(
             "tier0_result": tier0_telemetry,
             "compile": compile_telemetry,
             "test_runner": test_runner_telemetry,
+            "mech_evidence": mech_ev.model_dump() if mech_ev and hasattr(mech_ev, "model_dump") else None,
             "jev_request": jev_request_telemetry,
             "jev_verdict": jev_verdict_telemetry,
             "advisory": advisory_telemetry,
@@ -3952,6 +4142,7 @@ def node_gate(
             jev_state_keys=jev_keys,
             failure_evidence=semantic_evidence,
             retry_metadata=retry_progress,
+            mech_evidence=mech_ev,
         )
         _teardown_worktree(state, workspace)
 
@@ -3968,10 +4159,11 @@ def node_gate(
             "tier0_result": tier0_telemetry,
             "compile": compile_telemetry,
             "test_runner": test_runner_telemetry,
+            "mech_evidence": mech_ev.model_dump() if mech_ev and hasattr(mech_ev, "model_dump") else None,
             "jev_request": jev_request_telemetry,
             "jev_verdict": jev_verdict_telemetry,
-                "failure_evidence": semantic_evidence,
-                "retry_metadata": retry_progress,
+            "failure_evidence": semantic_evidence,
+            "retry_metadata": retry_progress,
             "advisory": advisory_telemetry,
         })
 
@@ -4179,40 +4371,36 @@ def node_verify(
         )
 
         verify_classification = None
-        verify_baseline_failures = state.get("baseline_failures")
-        verify_new_failures = state.get("new_failures")
-        verify_full_suite_clean = state.get("full_suite_clean")
+        verify_baseline_failures = 0
+        verify_new_failures = 0
+        verify_full_suite_clean = None
 
-        if workspace is not None and hasattr(workspace, "_baseline_test_cache"):
-            commit_key = str(base_commit).strip() if base_commit else "HEAD"
-            baseline = workspace._baseline_test_cache.get(commit_key)
-            if baseline is not None:
-                base_failing_raw = baseline.get("failing_ids")
-                if base_failing_raw is not None:
-                    base_set = set(base_failing_raw)
-                    verify_baseline_failures = len(base_set)
-                    cand_ids = test_runner_info.get("failing_test_ids") if isinstance(test_runner_info, dict) else None
-                    if outcome == TestOutcome.PASSED:
-                        if len(base_set) > 0:
-                            verify_classification = "REGRESSION_FREE_WITH_BASELINE_FAILURES"
-                            verify_full_suite_clean = False
-                            verify_new_failures = 0
-                        else:
-                            verify_classification = "FULL_SUITE_PASSED"
-                            verify_full_suite_clean = True
-                            verify_new_failures = 0
-                    elif outcome == TestOutcome.FAILED and cand_ids is not None:
-                        cand_set = set(cand_ids)
-                        new_failing = cand_set - base_set
-                        verify_new_failures = len(new_failing)
-                        if len(new_failing) == 0:
-                            verify_classification = "REGRESSION_FREE_WITH_BASELINE_FAILURES"
-                            verify_full_suite_clean = False
-                            outcome = TestOutcome.PASSED
-                            test_output = f"REGRESSION_FREE_WITH_BASELINE_FAILURES ({len(base_set)} baseline failures, 0 new failures)"
-                        else:
-                            verify_classification = "REGRESSION_DETECTED"
-                            verify_full_suite_clean = False
+        is_untargeted = not bool(targets)
+        verify_ev_level = evidence_level(
+            compile_outcome=compile_info if 'compile_info' in locals() else None,
+            test_outcome=test_runner_info,
+            test_policy=state.get("test_policy"),
+        )
+        has_counted_or_named = verify_ev_level in ("counted", "named", EvidenceLevel.COUNTED, EvidenceLevel.NAMED)
+
+        if outcome in (TestOutcome.PASSED, "PASSED"):
+            if is_untargeted and has_counted_or_named:
+                verify_classification = "FULL_SUITE_PASSED"
+                verify_full_suite_clean = True
+                verify_baseline_failures = 0
+                verify_new_failures = 0
+            else:
+                verify_classification = "PASSED_EXIT_ONLY"
+                verify_full_suite_clean = None
+                verify_baseline_failures = 0
+                verify_new_failures = 0
+        elif outcome in (TestOutcome.FAILED, "FAILED"):
+            verify_classification = "FAILED"
+            verify_full_suite_clean = False
+            verify_new_failures = 1
+        elif test_policy == "never":
+            verify_classification = "EXEMPT_BY_POLICY"
+            verify_full_suite_clean = None
 
         if verify_classification is not None:
             state["test_classification"] = verify_classification
@@ -4226,6 +4414,17 @@ def node_verify(
                 if "new_failures" not in test_runner_info:
                     test_runner_info["new_failures"] = verify_new_failures
                 test_runner_info["full_suite_clean"] = verify_full_suite_clean
+
+        unverified_subgoals = list(state.get("mechanically_unverified_subgoals") or [])
+        for entry in state.get("trajectory", []):
+            if isinstance(entry, dict) and entry.get("node") == "gate" and entry.get("gate_status") == "passed":
+                sg = entry.get("subgoal") or {}
+                sg_id = sg.get("id") if isinstance(sg, dict) else getattr(sg, "id", None)
+                m_ev = entry.get("mech_evidence") or {}
+                if isinstance(m_ev, dict) and m_ev.get("mechanically_unverified"):
+                    if sg_id and sg_id not in unverified_subgoals:
+                        unverified_subgoals.append(sg_id)
+        state["mechanically_unverified_subgoals"] = unverified_subgoals
 
         if outcome == TestOutcome.FAILED or test_output == "FAILED":
             output_tail = None
@@ -4362,6 +4561,7 @@ def node_verify(
             "status": state.get("status"),
             "compile": compile_info,
             "test_runner": test_runner_info,
+            "mechanically_unverified_subgoals": unverified_subgoals,
             "jev_request": {
                 "ticket": ticket,
                 "diff_size": len(final_diff),
@@ -4505,10 +4705,12 @@ def route_gate(state: State) -> str:
     if (
         state.get("mechanical_strike_count", 0) >= 3
         or state.get("semantic_strike_count", 0) >= 3
-        or state.get("gate_status") == "merge_failed"
+        or state.get("gate_status") in ("merge_failed", "verification_inconclusive")
         or state.get("status") == "escalated"
     ):
         return "escalate"
+    if state.get("gate_status") == "unmeasured":
+        return "implement"
     if state.get("gate_status") == "passed":
         if state.get("plan_queue"):
             return "implement"
@@ -4764,6 +4966,8 @@ class JevEngine:
             "current_subgoal": None,
             "mechanical_strike_count": 0,
             "semantic_strike_count": 0,
+            "unmeasured_retry_count": 0,
+            "mechanically_unverified_subgoals": [],
             "trajectory": [],
             "gate_status": None,
             "last_feedback": None,
