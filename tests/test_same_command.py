@@ -589,3 +589,79 @@ def test_16_adversary_garbage_output_both_sides(tmp_path, monkeypatch):
     assert ev_no_strike.reason == MechReason.BASELINE_UNAVAILABLE
     assert ev_no_strike.base_status == BaseStatus.FAIL
     assert ev_no_strike.comparison == Comparison.INCONCLUSIVE
+
+
+# 17. The my-harness case: 2 old broken tests, new passing test, targeted -> legacy label PASSED_EXIT_ONLY and full_suite_clean None.
+def test_17_my_harness_case_targeted_passed_exit_only(tmp_path):
+    repo_dir, base_commit = _create_real_git_repo(tmp_path)
+
+    # 2 old broken tests in base commit
+    tests_dir = repo_dir / "tests"
+    tests_dir.mkdir(parents=True, exist_ok=True)
+    (tests_dir / "test_old.py").write_text(
+        "def test_old_1():\n    assert False, 'broken 1'\n\n"
+        "def test_old_2():\n    assert False, 'broken 2'\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "."], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "Add broken baseline tests"], cwd=repo_dir, check=True, capture_output=True)
+    base_commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo_dir, check=True, capture_output=True, text=True).stdout.strip()
+
+    ws = Workspace(repo_dir=repo_dir)
+    ws.create_subgoal_worktree("sg-target", base_ref=base_commit)
+    subgoal = Subgoal(id="sg-target", description="Add new passing test", scope=["tests/test_new.py"], expects_tests=True)
+    ws.stage_file_mutation("tests/test_new.py", "def test_new_feature():\n    assert True\n")
+
+    # Real pytest run targeting only tests/test_new.py
+    res = ws.run_mechanical_checks(subgoal, base_commit=base_commit, test_targets=["tests/test_new.py"])
+
+    assert res.passed is True
+    assert res.failed_check is None
+    assert res.test_classification == TestOutcome.PASSED_EXIT_ONLY.value
+    assert res.full_suite_clean is None
+    assert res.baseline_failures == 0
+    assert res.new_failures == 0
+    assert res.mech_evidence is not None
+    assert res.mech_evidence.mech_status == MechStatus.PASS
+    assert res.mech_evidence.evidence_level == EvidenceLevel.EXIT_ONLY
+    assert res.mech_evidence.mechanically_unverified is True
+
+
+# 18. The my-harness case untargeted -> full suite fails with the same 2 IDs -> regression-free with evidence named.
+def test_18_my_harness_case_untargeted_regression_free_named(tmp_path):
+    repo_dir, base_commit = _create_real_git_repo(tmp_path)
+
+    # 2 old broken tests in base commit
+    tests_dir = repo_dir / "tests"
+    tests_dir.mkdir(parents=True, exist_ok=True)
+    (tests_dir / "test_old.py").write_text(
+        "def test_old_1():\n    assert False, 'broken 1'\n\n"
+        "def test_old_2():\n    assert False, 'broken 2'\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "."], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "Add broken baseline tests"], cwd=repo_dir, check=True, capture_output=True)
+    base_commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo_dir, check=True, capture_output=True, text=True).stdout.strip()
+
+    ws = Workspace(repo_dir=repo_dir)
+    ws.create_subgoal_worktree("sg-untargeted", base_ref=base_commit)
+    subgoal = Subgoal(id="sg-untargeted", description="Add new passing test", scope=["tests/test_new.py"], expects_tests=True)
+    ws.stage_file_mutation("tests/test_new.py", "def test_new_feature():\n    assert True\n")
+
+    # Real pytest run untargeted (test_targets=None)
+    res = ws.run_mechanical_checks(subgoal, base_commit=base_commit, test_targets=None)
+
+    assert res.passed is True
+    assert res.failed_check is None
+    assert res.test_classification == TestOutcome.REGRESSION_FREE_WITH_BASELINE_FAILURES.value
+    assert res.full_suite_clean is False
+    assert res.baseline_failures == 2
+    assert res.new_failures == 0
+    assert "tests/test_old.py::test_old_1" in res.baseline_failing_ids
+    assert "tests/test_old.py::test_old_2" in res.baseline_failing_ids
+    assert res.new_failing_ids == []
+    assert res.mech_evidence is not None
+    assert res.mech_evidence.mech_status == MechStatus.PASS
+    assert res.mech_evidence.comparison == Comparison.SAME
+    assert res.mech_evidence.evidence_level == EvidenceLevel.NAMED
+    assert res.mech_evidence.mechanically_unverified is False

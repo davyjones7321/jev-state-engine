@@ -120,8 +120,10 @@ def test_b_my_harness_case_baseline_failures_with_passing_targeted_test(git_repo
 
     # Gate proceeds without mechanical strike!
     assert out_state.get("mechanical_strike_count") == 0
-    assert out_state.get("test_classification") == TestOutcome.FULL_SUITE_PASSED.value
-    assert out_state.get("full_suite_clean") is True
+    assert out_state.get("test_classification") != TestOutcome.FULL_SUITE_PASSED.value
+    assert out_state.get("test_classification") == TestOutcome.PASSED_EXIT_ONLY.value
+    assert out_state.get("full_suite_clean") is not True
+    assert out_state.get("full_suite_clean") is None
     assert out_state.get("baseline_failures") == 0
     assert out_state.get("new_failures") == 0
     assert gatekeeper.validate_subgoal.called
@@ -269,8 +271,8 @@ def test_e_clean_repo_all_tests_pass_full_suite_passed(git_repo):
 
     assert res.passed is True
     assert res.failed_check is None
-    assert res.test_classification == TestOutcome.FULL_SUITE_PASSED.value
-    assert res.full_suite_clean is True
+    assert res.test_classification == TestOutcome.PASSED_EXIT_ONLY.value
+    assert res.full_suite_clean is None
     assert res.baseline_failures == 0
     assert res.new_failures == 0
 

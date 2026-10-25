@@ -2163,9 +2163,14 @@ class Workspace:
         # 2c. exit 0 -> PASS
         cand_exit = last_run.get("exit_code")
         if cand_exit == 0 or cand_outcome == TestOutcome.PASSED:
+            ev_level = EvidenceLevel.EXIT_ONLY
+            if last_run.get("parsed_counts"):
+                ev_level = EvidenceLevel.COUNTED
+            is_exit_only = (ev_level == EvidenceLevel.EXIT_ONLY)
             return MechanicalEvidence(
                 mech_status=MechStatus.PASS,
-                evidence_level=EvidenceLevel.EXIT_ONLY,
+                evidence_level=ev_level,
+                mechanically_unverified=True if is_exit_only else False,
                 base_status=None,
                 comparison=Comparison.NOT_COMPARED,
                 command_identity={"cmd": last_run.get("argv")},
@@ -2257,6 +2262,7 @@ class Workspace:
                 if compile_passed and launcher_healthy and output_non_empty:
                     return MechanicalEvidence(
                         mech_status=MechStatus.FAIL,
+                        evidence_level=EvidenceLevel.EXIT_ONLY,
                         base_status=base_status,
                         comparison=Comparison.CANDIDATE_ONLY,
                         target_rule="provisional",
@@ -2334,6 +2340,7 @@ class Workspace:
         if base_status == BaseStatus.PASS:
             return MechanicalEvidence(
                 mech_status=MechStatus.FAIL,
+                evidence_level=EvidenceLevel.EXIT_ONLY,
                 base_status=BaseStatus.PASS,
                 comparison=Comparison.CANDIDATE_ONLY,
                 command_identity={"cmd": test_cmd},
@@ -2361,6 +2368,7 @@ class Workspace:
                         base_status=BaseStatus.FAIL,
                         comparison=Comparison.SAME,
                         evidence_level=EvidenceLevel.NAMED,
+                        mechanically_unverified=False,
                         command_identity={"cmd": test_cmd},
                         target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
                     )
@@ -3812,8 +3820,14 @@ class Workspace:
                     new_failures = 0
                     new_failing_ids = []
                 else:
-                    test_classification = TestOutcome.FULL_SUITE_PASSED.value
-                    full_suite_clean = True
+                    is_untargeted = not bool(test_targets)
+                    has_counted_or_named = mech_evidence.evidence_level in (EvidenceLevel.COUNTED, EvidenceLevel.NAMED)
+                    if is_untargeted and has_counted_or_named:
+                        test_classification = TestOutcome.FULL_SUITE_PASSED.value
+                        full_suite_clean = True
+                    else:
+                        test_classification = TestOutcome.PASSED_EXIT_ONLY.value
+                        full_suite_clean = None
                     baseline_failures = 0
                     new_failures = 0
                     baseline_failing_ids = []

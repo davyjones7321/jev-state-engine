@@ -109,4 +109,11 @@ class MechanicalEvidence(BaseModel):
                     )
                 self.mechanically_unverified = True
 
+        if self.mech_status == MechStatus.PASS and self.evidence_level in (EvidenceLevel.COUNTED, EvidenceLevel.NAMED):
+            if self.mechanically_unverified is True:
+                raise ValueError(
+                    f"evidence_level {self.evidence_level.value} forces mechanically_unverified=False when status is PASS"
+                )
+            self.mechanically_unverified = False
+
         return self
