@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test & Verify (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "latest"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: "temurin"
+
+      - name: Configure Git User
+        run: |
+          git config --global user.name "CI Tester"
+          git config --global user.email "ci@example.com"
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Test Suite (pytest -rs -m "not live")
+        run: |
+          python -m pytest -v -rs -m "not live"
+
+      - name: Run Phase Verification Script
+        run: |
+          python scripts/verify_phase.py HEAD~1 > verify_report_${{ matrix.os }}.txt
+        shell: bash
+
+      - name: Display Verification Report
+        run: |
+          cat verify_report_${{ matrix.os }}.txt
+        shell: bash
+
+      - name: Upload Verification Report Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-report-${{ matrix.os }}
+          path: verify_report_${{ matrix.os }}.txt

@@ -3,7 +3,8 @@
 
 Verification script for phase transitions as specified in session-1-v2.md (Phase 0B):
 Prints branch/commit, diff stat vs a base ref, added/modified/deleted tests,
-collected counts for new test files, greps for key patterns, and the last lines of the offline suite.
+collected counts for new test files, greps for key patterns, skipped fixtures/tests,
+and the last lines of the offline suite.
 """
 
 import os
@@ -61,12 +62,15 @@ def main():
     print("--- Collected Test Counts ---")
     changed_files_res = run_cmd(["git", "diff", "--name-only", base_ref, "--", "tests/"])
     changed_test_files = [f.strip() for f in changed_files_res.stdout.splitlines() if f.strip().endswith(".py")]
-    for tf in changed_test_files:
-        if (repo_root / tf).exists():
-            c_res = run_cmd(["python", "-m", "pytest", tf, "--collect-only", "-q"])
-            summary_lines = [l for l in c_res.stdout.splitlines() if "collected" in l or "tests" in l]
-            last_line = summary_lines[-1] if summary_lines else c_res.stdout.strip()
-            print(f"  {tf}: {last_line}")
+    if changed_test_files:
+        for tf in changed_test_files:
+            if (repo_root / tf).exists():
+                c_res = run_cmd(["python", "-m", "pytest", tf, "--collect-only", "-q"])
+                summary_lines = [l for l in c_res.stdout.splitlines() if "collected" in l or "tests" in l]
+                last_line = summary_lines[-1] if summary_lines else c_res.stdout.strip()
+                print(f"  {tf}: {last_line}")
+    else:
+        print("  (no test files changed vs base)")
     print()
 
     # 5. Greps for key patterns
@@ -94,12 +98,12 @@ def main():
         print(f"  {line}")
     print()
 
-    # 6. Last lines of offline test suite
+    # 6. Last lines of offline test suite with skipped reasons (-rs)
     print("--- Pytest Offline Suite Summary ---")
     env = os.environ.copy()
     env.pop("ANTIGRAVITY_SOURCE_METADATA", None)
     pytest_res = subprocess.run(
-        ["python", "-m", "pytest", "-q", "-m", "not live"],
+        ["python", "-m", "pytest", "-q", "-rs", "-m", "not live"],
         capture_output=True,
         text=True,
         env=env,
@@ -107,7 +111,7 @@ def main():
     )
     lines = [l for l in pytest_res.stdout.splitlines() if l.strip()]
     if lines:
-        for l in lines[-5:]:
+        for l in lines[-12:]:
             print(l)
     else:
         print(pytest_res.stderr.strip() or "(no pytest output)")
