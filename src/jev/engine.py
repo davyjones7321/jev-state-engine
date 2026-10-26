@@ -3317,6 +3317,7 @@ def _snapshot_attempt(
     new_failures: Optional[int] = None,
     full_suite_clean: Optional[bool] = None,
     mech_evidence: Optional[Any] = None,
+    unverified_kind: Optional[str] = None,
 ) -> None:
     """Helper to snapshot an attempt row to the ledger."""
     if not recorder:
@@ -3433,6 +3434,7 @@ def _snapshot_attempt(
         new_failures=new_failures,
         full_suite_clean=full_suite_clean,
         mech_evidence=mech_ev_obj,
+        unverified_kind=unverified_kind,
     )
 
 
@@ -3823,6 +3825,12 @@ def node_gate(
     )
 
     mech_ev = getattr(mech_result, "mech_evidence", None)
+    if (mech_result.failed_check == "test_surface_changed" or getattr(mech_result, "test_surface_changed", False)) and mech_ev is None:
+        mech_ev = MechanicalEvidence(
+            mech_status=MechStatus.UNMEASURED,
+            reason=MechReason.TEST_SURFACE_CHANGED,
+            test_surface_changed=True,
+        )
     is_unmeasured = (
         mech_result.failed_check == "tests_unmeasured"
         or (
@@ -4193,8 +4201,7 @@ def node_gate(
             base_desc = f"Regression-free with baseline failures (baseline_failures={baseline_failures}, new_failures=0)."
             mechanical_detail = f"{standard_block}\n{base_desc}\n{mech_result.detail}".strip()
         elif m_ev_level == "exit_only":
-            detail_text = (mech_result.detail or "").replace("FULL_SUITE_PASSED", "PASSED_EXIT_ONLY")
-            detail_text = re.sub(r"\bfull suite\b", "suite", detail_text, flags=re.IGNORECASE)
+            detail_text = mech_result.detail or ""
             mechanical_detail = f"{standard_block}\n{detail_text}".strip()
         elif tests_ran or subgoal.expects_tests or test_policy == "verify-only":
             mechanical_detail = (
@@ -4390,15 +4397,36 @@ def node_gate(
         state["committed_subgoals"] = list(state.get("committed_subgoals", [])) + [subgoal.model_copy(deep=True)]
 
         is_unv = False
-        if mech_ev is not None:
-            is_unv = bool(getattr(mech_ev, "mechanically_unverified", False))
-        elif ev_level in ("exit_only", "none"):
+        unv_kind = None
+        if not tests_ran or not getattr(subgoal, "expects_tests", True) or test_policy in ("never", "verify-only"):
             is_unv = True
+            unv_kind = "untested"
+        elif (
+            (mech_ev is not None and (
+                getattr(mech_ev, "mechanically_unverified", False)
+                or getattr(mech_ev, "evidence_level", None) in (EvidenceLevel.EXIT_ONLY, EvidenceLevel.NONE, "exit_only", "none")
+            ))
+            or ev_level in ("exit_only", "none")
+        ):
+            is_unv = True
+            unv_kind = "exit_only"
+        elif mech_ev is not None and getattr(mech_ev, "mechanically_unverified", False):
+            is_unv = True
+            unv_kind = getattr(mech_ev, "unverified_kind", None) or "untested"
+
+        if is_unv and mech_ev is not None:
+            mech_ev.mechanically_unverified = True
+            if not getattr(mech_ev, "unverified_kind", None):
+                mech_ev.unverified_kind = unv_kind
+
         if is_unv and getattr(subgoal, "id", None):
             curr_unv = list(state.get("mechanically_unverified_subgoals") or [])
             if subgoal.id not in curr_unv:
                 curr_unv.append(subgoal.id)
             state["mechanically_unverified_subgoals"] = curr_unv
+            unv_kinds = dict(state.get("mechanically_unverified_kinds") or {})
+            unv_kinds[subgoal.id] = unv_kind
+            state["mechanically_unverified_kinds"] = unv_kinds
 
         _snapshot_attempt(
             safe_rec,
@@ -4415,6 +4443,7 @@ def node_gate(
             dependency_delta=attempt_dep_delta,
             jev_state_keys=jev_keys,
             mech_evidence=mech_ev,
+            unverified_kind=unv_kind,
         )
         if safe_rec:
             safe_rec.record_subgoal_committed(run_id, subgoal_id, parent_sha=parent_sha, commit_sha=commit_sha)
@@ -4427,6 +4456,8 @@ def node_gate(
             "compile": compile_telemetry,
             "test_runner": test_runner_telemetry,
             "mech_evidence": mech_ev.model_dump() if mech_ev and hasattr(mech_ev, "model_dump") else None,
+            "mechanically_unverified": is_unv,
+            "unverified_kind": unv_kind,
             "jev_request": jev_request_telemetry,
             "jev_verdict": jev_verdict_telemetry,
             "advisory": advisory_telemetry,
@@ -4774,7 +4805,11 @@ def node_verify(
                 sg = entry.get("subgoal") or {}
                 sg_id = sg.get("id") if isinstance(sg, dict) else getattr(sg, "id", None)
                 m_ev = entry.get("mech_evidence") or {}
-                if isinstance(m_ev, dict) and m_ev.get("mechanically_unverified"):
+                if (
+                    entry.get("mechanically_unverified")
+                    or entry.get("unverified_kind")
+                    or (isinstance(m_ev, dict) and m_ev.get("mechanically_unverified"))
+                ):
                     if sg_id and sg_id not in unverified_subgoals:
                         unverified_subgoals.append(sg_id)
         state["mechanically_unverified_subgoals"] = unverified_subgoals

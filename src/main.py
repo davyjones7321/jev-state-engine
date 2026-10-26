@@ -293,7 +293,25 @@ def main(argv: Optional[List[str]] = None) -> int:
     ev_level = None
     if hasattr(recorder, "get_run_evidence_level"):
         ev_level = recorder.get_run_evidence_level(target_run_id)
-    print(format_evidence_summary(ev_level, test_policy=args.test_policy))
+    if ev_level and ev_level not in ("tests+compile", "tests-only") and args.test_policy == "auto":
+        committed_sgs = final_state.get("committed_subgoals") or []
+        unv_kinds = final_state.get("mechanically_unverified_kinds") or {}
+        if committed_sgs and all(not getattr(sg, "expects_tests", True) for sg in committed_sgs):
+            print(f"Evidence: {ev_level} (no tests ran: expects_tests=false)")
+        elif any(k == "untested" for k in unv_kinds.values()):
+            print(f"Evidence: {ev_level} (no tests ran: subgoals do not expect tests)")
+        else:
+            traj = final_state.get("trajectory") or []
+            no_cmd = any(
+                (entry.get("mech_evidence") or {}).get("reason") in ("NO_COMMAND", "MISSING_TOOL")
+                for entry in traj if isinstance(entry, dict)
+            )
+            if no_cmd:
+                print(f"Evidence: {ev_level} (no tests ran: no test framework configured)")
+            else:
+                print(f"Evidence: {ev_level} (no tests ran: subgoals do not expect tests)")
+    else:
+        print(format_evidence_summary(ev_level, test_policy=args.test_policy))
 
     unverified_subgoals = final_state.get("mechanically_unverified_subgoals") or []
     if len(unverified_subgoals) > 0:

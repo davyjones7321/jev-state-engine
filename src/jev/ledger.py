@@ -172,6 +172,7 @@ class Recorder(Protocol):
         new_failures: Optional[int] = None,
         full_suite_clean: Optional[bool] = None,
         mech_evidence: Optional[MechanicalEvidence] = None,
+        unverified_kind: Optional[str] = None,
     ) -> None: ...
 
     def get_attempt_mech_evidence(
@@ -302,6 +303,7 @@ class NullRecorder:
         new_failures: Optional[int] = None,
         full_suite_clean: Optional[bool] = None,
         mech_evidence: Optional[MechanicalEvidence] = None,
+        unverified_kind: Optional[str] = None,
     ) -> None:
         pass
 
@@ -490,6 +492,7 @@ class SqliteLedger:
                    mech_approval_valid INTEGER DEFAULT NULL,
                    mech_comparison_valid INTEGER DEFAULT NULL,
                    mech_mechanically_unverified INTEGER DEFAULT NULL,
+                   mech_unverified_kind TEXT DEFAULT NULL,
                    mech_verification_inconclusive INTEGER DEFAULT NULL,
                    PRIMARY KEY (run_id, subgoal_id, attempt_no)
                 );
@@ -527,6 +530,7 @@ class SqliteLedger:
                 ("mech_approval_valid", "INTEGER"),
                 ("mech_comparison_valid", "INTEGER"),
                 ("mech_mechanically_unverified", "INTEGER"),
+                ("mech_unverified_kind", "TEXT"),
                 ("mech_verification_inconclusive", "INTEGER"),
             )
             for name, col_type in mech_cols:
@@ -775,6 +779,7 @@ class SqliteLedger:
         new_failures: Optional[int] = None,
         full_suite_clean: Optional[bool] = None,
         mech_evidence: Optional[MechanicalEvidence] = None,
+        unverified_kind: Optional[str] = None,
     ) -> None:
         now_ts = created_at or datetime.now(timezone.utc).isoformat()
         if not isinstance(jev_state_keys, str):
@@ -812,6 +817,7 @@ class SqliteLedger:
         m_approval_valid = None
         m_comparison_valid = None
         m_mech_unverified = None
+        m_unverified_kind = unverified_kind
         m_verif_inconclusive = None
 
         if mech_evidence is not None:
@@ -836,6 +842,8 @@ class SqliteLedger:
             m_approval_valid = None if mech_evidence.approval_valid is None else (1 if mech_evidence.approval_valid else 0)
             m_comparison_valid = None if mech_evidence.comparison_valid is None else (1 if mech_evidence.comparison_valid else 0)
             m_mech_unverified = None if mech_evidence.mechanically_unverified is None else (1 if mech_evidence.mechanically_unverified else 0)
+            if m_unverified_kind is None and hasattr(mech_evidence, "unverified_kind"):
+                m_unverified_kind = mech_evidence.unverified_kind
             m_verif_inconclusive = None if mech_evidence.verification_inconclusive is None else (1 if mech_evidence.verification_inconclusive else 0)
 
         with self._get_connection() as conn:
@@ -865,14 +873,14 @@ class SqliteLedger:
                   mech_worker_staged_json, mech_engine_touched_json,
                   mech_test_authorship, mech_test_surface_changed,
                   mech_verifier_modified, mech_approval_valid, mech_comparison_valid,
-                  mech_mechanically_unverified, mech_verification_inconclusive
+                  mech_mechanically_unverified, mech_unverified_kind, mech_verification_inconclusive
                  ) VALUES (
                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                    ?, ?, ?,
                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                   ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                   ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                  )
                 """,
                 (
@@ -936,6 +944,7 @@ class SqliteLedger:
                     m_approval_valid,
                     m_comparison_valid,
                     m_mech_unverified,
+                    m_unverified_kind,
                     m_verif_inconclusive,
                 ),
             )
@@ -1012,6 +1021,7 @@ class SqliteLedger:
                 approval_valid=_to_bool(row["mech_approval_valid"]),
                 comparison_valid=_to_bool(row["mech_comparison_valid"]),
                 mechanically_unverified=_to_bool(row["mech_mechanically_unverified"]),
+                unverified_kind=row["mech_unverified_kind"] if "mech_unverified_kind" in row.keys() else None,
                 verification_inconclusive=_to_bool(row["mech_verification_inconclusive"]),
             )
 

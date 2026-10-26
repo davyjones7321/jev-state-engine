@@ -139,3 +139,4 @@ class State(TypedDict, total=False):
     new_failing_ids: Optional[List[str]]
     unmeasured_retry_count: int
     mechanically_unverified_subgoals: Optional[List[str]]
+    mechanically_unverified_kinds: Optional[Dict[str, str]]

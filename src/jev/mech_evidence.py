@@ -76,6 +76,7 @@ class MechanicalEvidence(BaseModel):
     approval_valid: Optional[bool] = None
     comparison_valid: Optional[bool] = None
     mechanically_unverified: Optional[bool] = None
+    unverified_kind: Optional[str] = None
     verification_inconclusive: Optional[bool] = None
     full_suite_verified: bool = False
     attribution_note: Optional[str] = None
@@ -95,6 +96,8 @@ class MechanicalEvidence(BaseModel):
             if self.mechanically_unverified is False:
                 raise ValueError("UNMEASURED forces mechanically_unverified=True; cannot be False")
             self.mechanically_unverified = True
+            if not self.unverified_kind:
+                self.unverified_kind = "untested"
 
         # d. evidence_level in (exit_only, none) forces full_suite_verified=False
         # and forces mechanically_unverified=True when status is PASS
@@ -108,6 +111,8 @@ class MechanicalEvidence(BaseModel):
                         f"evidence_level {self.evidence_level.value} forces mechanically_unverified=True when status is PASS"
                     )
                 self.mechanically_unverified = True
+                if not self.unverified_kind:
+                    self.unverified_kind = "exit_only"
 
         if self.mech_status == MechStatus.PASS and self.evidence_level in (EvidenceLevel.COUNTED, EvidenceLevel.NAMED):
             if self.mechanically_unverified is True:
@@ -115,5 +120,6 @@ class MechanicalEvidence(BaseModel):
                     f"evidence_level {self.evidence_level.value} forces mechanically_unverified=False when status is PASS"
                 )
             self.mechanically_unverified = False
+            self.unverified_kind = None
 
         return self
