@@ -269,6 +269,39 @@ def _extract_diff_excerpt(diff: Any, max_lines: int = 40, max_chars: int = 3000)
     return excerpt
 
 
+def _extract_declarations_and_head(content: str, max_lines: int = 40) -> str:
+    lines = content.splitlines()
+    if len(lines) <= max_lines:
+        return "\n".join(f"{i + 1}: {lines[i]}" for i in range(len(lines)))
+
+    decl_pattern = re.compile(
+        r'^\s*(?:(?:export|public|pub|private|protected|static|final|abstract|async|default)\s+)*'
+        r'(?:export|module\.exports|class|def|func|fn|function|pub|public|interface|type|const|struct)\b'
+    )
+
+    decl_indices: List[int] = []
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith(("//", "/*", "*", "#")):
+            continue
+        if decl_pattern.match(line):
+            decl_indices.append(idx)
+            if len(decl_indices) >= max_lines:
+                break
+
+    selected_indices = list(decl_indices)
+    decl_set = set(decl_indices)
+
+    # then fill with the head
+    for idx in range(len(lines)):
+        if len(selected_indices) >= max_lines:
+            break
+        if idx not in decl_set:
+            selected_indices.append(idx)
+
+    return "\n".join(f"{idx + 1}: {lines[idx]}" for idx in selected_indices)
+
+
 def _build_source_hints(
     error_text: str,
     candidate_root: Optional[Path],
@@ -419,13 +452,16 @@ def _build_source_hints(
                         struct_parts.append("Symbols: " + ", ".join(f"{s.kind} {s.name}" for s in res.symbols[:10]))
                     if res.imports:
                         struct_parts.append("Imports: " + ", ".join(i.name for i in res.imports[:10]))
-                    snippet = "\n".join(struct_parts) if struct_parts else "No top-level structure found."
+                    snippet = "\n".join(struct_parts) if struct_parts else ""
+                    if not snippet:
+                        content = resolved.read_text(encoding="utf-8", errors="replace")
+                        snippet = _extract_declarations_and_head(content, max_lines=max_lines)
                 except Exception:
-                    file_lines = resolved.read_text(encoding="utf-8", errors="replace").splitlines()[:max_lines]
-                    snippet = "\n".join(f"{i+1}: {file_lines[i]}" for i in range(len(file_lines)))
+                    content = resolved.read_text(encoding="utf-8", errors="replace")
+                    snippet = _extract_declarations_and_head(content, max_lines=max_lines)
             else:
-                file_lines = resolved.read_text(encoding="utf-8", errors="replace").splitlines()[:max_lines]
-                snippet = "\n".join(f"{i+1}: {file_lines[i]}" for i in range(len(file_lines)))
+                content = resolved.read_text(encoding="utf-8", errors="replace")
+                snippet = _extract_declarations_and_head(content, max_lines=max_lines)
 
             hints_by_file[rel_posix] = {
                 "file": rel_posix,
@@ -2669,10 +2705,13 @@ def node_implement(
                 self_check_outcomes.append("skipped")
                 return f"Self-check: skipped\nReason: {exc}"
             finally:
-                if hasattr(workspace, "_compute_provenance_deltas"):
-                    workspace._compute_provenance_deltas()
-                if hasattr(workspace, "_discard_engine_touched"):
-                    workspace._discard_engine_touched()
+                if hasattr(workspace, "discard_engine_touched"):
+                    workspace.discard_engine_touched()
+                else:
+                    if hasattr(workspace, "_compute_provenance_deltas"):
+                        workspace._compute_provenance_deltas()
+                    if hasattr(workspace, "_discard_engine_touched"):
+                        workspace._discard_engine_touched()
 
             c_outcome = compile_res.get("outcome")
             detail = compile_res.get("detail", "")

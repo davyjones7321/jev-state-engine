@@ -1303,7 +1303,7 @@ class Workspace:
     def _discard_engine_touched(self) -> None:
         if not self.engine_touched_paths:
             return
-        if self.worktree_dir == self.repo_dir and not getattr(self, "strict_provenance", False):
+        if self.worktree_dir == self.repo_dir:
             return
         status_res = self._run_git(["status", "--porcelain", "-uall"])
         if status_res.returncode != 0 or not status_res.stdout:
@@ -1334,6 +1334,8 @@ class Workspace:
 
     def discard_engine_touched(self) -> None:
         """Compute deltas and discard all engine-touched artifacts."""
+        if self.worktree_dir == self.repo_dir:
+            return
         self._compute_provenance_deltas()
         self._discard_engine_touched()
 

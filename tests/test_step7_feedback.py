@@ -502,3 +502,118 @@ def test_engine_level_compile_failure_retry_feedback_contains_hint(temp_git_repo
     assert hint_item["file"] == "src/comp.ts"
     assert hint_item["confidence"] == "hint, may be incomplete"
     assert "5: const x: number = 'invalid string';" in hint_item["snippet"]
+
+
+def test_discard_engine_touched_in_repo_dir_preserves_user_files(temp_git_repo):
+    """Regression test: when worktree_dir == repo_dir, neither _discard_engine_touched
+    nor discard_engine_touched may revert tracked user edits or clean untracked user files."""
+    # 1. Setup user-edited tracked file
+    readme = temp_git_repo / "README.md"
+    readme.write_text("# Edited by user\n", encoding="utf-8")
+
+    # 2. Setup untracked user file
+    untracked = temp_git_repo / "user_untracked.txt"
+    untracked.write_text("user created file\n", encoding="utf-8")
+
+    # 3. Workspace with strict_provenance=True, working in repo_dir (worktree_dir == repo_dir)
+    ws = Workspace(repo_dir=temp_git_repo, strict_provenance=True)
+    assert ws.worktree_dir == ws.repo_dir
+
+    # Pre-fill engine_touched_paths with both paths
+    ws.engine_touched_paths = ["README.md", "user_untracked.txt"]
+
+    # Call _discard_engine_touched
+    ws._discard_engine_touched()
+
+    # Both must survive!
+    assert untracked.exists(), "Untracked user file was deleted by _discard_engine_touched in repo_dir!"
+    assert readme.read_text(encoding="utf-8") == "# Edited by user\n", "User-edited tracked file was reverted by _discard_engine_touched in repo_dir!"
+
+    # Pre-fill again and call public discard_engine_touched()
+    ws.engine_touched_paths = ["README.md", "user_untracked.txt"]
+    ws.discard_engine_touched()
+
+    assert untracked.exists(), "Untracked user file was deleted by discard_engine_touched in repo_dir!"
+    assert readme.read_text(encoding="utf-8") == "# Edited by user\n", "User-edited tracked file was reverted by discard_engine_touched in repo_dir!"
+
+def test_check_compile_directory_prefix_scope(temp_git_repo):
+    """check_compile scope filtering: scope 'src/' matches src/index.ts; 'src/a.ts' does not match src/a.tsx;
+    nothing outside the scope is matched."""
+    ws = Workspace(repo_dir=temp_git_repo, strict_provenance=True)
+    subgoal = Subgoal(id="sg-scope", description="Scope test", scope=["src/"], expects_tests=False)
+    wt_path = ws.create_subgoal_worktree(subgoal.id)
+
+    # Create modified files: src/index.ts, src/a.tsx, and outside/other.ts
+    src_dir = wt_path / "src"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    outside_dir = wt_path / "outside"
+    outside_dir.mkdir(parents=True, exist_ok=True)
+
+    ws.stage_file_mutation("src/index.ts", "export const index = 1;\n")
+    ws.stage_file_mutation("src/a.tsx", "export const Comp = () => null;\n")
+    ws.stage_file_mutation("outside/other.ts", "export const other = 2;\n")
+
+    captured_scopes = []
+
+    from jev.workspace import ECOSYSTEM_COMPILE_HANDLERS
+    original_matches = ECOSYSTEM_COMPILE_HANDLERS[0].matches
+
+    def spy_matches(touched_sources, *args, **kwargs):
+        captured_scopes.append(set(touched_sources))
+        return False
+
+    with patch.object(ECOSYSTEM_COMPILE_HANDLERS[0], "matches", side_effect=spy_matches):
+        # 1. Scope 'src/' matches src/index.ts and src/a.tsx, but NOT outside/other.ts
+        captured_scopes.clear()
+        ws.check_compile(scope=["src/"])
+        assert len(captured_scopes) > 0
+        matched_set = captured_scopes[0]
+        assert "src/index.ts" in matched_set
+        assert "src/a.tsx" in matched_set
+        assert "outside/other.ts" not in matched_set
+
+        # 2. Scope 'src/a.ts' does NOT match src/a.tsx, and does not match src/index.ts or outside/other.ts
+        captured_scopes.clear()
+        res_a_ts = ws.check_compile(scope=["src/a.ts"])
+        # No source files matched in scope -> EXEMPT
+        assert res_a_ts["outcome"] == CompileOutcome.EXEMPT.value
+        assert "Diff touches no compiled source files." in res_a_ts["detail"]
+        assert len(captured_scopes) == 0
+
+        # 3. Scope 'src/index.ts' matches ONLY src/index.ts (nothing outside scope matched)
+        captured_scopes.clear()
+        ws.check_compile(scope=["src/index.ts"])
+        assert len(captured_scopes) > 0
+        assert captured_scopes[0] == {"src/index.ts"}
+
+
+def test_source_hints_referenced_file_over_40_lines_with_license_header(temp_git_repo):
+    """Referenced file with >40 lines (e.g. 45-line license header and exported class below):
+    hint must contain the class name and declarations with line numbers up to 40 lines total."""
+    src_dir = temp_git_repo / "src"
+    src_dir.mkdir(parents=True, exist_ok=True)
+
+    service_ts = src_dir / "service.ts"
+    lines = [f"// License header boilerplate line {i}" for i in range(1, 46)]
+    lines.append("export class GreeterService {")
+    lines.append("    greet(): string { return 'hello'; }")
+    lines.append("}")
+    service_ts.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    error_text = "src/app.ts:10:5: error TS2304: Cannot find name 'GreeterService' from './src/service.ts'."
+
+    hints = _build_source_hints(error_text, temp_git_repo)
+    ref_hint = next((h for h in hints if h["file"] == "src/service.ts"), None)
+    assert ref_hint is not None
+    assert ref_hint["type"] == "referenced_file"
+
+    snippet = ref_hint["snippet"]
+    # Must contain class name
+    assert "GreeterService" in snippet
+    assert "46: export class GreeterService {" in snippet
+    # Total lines <= 40
+    snippet_lines = snippet.splitlines()
+    assert len(snippet_lines) <= 40
+    # Declarations appear first, followed by head
+    assert snippet_lines[0].startswith("46: export class GreeterService")
+
