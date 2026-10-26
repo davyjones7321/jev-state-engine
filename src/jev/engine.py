@@ -1,3 +1,4 @@
+import ast
 import hashlib
 import inspect
 import json
@@ -56,6 +57,8 @@ from jev.models import (
     ValidationVerdict,
 )
 from jev.workspace import (
+    ALL_SOURCE_EXTENSIONS,
+    ECOSYSTEM_COMPILE_HANDLERS,
     MAX_READ_CHARS,
     MainDivergedError,
     TrackedModificationsError,
@@ -266,6 +269,187 @@ def _extract_diff_excerpt(diff: Any, max_lines: int = 40, max_chars: int = 3000)
     return excerpt
 
 
+def _build_source_hints(
+    error_text: str,
+    candidate_root: Optional[Path],
+    *,
+    max_files: int = 3,
+    max_lines: int = 40,
+    max_chars: int = 6000,
+) -> List[Dict[str, Any]]:
+    if not error_text or candidate_root is None:
+        return []
+
+    try:
+        cand_root = Path(candidate_root).resolve()
+        if not cand_root.is_dir():
+            return []
+    except Exception:
+        return []
+
+    probe_extensions = [".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".rs", ".java", ".kt"]
+    hints_by_file: Dict[str, Dict[str, Any]] = {}
+
+    def _resolve_candidate(p_str: str, base_dir: Path) -> Optional[Path]:
+        p = Path(str(p_str).replace("\\", "/"))
+        if p.is_absolute():
+            try:
+                res = p.resolve()
+                res.relative_to(cand_root)
+                if res.is_file() and not is_secret_path(res):
+                    return res
+            except (ValueError, OSError):
+                return None
+        else:
+            try:
+                norm = str(p_str).replace("\\", "/").lstrip("./")
+                res = (base_dir / norm).resolve()
+                res.relative_to(cand_root)
+                if res.is_file() and not is_secret_path(res):
+                    return res
+            except (ValueError, OSError):
+                return None
+        return None
+
+    # 1. Location hints:
+    # a. File "x", line N
+    # b. file(line,col) or file(line)
+    # c. file:line[:col]
+    location_patterns = [
+        re.compile(r'File\s+["\']([^"\']+)["\'],\s+line\s+(\d+)'),
+        re.compile(r'(?:^|[\s"\'\(])([a-zA-Z0-9_\-\./\\]+\.[a-zA-Z0-9_]+)\(([0-9]+)(?:,\s*(\d+))?\)'),
+        re.compile(r'(?:^|[\s"\'\(])([a-zA-Z0-9_\-\./\\]+\.[a-zA-Z0-9_]+):(\d+)(?::(\d+))?'),
+    ]
+
+    for pat in location_patterns:
+        for m in pat.finditer(error_text):
+            if len(hints_by_file) >= max_files:
+                break
+            raw_file = m.group(1).strip()
+            line_str = m.group(2).strip()
+            try:
+                line_num = int(line_str)
+            except ValueError:
+                continue
+
+            resolved = _resolve_candidate(raw_file, cand_root)
+            if resolved is None:
+                continue
+
+            rel_posix = resolved.relative_to(cand_root).as_posix()
+            if rel_posix in hints_by_file:
+                continue
+
+            try:
+                content = resolved.read_text(encoding="utf-8", errors="replace")
+                lines = content.splitlines()
+                start_line = max(1, line_num - 10)
+                end_line = min(len(lines), line_num + 10)
+                if (end_line - start_line + 1) > max_lines:
+                    end_line = start_line + max_lines - 1
+                snippet_lines = [
+                    f"{ln}: {lines[ln - 1]}"
+                    for ln in range(start_line, end_line + 1)
+                ]
+                snippet = "\n".join(snippet_lines)
+            except Exception:
+                snippet = ""
+
+            hints_by_file[rel_posix] = {
+                "file": rel_posix,
+                "line": line_num,
+                "type": "location",
+                "snippet": snippet,
+                "confidence": "hint, may be incomplete",
+            }
+
+    # 2. Referenced-file hints
+    if len(hints_by_file) < max_files:
+        search_dirs: List[Path] = []
+        for h_file in list(hints_by_file.keys()):
+            h_dir = (cand_root / Path(h_file).parent).resolve()
+            if h_dir not in search_dirs:
+                search_dirs.append(h_dir)
+        if cand_root not in search_dirs:
+            search_dirs.append(cand_root)
+
+        raw_tokens = re.findall(r'[^\s"\'\(\)<>\[\]`:]+', error_text)
+        for token in raw_tokens:
+            if len(hints_by_file) >= max_files:
+                break
+            cleaned = token.strip(",;()\"'").rstrip(".")
+            if not cleaned or cleaned.startswith("http://") or cleaned.startswith("https://"):
+                continue
+            if not ("/" in cleaned or "\\" in cleaned or any(cleaned.endswith(ext) for ext in probe_extensions)):
+                continue
+
+            resolved: Optional[Path] = None
+            for s_dir in search_dirs:
+                cand = _resolve_candidate(cleaned, s_dir)
+                if cand is not None:
+                    resolved = cand
+                    break
+                for ext in probe_extensions:
+                    cand = _resolve_candidate(f"{cleaned}{ext}", s_dir)
+                    if cand is not None:
+                        resolved = cand
+                        break
+                    cand = _resolve_candidate(f"{cleaned}/index{ext}", s_dir)
+                    if cand is not None:
+                        resolved = cand
+                        break
+                if resolved is not None:
+                    break
+
+            if resolved is None:
+                continue
+
+            rel_posix = resolved.relative_to(cand_root).as_posix()
+            if rel_posix in hints_by_file:
+                continue
+
+            if resolved.suffix.lower() == ".py":
+                try:
+                    retriever = AstWorkspaceRetriever(cand_root)
+                    res = retriever.retrieve(path=rel_posix)
+                    struct_parts = []
+                    if res.definitions:
+                        struct_parts.append("Definitions: " + ", ".join(d.name for d in res.definitions[:10]))
+                    if res.symbols:
+                        struct_parts.append("Symbols: " + ", ".join(f"{s.kind} {s.name}" for s in res.symbols[:10]))
+                    if res.imports:
+                        struct_parts.append("Imports: " + ", ".join(i.name for i in res.imports[:10]))
+                    snippet = "\n".join(struct_parts) if struct_parts else "No top-level structure found."
+                except Exception:
+                    file_lines = resolved.read_text(encoding="utf-8", errors="replace").splitlines()[:max_lines]
+                    snippet = "\n".join(f"{i+1}: {file_lines[i]}" for i in range(len(file_lines)))
+            else:
+                file_lines = resolved.read_text(encoding="utf-8", errors="replace").splitlines()[:max_lines]
+                snippet = "\n".join(f"{i+1}: {file_lines[i]}" for i in range(len(file_lines)))
+
+            hints_by_file[rel_posix] = {
+                "file": rel_posix,
+                "type": "referenced_file",
+                "snippet": snippet,
+                "confidence": "hint, may be incomplete",
+            }
+
+    source_hints: List[Dict[str, Any]] = []
+    total_chars = 0
+    for h in list(hints_by_file.values())[:max_files]:
+        h_copy = dict(h)
+        snip = h_copy.get("snippet", "")
+        rem = max_chars - total_chars
+        if rem <= 0:
+            break
+        if len(snip) > rem:
+            h_copy["snippet"] = snip[:rem]
+        total_chars += len(h_copy["snippet"])
+        source_hints.append(h_copy)
+
+    return source_hints
+
+
 def _attempt_evidence(
     state: State,
     *,
@@ -277,6 +461,8 @@ def _attempt_evidence(
     test_info: Optional[Dict[str, Any]] = None,
     subgoal: Optional[Subgoal] = None,
     tests_ran: bool = False,
+    workspace: Optional[Any] = None,
+    worktree_dir: Optional[Union[str, Path]] = None,
 ) -> Dict[str, Any]:
     """Build a bounded, deterministic repair packet for a failed attempt."""
     compile_info = compile_info if isinstance(compile_info, dict) else {}
@@ -304,7 +490,35 @@ def _attempt_evidence(
     unknowns = ["root cause is not established by deterministic checks"]
     if not new_errors and not baseline_errors:
         unknowns.append("no compiler baseline/new-error comparison is available")
-    required = ["inspect the affected files and relevant tests before retrying"]
+
+    # Build source hints from error outputs
+    candidate_root: Optional[Path] = None
+    if worktree_dir:
+        candidate_root = Path(worktree_dir)
+    elif workspace and getattr(workspace, "worktree_dir", None):
+        candidate_root = Path(workspace.worktree_dir)
+    elif state.get("current_worktree_path"):
+        candidate_root = Path(state["current_worktree_path"])
+    elif workspace and getattr(workspace, "repo_dir", None):
+        candidate_root = Path(workspace.repo_dir)
+
+    err_tokens = [str(output or ""), str(detail or "")]
+    if compile_info:
+        for ne in compile_info.get("new_errors") or []:
+            err_tokens.append(str(ne))
+        if compile_info.get("output_tail"):
+            err_tokens.append(str(compile_info["output_tail"]))
+    if test_info and test_info.get("output_tail"):
+        err_tokens.append(str(test_info["output_tail"]))
+    combined_err = "\n".join(err_tokens)
+
+    source_hints = _build_source_hints(combined_err, candidate_root)
+    if source_hints:
+        hint_file = source_hints[0]["file"]
+        required = [f"read {hint_file} before retrying"]
+    else:
+        required = ["inspect the affected files and relevant tests before retrying"]
+
     constraints = ["do not repeat a prior diff hash", "preserve declared write scope", "pass Tier 0 before semantic validation"]
     selected_trajectory = []
     selected_read_evidence = []
@@ -333,6 +547,7 @@ def _attempt_evidence(
         "known_facts": known_facts,
         "unknowns": unknowns,
         "required_inspection": required,
+        "source_hints": source_hints,
         "prior_attempts": previous,
         "retry_constraints": constraints,
         "selected_trajectory": selected_trajectory[:3],
@@ -2255,6 +2470,8 @@ def node_implement(
             workspace.worktree_dir = Path(state["current_worktree_path"])
 
     executed_tools: List[Dict[str, Any]] = []
+    self_check_calls = 0
+    self_check_outcomes: List[str] = []
 
     if llm is not None and subgoal is not None and workspace is not None:
         submitted = False
@@ -2312,8 +2529,15 @@ def node_implement(
             )
 
         def _validate_changes(paths: Optional[List[str]] = None) -> str:
-            """Run a bounded, read-only syntax check on scoped changed Python files."""
+            """Run advisory compile and syntax checks on staged files."""
+            nonlocal self_check_calls, self_check_outcomes
+            self_check_calls += 1
+            if self_check_calls > 4:
+                self_check_outcomes.append("skipped (limit reached)")
+                return "Self-check: skipped (limit reached)"
+
             if implementation_root is None:
+                self_check_outcomes.append("failed")
                 return "Self-check: failed\nReason: implementation worktree is unavailable."
 
             scope_paths = {
@@ -2328,67 +2552,151 @@ def node_implement(
                     candidates = sorted(Workspace._extract_files_from_diff(str(diff or "")))
                 except Exception:
                     candidates = []
+            if not candidates and hasattr(workspace, "worker_staged_paths") and workspace.worker_staged_paths:
+                candidates = sorted(list(workspace.worker_staged_paths))
             if not candidates:
                 candidates = list(scope_paths)
 
-            safe_python_files: List[str] = []
             for raw_path in candidates:
                 normalized = Path(str(raw_path).replace("\\", "/")).as_posix().lstrip("./")
-                if scope_paths and normalized not in scope_paths:
+                if scope_paths and not _path_in_declared_scope(normalized):
+                    self_check_outcomes.append("failed")
                     return _cap_self_check_output(
                         f"Self-check: failed\nReason: path '{raw_path}' is outside declared scope."
                     )
-                if Path(normalized).suffix.lower() != ".py":
-                    continue
                 target = (implementation_root / normalized).resolve()
                 try:
                     target.relative_to(implementation_root)
                 except ValueError:
+                    self_check_outcomes.append("failed")
                     return _cap_self_check_output(
                         f"Self-check: failed\nReason: path '{raw_path}' escapes the implementation worktree."
                     )
-                if not target.is_file():
-                    return _cap_self_check_output(
-                        f"Self-check: failed\nReason: Python file '{normalized}' was not found."
+
+            safe_python_files = sorted(set(
+                f for f in candidates
+                if Path(f).suffix.lower() == ".py" and (implementation_root / f).is_file()
+            ))
+
+            python_syntax_error: Optional[str] = None
+            if safe_python_files:
+                checker = (
+                    "import ast, pathlib, sys\n"
+                    "for name in sys.argv[1:]:\n"
+                    "    source = pathlib.Path(name).read_text(encoding='utf-8')\n"
+                    "    ast.parse(source, filename=name)\n"
+                    "    print(f'OK: {name}')\n"
+                )
+                try:
+                    completed = subprocess.run(
+                        [sys.executable, "-c", checker, *safe_python_files],
+                        cwd=str(implementation_root),
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=120,
+                        check=False,
                     )
-                safe_python_files.append(normalized)
+                    if completed.returncode != 0:
+                        commit_ref = state.get("subgoal_base_commit") or state.get("base_commit") or getattr(workspace, "base_commit", None)
+                        is_new_error = True
+                        if commit_ref and hasattr(workspace, "_run_repo_git"):
+                            base_err_count = 0
+                            for py_f in safe_python_files:
+                                show_res = workspace._run_repo_git(["show", f"{commit_ref}:{py_f}"])
+                                if show_res.returncode == 0:
+                                    try:
+                                        ast.parse(show_res.stdout, filename=py_f)
+                                    except SyntaxError:
+                                        base_err_count += 1
+                            if base_err_count == len(safe_python_files):
+                                is_new_error = False
 
-            safe_python_files = sorted(set(safe_python_files))
-            if not safe_python_files:
-                return "Self-check: skipped\nReason: no changed Python files require a syntax check."
+                        if is_new_error:
+                            output = "\n".join(part for part in (completed.stdout, completed.stderr) if part).strip()
+                            python_syntax_error = (
+                                f"Self-check: failed\nCheck: Python syntax\nFiles: {', '.join(safe_python_files)}"
+                                + (f"\nDiagnostics:\n{output}" if output else "")
+                            )
+                except subprocess.TimeoutExpired:
+                    self_check_outcomes.append("timeout")
+                    return _cap_self_check_output(
+                        f"Self-check: timeout after 120 seconds\n"
+                        f"Check: Python syntax ({', '.join(safe_python_files)})"
+                    )
+                except Exception as exc:
+                    self_check_outcomes.append("failed")
+                    return _cap_self_check_output(f"Self-check: failed\nReason: {type(exc).__name__}")
 
-            checker = (
-                "import ast, pathlib, sys\n"
-                "for name in sys.argv[1:]:\n"
-                "    source = pathlib.Path(name).read_text(encoding='utf-8')\n"
-                "    ast.parse(source, filename=name)\n"
-                "    print(f'OK: {name}')\n"
-            )
-            try:
-                completed = subprocess.run(
-                    [sys.executable, "-c", checker, *safe_python_files],
-                    cwd=str(implementation_root),
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=SELF_CHECK_TIMEOUT_SECONDS,
-                    check=False,
-                )
-            except subprocess.TimeoutExpired:
+            if python_syntax_error is not None:
+                self_check_outcomes.append("failed")
+                return _cap_self_check_output(python_syntax_error)
+
+            # Match compile handler for candidate source files
+            commit_ref = state.get("subgoal_base_commit") or state.get("base_commit") or getattr(workspace, "base_commit", None)
+            matched_handler = None
+            if workspace is not None and hasattr(workspace, "check_compile"):
+                touched_sources = {
+                    Path(f).as_posix()
+                    for f in candidates
+                    if Path(f).suffix.lower() in ALL_SOURCE_EXTENSIONS
+                }
+                for h in ECOSYSTEM_COMPILE_HANDLERS:
+                    if h.matches(touched_sources, implementation_root, getattr(workspace, "repo_dir", implementation_root)):
+                        matched_handler = h
+                        break
+
+            if matched_handler is None:
+                if safe_python_files:
+                    self_check_outcomes.append("passed")
+                    return _cap_self_check_output(
+                        f"Self-check: passed\nCheck: Python syntax\nFiles: {', '.join(safe_python_files)}"
+                    )
+                self_check_outcomes.append("skipped")
+                return "Self-check: skipped\nReason: no changed files require a compile or syntax check."
+
+            if matched_handler.name == "python" and safe_python_files:
+                self_check_outcomes.append("passed")
                 return _cap_self_check_output(
-                    f"Self-check: timeout after {SELF_CHECK_TIMEOUT_SECONDS} seconds\n"
-                    f"Check: Python syntax ({', '.join(safe_python_files)})"
+                    f"Self-check: passed\nCheck: Python syntax\nFiles: {', '.join(safe_python_files)}"
                 )
-            except Exception as exc:
-                return _cap_self_check_output(f"Self-check: failed\nReason: {type(exc).__name__}")
 
-            output = "\n".join(part for part in (completed.stdout, completed.stderr) if part).strip()
-            status = "passed" if completed.returncode == 0 else "failed"
-            return _cap_self_check_output(
-                f"Self-check: {status}\nCheck: Python syntax\nFiles: {', '.join(safe_python_files)}"
-                + (f"\nDiagnostics:\n{output}" if output else "")
-            )
+            # Call workspace.check_compile
+            try:
+                compile_res = workspace.check_compile(scope=candidates, base_commit=commit_ref)
+            except Exception as exc:
+                self_check_outcomes.append("skipped")
+                return f"Self-check: skipped\nReason: {exc}"
+            finally:
+                if hasattr(workspace, "_compute_provenance_deltas"):
+                    workspace._compute_provenance_deltas()
+                if hasattr(workspace, "_discard_engine_touched"):
+                    workspace._discard_engine_touched()
+
+            c_outcome = compile_res.get("outcome")
+            detail = compile_res.get("detail", "")
+            new_errors = compile_res.get("new_errors") or []
+            ecosystem = compile_res.get("ecosystem") or matched_handler.name
+
+            if c_outcome == CompileOutcome.PASSED.value:
+                self_check_outcomes.append("passed")
+                return _cap_self_check_output(f"Self-check: passed\nCheck: {ecosystem} compile\nDetail: {detail}")
+            elif c_outcome == CompileOutcome.FAILED.value:
+                self_check_outcomes.append("failed")
+                err_lines = [f"Self-check: failed\nCheck: {ecosystem} compile\nDetail: {detail}"]
+                if new_errors:
+                    err_lines.append("Errors:\n" + "\n".join(new_errors))
+                elif compile_res.get("output_tail"):
+                    err_lines.append(f"Diagnostics:\n{compile_res.get('output_tail')}")
+                return _cap_self_check_output("\n".join(err_lines))
+            elif c_outcome in (CompileOutcome.EXEMPT.value, CompileOutcome.NO_COMPILE_COMMAND.value, CompileOutcome.ENV_NOT_READY.value):
+                self_check_outcomes.append("skipped")
+                reason = detail or "compile check not applicable"
+                return _cap_self_check_output(f"Self-check: skipped\nReason: {reason}")
+            else:
+                self_check_outcomes.append("skipped")
+                return _cap_self_check_output(f"Self-check: skipped\nReason: {detail}")
 
         @tool
         def validate_changes(paths: Optional[List[str]] = None) -> str:
@@ -2713,7 +3021,7 @@ def node_implement(
             "4. Stage all necessary code changes using the `stage_file_mutation` tool.\n"
             "   Only mutate files within the declared scope.\n"
             "5. Use `list_dir`, `read_file`, `grep`, and `inspect_structure` only for bounded, read-only inspection; they are limited to the worktree and a per-attempt call budget. `inspect_structure` is limited to the declared scope.\n"
-            "6. Before submission, you may call `validate_changes` for bounded, read-only diagnostics. It never replaces authoritative Tier 0.\n"
+            "6. Call `validate_changes` to type-check and validate your staged files before calling `submit_subgoal`. It provides bounded, read-only diagnostics on your changes (advisory only; it never replaces authoritative Tier 0).\n"
             "7. When all changes are staged and you are done, call the `submit_subgoal` tool to submit your work for gate verification."
         )
         prompt_text = "\n\n".join(prompt_lines)
@@ -2839,6 +3147,8 @@ def node_implement(
     traj_entry: Dict[str, Any] = {"node": "implement", "current_subgoal": subgoal_data}
     if executed_tools:
         traj_entry["tool_calls"] = executed_tools
+    traj_entry["self_check_calls"] = self_check_calls
+    traj_entry["self_check_outcomes"] = list(self_check_outcomes)
     state["trajectory"].append(traj_entry)
     return state
 
@@ -3174,6 +3484,7 @@ def node_gate(
                 diff=diff,
                 detail=f"Identical to attempt {prev_att_no}.",
                 subgoal=subgoal,
+                workspace=workspace,
             )
             duplicate_evidence["prior_attempts"] = [{
                 "hash": matching_fa.get("diff_sha", diff_sha),
@@ -3299,6 +3610,7 @@ def node_gate(
             diff=diff,
             detail="Implementation produced no diff.",
             subgoal=subgoal,
+            workspace=workspace,
         )
         state["mechanical_strike_count"] = state.get("mechanical_strike_count", 0) + 1
         state["gate_status"] = "mechanical_failure"
@@ -3468,6 +3780,7 @@ def node_gate(
         test_info=test_runner_telemetry,
         subgoal=subgoal,
         tests_ran=tests_ran,
+        workspace=workspace,
     )
 
     mech_ev = getattr(mech_result, "mech_evidence", None)
@@ -3891,6 +4204,7 @@ def node_gate(
         test_info=test_runner_telemetry,
         subgoal=subgoal,
         tests_ran=tests_ran,
+        workspace=workspace,
     )
     semantic_evidence["known_facts"].extend([
         f"semantic validity probability: {getattr(verdict, 'probability', None)}",

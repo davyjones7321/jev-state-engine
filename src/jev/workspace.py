@@ -1303,7 +1303,7 @@ class Workspace:
     def _discard_engine_touched(self) -> None:
         if not self.engine_touched_paths:
             return
-        if self.worktree_dir == self.repo_dir:
+        if self.worktree_dir == self.repo_dir and not getattr(self, "strict_provenance", False):
             return
         status_res = self._run_git(["status", "--porcelain", "-uall"])
         if status_res.returncode != 0 or not status_res.stdout:
@@ -1330,6 +1330,12 @@ class Workspace:
             self._run_git(["checkout", "--"] + tracked_to_revert)
         if untracked_to_clean:
             self._run_git(["clean", "-f", "--"] + untracked_to_clean)
+        self.engine_touched_paths.clear()
+
+    def discard_engine_touched(self) -> None:
+        """Compute deltas and discard all engine-touched artifacts."""
+        self._compute_provenance_deltas()
+        self._discard_engine_touched()
 
     def commit_subgoal(self, message: str = "Subgoal committed") -> None:
         self._compute_provenance_deltas()
@@ -3266,7 +3272,11 @@ class Workspace:
             else:
                 scope_set = {Path(s).as_posix() for s in scope}
             if scope_set:
-                touched_files = [f for f in touched_files if Path(f).as_posix() in scope_set]
+                touched_files = [
+                    f for f in touched_files
+                    if Path(f).as_posix() in scope_set
+                    or any(Path(f).as_posix().startswith(f"{s.rstrip('/')}/") for s in scope_set)
+                ]
 
         touched_source_files = [
             f for f in touched_files if Path(f).suffix.lower() in ALL_SOURCE_EXTENSIONS
