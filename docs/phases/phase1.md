@@ -96,16 +96,20 @@
 ```text
 === Verification Report for base: origin/phase0b-ci-and-verify-script ===
 Branch: phase1-freeze-evidence-contract
-Commit: 4352ce1ae6c7a0eeb894ca8720218c64b23433ab
+Commit: 7d8f3a69e51ef36b5be93702b40f402cdc07ae4d
 
 --- Diff stat vs origin/phase0b-ci-and-verify-script ---
-src/jev/engine.py                      |  47 +++-
+ docs/phases/phase0a.md                 |  97 +++++++
+ done.md => docs/phases/phase0b.md      |   0
+ docs/phases/phase1.md                  | 153 +++++++++++
+ scripts/verify_phase.py                |  28 +-
+ src/jev/engine.py                      |  47 +++-
  src/jev/ledger.py                      |  14 +-
  src/jev/mech_evidence.py               |   6 +
  src/jev/models.py                      |   1 +
  src/main.py                            |  20 +-
- tests/test_phase1_evidence_contract.py | 441 +++++++++++++++++++++++++++++++++
- 6 files changed, 520 insertions(+), 9 deletions(-)
+ tests/test_phase1_evidence_contract.py | 456 +++++++++++++++++++++++++++++++++
+ 10 files changed, 806 insertions(+), 16 deletions(-)
 
 --- Test Changes ---
 Added tests:
@@ -121,7 +125,7 @@ Added tests:
   + test_main_report_line_replaces_misleading_auto_policy
 
 --- Collected Test Counts ---
-  tests/test_phase1_evidence_contract.py: 10 tests collected in 2.58s
+  tests/test_phase1_evidence_contract.py: 10 tests collected in 1.64s
 
 --- Grep Checks ---
 Pattern 'git add -A' in src/jev/:
@@ -149,5 +153,5 @@ src\jev\models.py:38
 -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
 =========================== short test summary info ===========================
 SKIPPED [1] tests\test_live_substep_7a.py:9: Set RUN_LIVE_PIPELINE=1 to execute live pipeline
-767 passed, 1 skipped, 2 deselected, 2 warnings in 601.65s (0:10:01)
+767 passed, 1 skipped, 2 deselected, 2 warnings in 645.76s (0:10:45)
 ```
