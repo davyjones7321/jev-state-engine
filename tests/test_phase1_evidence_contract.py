@@ -1,6 +1,7 @@
 import ast
 import inspect
 import json
+import os
 import sqlite3
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -397,15 +398,29 @@ def test_grep_gate_does_not_read_legacy_classification_for_decisions():
 # 8. Report line replaces misleading test_policy=auto with real cause
 # ==============================================================================
 
-def test_main_report_line_replaces_misleading_auto_policy(capsys):
-    """main() replaces misleading test_policy=auto with real cause."""
+def test_main_report_line_replaces_misleading_auto_policy(capsys, monkeypatch):
+    """main() replaces misleading test_policy=auto with real cause hermetically."""
     from main import main
     import sys
 
-    # Simulate running main with args where test_policy is auto but expects_tests=false
-    # We can invoke main with mocks
-    with patch("main.JevEngine") as mock_engine_cls, \
+    # Hermetic isolation: ensure no reliance on real environment, .env, or network
+    monkeypatch.setenv("JEV_API_URL", "https://mock.typesafe.ai/v1/systemone")
+    monkeypatch.setenv("JEV_API_KEY", "mock_jev_key")
+    for k in list(os.environ.keys()):
+        if k.startswith("ADVISORY_") or k == "GOOGLE_API_KEY":
+            monkeypatch.delenv(k, raising=False)
+
+    with patch("main.dotenv_values", return_value={}), \
+         patch("main.Gatekeeper") as mock_gatekeeper_cls, \
+         patch("main.Workspace") as mock_workspace_cls, \
+         patch("main.JevEngine") as mock_engine_cls, \
          patch("main.SqliteLedger") as mock_ledger_cls:
+
+        mock_gatekeeper = MagicMock()
+        mock_gatekeeper_cls.return_value = mock_gatekeeper
+
+        mock_workspace = MagicMock()
+        mock_workspace_cls.return_value = mock_workspace
 
         mock_engine = MagicMock()
         mock_engine.execute.return_value = {

@@ -14,8 +14,8 @@ import sys
 from pathlib import Path
 
 
-def run_cmd(cmd, check=True):
-    res = subprocess.run(cmd, capture_output=True, text=True)
+def run_cmd(cmd, check=True, env=None):
+    res = subprocess.run(cmd, capture_output=True, text=True, env=env)
     if check and res.returncode != 0:
         raise RuntimeError(f"Command {' '.join(cmd)} failed (code {res.returncode}):\n{res.stderr}")
     return res
@@ -26,6 +26,12 @@ def main():
     repo_root = Path(__file__).resolve().parent.parent
 
     print(f"=== Verification Report for base: {base_ref} ===")
+
+    # Check for dirty working tree
+    status_res = run_cmd(["git", "status", "--porcelain"])
+    if status_res.stdout.strip():
+        print("WARNING: Working tree is dirty!")
+        print()
 
     # 1. Branch & Commit
     branch_res = run_cmd(["git", "rev-parse", "--abbrev-ref", "HEAD"])
@@ -58,6 +64,15 @@ def main():
         print("(no new test functions added)")
     print()
 
+    clean_env = os.environ.copy()
+    clean_env.pop("ANTIGRAVITY_SOURCE_METADATA", None)
+    clean_env.pop("JEV_API_URL", None)
+    clean_env.pop("JEV_API_KEY", None)
+    clean_env.pop("GOOGLE_API_KEY", None)
+    for k in list(clean_env.keys()):
+        if k.startswith("ADVISORY_"):
+            clean_env.pop(k, None)
+
     # 4. Collected counts for new/modified test files
     print("--- Collected Test Counts ---")
     changed_files_res = run_cmd(["git", "diff", "--name-only", base_ref, "--", "tests/"])
@@ -65,7 +80,7 @@ def main():
     if changed_test_files:
         for tf in changed_test_files:
             if (repo_root / tf).exists():
-                c_res = run_cmd(["python", "-m", "pytest", tf, "--collect-only", "-q"])
+                c_res = run_cmd([sys.executable, "-m", "pytest", tf, "--collect-only", "-q"], env=clean_env)
                 summary_lines = [l for l in c_res.stdout.splitlines() if "collected" in l or "tests" in l]
                 last_line = summary_lines[-1] if summary_lines else c_res.stdout.strip()
                 print(f"  {tf}: {last_line}")
@@ -100,13 +115,11 @@ def main():
 
     # 6. Last lines of offline test suite with skipped reasons (-rs)
     print("--- Pytest Offline Suite Summary ---")
-    env = os.environ.copy()
-    env.pop("ANTIGRAVITY_SOURCE_METADATA", None)
     pytest_res = subprocess.run(
-        ["python", "-m", "pytest", "-q", "-rs", "-m", "not live"],
+        [sys.executable, "-m", "pytest", "-q", "-rs", "-m", "not live"],
         capture_output=True,
         text=True,
-        env=env,
+        env=clean_env,
         cwd=repo_root,
     )
     lines = [l for l in pytest_res.stdout.splitlines() if l.strip()]

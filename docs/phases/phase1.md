@@ -45,7 +45,7 @@
     7. `test_node_gate_records_untested_and_exit_only_subgoals`: tests both exit-only and untested subgoals are collected in `mechanically_unverified_subgoals` with kinds in ledger and trajectory.
     8. `test_no_string_replacement_of_full_suite_passed`: asserts no string replacement workaround exists in `src/jev/engine.py`.
     9. `test_grep_gate_does_not_read_legacy_classification_for_decisions`: AST & grep test proving `node_gate` and `route_gate` do not read legacy classification strings for decisions.
-    10. `test_main_report_line_replaces_misleading_auto_policy`: tests CLI report replaces misleading text with the real cause.
+    10. `test_main_report_line_replaces_misleading_auto_policy`: tests CLI report replaces misleading text with the real cause hermetically.
 
 ---
 
