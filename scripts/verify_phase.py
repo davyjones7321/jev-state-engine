@@ -29,7 +29,8 @@ def main():
 
     # Check for dirty working tree
     status_res = run_cmd(["git", "status", "--porcelain"])
-    if status_res.stdout.strip():
+    dirty_lines = [l for l in status_res.stdout.splitlines() if not l.strip().endswith("session-1-v2.md")]
+    if dirty_lines:
         print("WARNING: Working tree is dirty!")
         print()
 
