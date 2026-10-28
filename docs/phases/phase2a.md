@@ -99,3 +99,69 @@ All 767 existing offline tests continue to pass completely untouched.
 ---
 
 ## 8. Verification Output
+
+```
+=== Verification Report for base: origin/promote/eval-production ===
+Branch: phase2a-runner-registry
+Commit: 96ecfd21ea726e7cf6db74416f4d02c2e9387712
+
+--- Diff stat vs origin/promote/eval-production ---
+docs/phases/phase2a.md        | 101 +++++++++
+ src/jev/runner_profiles.json  | 489 ++++++++++++++++++++++++++++++++++++++++++
+ src/jev/runner_registry.py    | 452 ++++++++++++++++++++++++++++++++++++++
+ src/jev/workspace.py          | 204 +++++-------------
+ tests/test_runner_registry.py | 393 +++++++++++++++++++++++++++++++++
+ 5 files changed, 1490 insertions(+), 149 deletions(-)
+
+--- Test Changes ---
+Added tests:
+  + test_registry_loads_and_validates_schema
+  + test_schema_rejects_extra_fields
+  + test_schema_rejects_missing_required_fields
+  + test_regex_pattern_valid
+  + test_regex_pattern_exceeds_length_cap
+  + test_regex_pattern_rejects_nested_quantifiers
+  + test_regex_pattern_rejects_invalid_syntax
+  + test_pathological_input_safety
+  + test_detection_runs_no_subprocess
+  + test_version_predicates_evaluation
+  + test_one_fixture_per_row_detection
+  + test_ambiguity_returns_no_command_with_candidate_ids
+  + test_ambiguity_js_runners
+  + test_zero_matches_returns_no_command
+  + test_package_json_precedence_over_other_markers
+  + test_derive_runner_profile_id_from_package_json
+  + test_command_identity_includes_registry_version_and_profile_id
+  + test_registry_version_bump_causes_cache_miss
+
+--- Collected Test Counts ---
+  tests/test_runner_registry.py: 47 tests collected in 0.87s
+
+--- Grep Checks ---
+Pattern 'git add -A' in src/jev/:
+  None found (clean)
+Pattern 'run_baseline_tests(' in src/jev/engine.py:
+  None found in engine.py (clean)
+Occurrences of 'FULL_SUITE_PASSED' in workspace.py and engine.py:
+  src/jev/engine.py:4772:                verify_classification = "FULL_SUITE_PASSED"
+  src/jev/workspace.py:1814:                    "outcome": TestOutcome.FULL_SUITE_PASSED.value,
+  src/jev/workspace.py:3744:                        test_classification = TestOutcome.FULL_SUITE_PASSED.value
+Occurrences of 'worktree_dir == self.repo_dir' in workspace.py (guard check):
+  src/jev/workspace.py:1164:        if self.worktree_dir == self.repo_dir:
+  src/jev/workspace.py:1197:        if self.worktree_dir == self.repo_dir:
+  src/jev/workspace.py:1228:        if self.worktree_dir == self.repo_dir:
+
+--- Pytest Offline Suite Summary ---
+.......................                                                  [100%]
+============================== warnings summary ===============================
+C:\Users\DavyJ\miniconda3\Lib\site-packages\langgraph\checkpoint\serde\encrypted.py:5
+  C:\Users\DavyJ\miniconda3\Lib\site-packages\langgraph\checkpoint\serde\encrypted.py:5: LangChainPendingDeprecationWarning: The default value of `allowed_objects` will change in a future version. Pass an explicit value (e.g., allowed_objects='messages' or allowed_objects='core') to suppress this warning.
+    from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+src\jev\models.py:38
+  D:\edge-downloades\d\intership-projects\jev-state-engine\src\jev\models.py:38: PytestCollectionWarning: cannot collect test class 'TestPolicy' because it has a __init__ constructor (from: tests/test_evidence.py)
+    class TestPolicy(str, Enum):
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ===========================
+SKIPPED [1] tests\test_live_substep_7a.py:9: Set RUN_LIVE_PIPELINE=1 to execute live pipeline
+814 passed, 1 skipped, 2 deselected, 2 warnings in 696.84s (0:11:36)
+```
