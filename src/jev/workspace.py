@@ -646,6 +646,8 @@ class ResolvedTestCommand:
     command: Optional[List[str]]
     source: str
     reason: Optional[str] = None
+    runner_profile_id: Optional[str] = None
+    registry_version: Optional[str] = None
 
 
 def compare_test_runs(before: Optional[dict], after: Optional[dict]) -> dict:
@@ -663,139 +665,17 @@ def compare_test_runs(before: Optional[dict], after: Optional[dict]) -> dict:
 def resolve_test_command(wt: Union[str, Path]) -> ResolvedTestCommand:
     """Detects the test command from repository manifests without running subprocesses or writing files.
 
-    Returns a ResolvedTestCommand with ecosystem, command (list or None), source (rule/file matched),
-    and reason (explanation if command is None).
+    Thin wrapper delegating detection to the runner profiles registry.
     """
-    wt = Path(wt)
-
-    # 1. package.json test script
-    pkg_json_path = wt / "package.json"
-    if pkg_json_path.exists():
-        try:
-            pkg_data = json.loads(pkg_json_path.read_text(encoding="utf-8", errors="replace"))
-            if isinstance(pkg_data, dict):
-                scripts = pkg_data.get("scripts")
-                if isinstance(scripts, dict) and "test" in scripts:
-                    if (wt / "yarn.lock").exists():
-                        return ResolvedTestCommand(ecosystem="yarn", command=["yarn", "test"], source="package.json")
-                    elif (wt / "pnpm-lock.yaml").exists():
-                        return ResolvedTestCommand(ecosystem="pnpm", command=["pnpm", "test"], source="package.json")
-                    else:
-                        return ResolvedTestCommand(ecosystem="npm", command=["npm", "test"], source="package.json")
-        except Exception as e:
-            return ResolvedTestCommand(
-                ecosystem="package_json",
-                command=None,
-                source="package.json",
-                reason=f"Failed to parse package.json: {e}",
-            )
-
-    # 2. go.mod
-    if (wt / "go.mod").exists():
-        return ResolvedTestCommand(ecosystem="go", command=["go", "test", "./..."], source="go.mod")
-
-    # 3. Cargo.toml
-    if (wt / "Cargo.toml").exists():
-        return ResolvedTestCommand(ecosystem="cargo", command=["cargo", "test"], source="Cargo.toml")
-
-    # 4. pom.xml
-    if (wt / "pom.xml").exists():
-        mvn_cmd = "mvn"
-        if sys.platform == "win32" and (wt / "mvnw.cmd").exists():
-            mvn_cmd = str(wt / "mvnw.cmd")
-        elif (wt / "mvnw").exists():
-            mvn_cmd = "./mvnw"
-        elif (wt / "mvnw.cmd").exists():
-            mvn_cmd = str(wt / "mvnw.cmd")
-        return ResolvedTestCommand(ecosystem="maven", command=[mvn_cmd, "test"], source="pom.xml")
-
-    # 5. build.gradle / build.gradle.kts
-    if (wt / "build.gradle").exists() or (wt / "build.gradle.kts").exists():
-        gradle_cmd = "gradle"
-        if sys.platform == "win32" and (wt / "gradlew.bat").exists():
-            gradle_cmd = str(wt / "gradlew.bat")
-        elif (wt / "gradlew").exists():
-            gradle_cmd = "./gradlew"
-        elif (wt / "gradlew.bat").exists():
-            gradle_cmd = str(wt / "gradlew.bat")
-        source = "build.gradle" if (wt / "build.gradle").exists() else "build.gradle.kts"
-        return ResolvedTestCommand(ecosystem="gradle", command=[gradle_cmd, "test"], source=source)
-
-    # 6. pytest signals
-    has_pytest = False
-    pytest_source = None
-    if (wt / "pytest.ini").exists():
-        has_pytest = True
-        pytest_source = "pytest.ini"
-    elif (wt / "pyproject.toml").exists():
-        try:
-            pyproj_text = (wt / "pyproject.toml").read_text(encoding="utf-8", errors="replace")
-            if "[tool.pytest" in pyproj_text:
-                has_pytest = True
-                pytest_source = "pyproject.toml"
-        except Exception:
-            pass
-    if not has_pytest:
-        try:
-            has_pytest = (
-                any(wt.glob("test_*.py"))
-                or any(wt.glob("*_test.py"))
-                or ((wt / "tests").is_dir() and (any((wt / "tests").glob("*.py")) or any((wt / "tests").rglob("*.py"))))
-            )
-            if has_pytest:
-                pytest_source = "python_test_files"
-        except Exception:
-            pass
-
-    if has_pytest:
-        return ResolvedTestCommand(
-            ecosystem="pytest",
-            command=[sys.executable, "-m", "pytest", "-q"],
-            source=pytest_source or "pytest",
-        )
-
-    # 7. IaC signals
-    # Terraform
-    has_tf = False
-    try:
-        has_tf = any(wt.glob("*.tf")) or any(p for p in wt.rglob("*.tf") if ".terraform" not in p.parts)
-    except Exception:
-        pass
-
-    if has_tf:
-        return ResolvedTestCommand(ecosystem="terraform", command=["terraform", "validate"], source="terraform")
-
-    # Ansible
-    has_ansible = (
-        (wt / "ansible.cfg").exists()
-        or (wt / "playbooks").is_dir()
-        or any(wt.glob("playbook*.yml"))
-        or any(wt.glob("playbook*.yaml"))
-    )
-    if has_ansible:
-        if shutil.which("ansible-lint"):
-            return ResolvedTestCommand(ecosystem="ansible", command=["ansible-lint"], source="ansible")
-        elif shutil.which("ansible-playbook"):
-            playbooks = list(wt.glob("playbook*.yml")) + list(wt.glob("playbook*.yaml"))
-            pb_arg = str(playbooks[0]) if playbooks else "."
-            return ResolvedTestCommand(
-                ecosystem="ansible",
-                command=["ansible-playbook", "--syntax-check", pb_arg],
-                source="ansible",
-            )
-        else:
-            return ResolvedTestCommand(ecosystem="ansible", command=["ansible-lint"], source="ansible")
-
-    # Helm
-    if (wt / "Chart.yaml").exists():
-        return ResolvedTestCommand(ecosystem="helm", command=["helm", "lint", "."], source="Chart.yaml")
-
-    # 8. Fallback
+    from jev.runner_registry import resolve_from_registry
+    res = resolve_from_registry(wt)
     return ResolvedTestCommand(
-        ecosystem=None,
-        command=None,
-        source="none",
-        reason="No test framework or test files detected",
+        ecosystem=res.ecosystem,
+        command=res.command,
+        source=res.source,
+        reason=res.reason,
+        runner_profile_id=res.runner_profile_id,
+        registry_version=res.registry_version,
     )
 
 
@@ -876,6 +756,9 @@ class Workspace:
         stderr: str = "",
         outcome: TestOutcome = TestOutcome.NO_TESTS_COLLECTED,
         executed_command: Optional[List[str]] = None,
+        runner_profile_id: Optional[str] = None,
+        registry_version: Optional[str] = None,
+        script_text: Optional[str] = None,
     ) -> TestOutcome:
         stdout_tail = stdout[-1000:] if stdout else ""
         stderr_tail = stderr[-1000:] if stderr else ""
@@ -911,10 +794,18 @@ class Workspace:
             c_cwd = str(getattr(self, "worktree_dir", Path.cwd()))
             c_tool_path = resolved_tool
 
+        res_cmd = getattr(self, "_current_resolved_test_command", None)
+        r_profile_id = runner_profile_id or (res_cmd.runner_profile_id if res_cmd else None)
+        r_reg_ver = registry_version or (res_cmd.registry_version if res_cmd else None)
+        r_script = script_text or (res_cmd.reason if (res_cmd and res_cmd.source == "package.json") else None)
+
         self.last_test_run = {
             "ecosystem": ecosystem,
             "command": command,
             "executed_command": executed_command if executed_command is not None else command,
+            "runner_profile_id": r_profile_id,
+            "registry_version": r_reg_ver,
+            "script_text": r_script,
             "exit_code": exit_code,
             # Bounded evidence: short output is exact; longer output is explicitly marked as truncated.
             "stdout": stdout_tail,
@@ -1752,6 +1643,7 @@ class Workspace:
         """
         wt = self.worktree_dir
         res = resolve_test_command(wt)
+        self._current_resolved_test_command = res
 
         if isinstance(targets, (str, bytes, Path)):
             raise ValueError("Test targets must be a sequence of relative paths, not a command string")
@@ -2147,12 +2039,25 @@ class Workspace:
         cand_outcome = self.run_tests(targets=test_targets)
         last_run = self.last_test_run or {}
 
+        from jev.runner_registry import load_registry
+        reg = load_registry()
+        registry_version = last_run.get("registry_version") or reg.registry_version
+        runner_profile_id = last_run.get("runner_profile_id")
+        script_text = last_run.get("script_text")
+        cmd_identity = {
+            "cmd": last_run.get("argv"),
+            "registry_version": registry_version,
+            "profile_id": runner_profile_id,
+        }
+        if script_text:
+            cmd_identity["script_text"] = script_text
+
         if last_run.get("launch_failed") or cand_outcome == TestOutcome.ENV_NOT_READY:
             return MechanicalEvidence(
                 mech_status=MechStatus.UNMEASURED,
                 reason=MechReason.MISSING_TOOL,
                 mechanically_unverified=True,
-                command_identity={"cmd": last_run.get("argv")},
+                command_identity={**cmd_identity, "cmd": last_run.get("argv")},
                 target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
             )
 
@@ -2161,7 +2066,7 @@ class Workspace:
                 mech_status=MechStatus.UNMEASURED,
                 reason=MechReason.TIMEOUT,
                 mechanically_unverified=True,
-                command_identity={"cmd": last_run.get("argv")},
+                command_identity={**cmd_identity, "cmd": last_run.get("argv")},
                 target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
             )
 
@@ -2181,7 +2086,7 @@ class Workspace:
                 mechanically_unverified=True if is_exit_only else False,
                 base_status=None,
                 comparison=Comparison.NOT_COMPARED,
-                command_identity={"cmd": last_run.get("argv")},
+                command_identity={**cmd_identity, "cmd": last_run.get("argv")},
                 target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
             )
 
@@ -2193,7 +2098,7 @@ class Workspace:
                 mech_status=MechStatus.UNMEASURED,
                 reason=MechReason.TOOLING_ERROR,
                 mechanically_unverified=True,
-                command_identity={"cmd": None},
+                command_identity={**cmd_identity, "cmd": None},
                 target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
             )
         if self._candidate_run_counts.get(attempt_key, 0) >= 2:
@@ -2201,7 +2106,7 @@ class Workspace:
                 mech_status=MechStatus.UNMEASURED,
                 reason=MechReason.TOOLING_ERROR,
                 mechanically_unverified=True,
-                command_identity={"cmd": last_run.get("argv")},
+                command_identity={**cmd_identity, "cmd": last_run.get("argv")},
                 target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
             )
         self._candidate_run_counts[attempt_key] = self._candidate_run_counts.get(attempt_key, 0) + 1
@@ -2214,7 +2119,7 @@ class Workspace:
                 mech_status=MechStatus.UNMEASURED,
                 reason=MechReason.TIMEOUT,
                 mechanically_unverified=True,
-                command_identity={"cmd": last_run.get("argv")},
+                command_identity={**cmd_identity, "cmd": last_run.get("argv")},
                 target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
             )
         if rerun_details.get("launch_failed"):
@@ -2222,7 +2127,7 @@ class Workspace:
                 mech_status=MechStatus.UNMEASURED,
                 reason=MechReason.MISSING_TOOL,
                 mechanically_unverified=True,
-                command_identity={"cmd": last_run.get("argv")},
+                command_identity={**cmd_identity, "cmd": last_run.get("argv")},
                 target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
             )
 
@@ -2232,7 +2137,7 @@ class Workspace:
                 mech_status=MechStatus.UNMEASURED,
                 reason=MechReason.FLAKY,
                 mechanically_unverified=True,
-                command_identity={"cmd": last_run.get("argv")},
+                command_identity={**cmd_identity, "cmd": last_run.get("argv")},
                 target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
             )
 
@@ -2249,7 +2154,7 @@ class Workspace:
                 mech_status=MechStatus.UNMEASURED,
                 reason=MechReason.FLAKY,
                 mechanically_unverified=True,
-                command_identity={"cmd": last_run.get("argv")},
+                command_identity={**cmd_identity, "cmd": last_run.get("argv")},
                 target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
             )
 
@@ -2275,7 +2180,7 @@ class Workspace:
                         comparison=Comparison.CANDIDATE_ONLY,
                         target_rule="provisional",
                         attribution_note=note,
-                        command_identity={"cmd": last_run.get("argv")},
+                        command_identity={**cmd_identity, "cmd": last_run.get("argv")},
                         target_scope={"kind": "targets", "paths": [str(x) for x in test_targets], "new_target": (present_at_base == 0)},
                     )
                 else:
@@ -2287,7 +2192,7 @@ class Workspace:
                         mechanically_unverified=True,
                         target_rule="provisional",
                         attribution_note=note,
-                        command_identity={"cmd": last_run.get("argv")},
+                        command_identity={**cmd_identity, "cmd": last_run.get("argv")},
                         target_scope={"kind": "targets", "paths": [str(x) for x in test_targets], "new_target": (present_at_base == 0)},
                     )
 
@@ -2302,6 +2207,7 @@ class Workspace:
             tuple(sorted(str(t) for t in (test_targets or []))),
             lockfile_hash,
             tool_version,
+            registry_version,
         )
 
         base_res_data = None
@@ -2317,7 +2223,7 @@ class Workspace:
                     base_status=BaseStatus.UNMEASURED,
                     comparison=Comparison.INCONCLUSIVE,
                     mechanically_unverified=True,
-                    command_identity={"cmd": test_cmd},
+                    command_identity={**cmd_identity, "cmd": test_cmd},
                     target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
                 )
 
@@ -2341,7 +2247,7 @@ class Workspace:
                 base_status=BaseStatus.UNMEASURED,
                 comparison=Comparison.INCONCLUSIVE,
                 mechanically_unverified=True,
-                command_identity={"cmd": test_cmd},
+                command_identity={**cmd_identity, "cmd": test_cmd},
                 target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
             )
 
@@ -2351,7 +2257,7 @@ class Workspace:
                 evidence_level=EvidenceLevel.EXIT_ONLY,
                 base_status=BaseStatus.PASS,
                 comparison=Comparison.CANDIDATE_ONLY,
-                command_identity={"cmd": test_cmd},
+                command_identity={**cmd_identity, "cmd": test_cmd},
                 target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
             )
 
@@ -2367,7 +2273,7 @@ class Workspace:
                         base_status=BaseStatus.FAIL,
                         comparison=Comparison.CANDIDATE_ONLY,
                         evidence_level=EvidenceLevel.NAMED,
-                        command_identity={"cmd": test_cmd},
+                        command_identity={**cmd_identity, "cmd": test_cmd},
                         target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
                     )
                 else:
@@ -2377,7 +2283,7 @@ class Workspace:
                         comparison=Comparison.SAME,
                         evidence_level=EvidenceLevel.NAMED,
                         mechanically_unverified=False,
-                        command_identity={"cmd": test_cmd},
+                        command_identity={**cmd_identity, "cmd": test_cmd},
                         target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
                     )
             else:
@@ -2387,7 +2293,7 @@ class Workspace:
                     base_status=BaseStatus.FAIL,
                     comparison=Comparison.INCONCLUSIVE,
                     mechanically_unverified=True,
-                    command_identity={"cmd": test_cmd},
+                    command_identity={**cmd_identity, "cmd": test_cmd},
                     target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
                 )
 
@@ -2397,7 +2303,7 @@ class Workspace:
             base_status=BaseStatus.UNMEASURED,
             comparison=Comparison.INCONCLUSIVE,
             mechanically_unverified=True,
-            command_identity={"cmd": test_cmd},
+            command_identity={**cmd_identity, "cmd": test_cmd},
             target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
         )
 
