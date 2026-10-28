@@ -118,4 +118,76 @@ When running `pytest -q -rs -m "not live"`, 18 tests are skipped:
 ---
 
 ## 6. Verification Script Output
-*(To be appended after commit)*
+
+```text
+=== Verification Report for base: origin/phase2a-runner-registry ===
+Branch: phase2b-real-fixtures
+Commit: 0ec072295e69a0e3e9b2fb8fe12b2436f2db700f
+
+--- Diff stat vs origin/phase2a-runner-registry ---
+docs/phases/phase2b.md                       | 121 +++++++++++
+ tests/fixtures/runners/ansible.json          |  17 ++
+ tests/fixtures/runners/bun-test.json         |  68 ++++++
+ tests/fixtures/runners/cargo-test.json       |  65 ++++++
+ tests/fixtures/runners/cmake-ctest.json      |  17 ++
+ tests/fixtures/runners/deno-test.json        |  18 ++
+ tests/fixtures/runners/dotnet-test.json      |  17 ++
+ tests/fixtures/runners/go-test.json          |  18 ++
+ tests/fixtures/runners/gradle-test.json      |  17 ++
+ tests/fixtures/runners/helm.json             |  17 ++
+ tests/fixtures/runners/jest.json             |  17 ++
+ tests/fixtures/runners/maven-surefire.json   |  17 ++
+ tests/fixtures/runners/mix-test.json         |  17 ++
+ tests/fixtures/runners/mocha.json            |  17 ++
+ tests/fixtures/runners/node-native-test.json |  65 ++++++
+ tests/fixtures/runners/phpunit.json          |  17 ++
+ tests/fixtures/runners/pytest.json           |  76 +++++++
+ tests/fixtures/runners/ruby-rake.json        |  17 ++
+ tests/fixtures/runners/swiftpm-test.json     |  16 ++
+ tests/fixtures/runners/terraform.json        |  17 ++
+ tests/fixtures/runners/vitest.json           |  17 ++
+ tests/fixtures/runners/xcode-test.json       |  15 ++
+ tests/test_runner_fixtures.py                | 299 +++++++++++++++++++++++++++
+ 23 files changed, 982 insertions(+)
+
+--- Test Changes ---
+Added tests:
+  + test_fixtures_directory_exists
+  + test_all_registry_profiles_have_fixture_file
+  + test_fixture_structure_and_schema
+  + test_every_profile_either_captured_or_skipped_with_reason
+  + test_canonical_known_measured_values_in_fixtures
+  + test_fixture_zero_test_exit_matches_registry
+  + test_live_runner_execution_or_skip
+
+--- Collected Test Counts ---
+  tests/test_runner_fixtures.py: 27 tests collected in 0.68s
+
+--- Grep Checks ---
+Pattern 'git add -A' in src/jev/:
+  None found (clean)
+Pattern 'run_baseline_tests(' in src/jev/engine.py:
+  None found in engine.py (clean)
+Occurrences of 'FULL_SUITE_PASSED' in workspace.py and engine.py:
+  src/jev/engine.py:4772:                verify_classification = "FULL_SUITE_PASSED"
+  src/jev/workspace.py:1814:                    "outcome": TestOutcome.FULL_SUITE_PASSED.value,
+  src/jev/workspace.py:3744:                        test_classification = TestOutcome.FULL_SUITE_PASSED.value
+Occurrences of 'worktree_dir == self.repo_dir' in workspace.py (guard check):
+  src/jev/workspace.py:1164:        if self.worktree_dir == self.repo_dir:
+  src/jev/workspace.py:1197:        if self.worktree_dir == self.repo_dir:
+  src/jev/workspace.py:1228:        if self.worktree_dir == self.repo_dir:
+
+--- Pytest Offline Suite Summary ---
+SKIPPED [1] tests\test_runner_fixtures.py:258: Toolchain 'gradle' not found in PATH on win32
+SKIPPED [1] tests\test_runner_fixtures.py:258: Toolchain 'dotnet' not found in PATH on win32
+SKIPPED [1] tests\test_runner_fixtures.py:258: Toolchain 'ctest' not found in PATH on win32
+SKIPPED [1] tests\test_runner_fixtures.py:258: Toolchain 'rake' not found in PATH on win32
+SKIPPED [1] tests\test_runner_fixtures.py:258: Toolchain 'phpunit' not found in PATH on win32
+SKIPPED [1] tests\test_runner_fixtures.py:222: Profile 'swiftpm-test' not supported on win32 (platforms: ['linux', 'darwin'])
+SKIPPED [1] tests\test_runner_fixtures.py:258: Toolchain 'mix' not found in PATH on win32
+SKIPPED [1] tests\test_runner_fixtures.py:222: Profile 'xcode-test' not supported on win32 (platforms: ['darwin'])
+SKIPPED [1] tests\test_runner_fixtures.py:258: Toolchain 'terraform' not found in PATH on win32
+SKIPPED [1] tests\test_runner_fixtures.py:258: Toolchain 'ansible-lint' not found in PATH on win32
+SKIPPED [1] tests\test_runner_fixtures.py:258: Toolchain 'helm' not found in PATH on win32
+824 passed, 18 skipped, 2 deselected, 2 warnings in 668.51s (0:11:08)
+```
