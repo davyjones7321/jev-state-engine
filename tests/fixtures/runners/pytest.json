@@ -1,0 +1,76 @@
+{
+  "profile_id": "pytest",
+  "runner": "pytest",
+  "supported_platforms": [
+    "linux",
+    "darwin",
+    "win32"
+  ],
+  "captured_on_host": true,
+  "host_platform": "win32",
+  "tool_version": "pytest 9.1.1",
+  "skip_reason": null,
+  "known_reference": {
+    "zero_tests_exit": 5,
+    "all_skipped_exit": 0
+  },
+  "cases": {
+    "pass": {
+      "command": [
+        "C:\\Users\\DavyJ\\miniconda3\\python.exe",
+        "-m",
+        "pytest",
+        "-q"
+      ],
+      "exit_code": 0,
+      "stdout": ".                                                                        [100%]\n1 passed in 0.64s\n",
+      "stderr": ""
+    },
+    "fail": {
+      "command": [
+        "C:\\Users\\DavyJ\\miniconda3\\python.exe",
+        "-m",
+        "pytest",
+        "-q"
+      ],
+      "exit_code": 1,
+      "stdout": "F.                                                                       [100%]\n================================== FAILURES ===================================\n___________________________________ test_ng ___________________________________\n\n>   def test_ng(): assert False\n                   ^^^^^^^^^^^^\nE   assert False\n\ntest_f.py:1: AssertionError\n=========================== short test summary info ===========================\nFAILED test_f.py::test_ng - assert False\n1 failed, 1 passed in 1.15s\n",
+      "stderr": ""
+    },
+    "zero_tests": {
+      "command": [
+        "C:\\Users\\DavyJ\\miniconda3\\python.exe",
+        "-m",
+        "pytest",
+        "-q"
+      ],
+      "exit_code": 5,
+      "stdout": "\nno tests ran in 1.01s\n",
+      "stderr": ""
+    },
+    "filter_matches_nothing": {
+      "command": [
+        "C:\\Users\\DavyJ\\miniconda3\\python.exe",
+        "-m",
+        "pytest",
+        "-q",
+        "-k",
+        "nonexistent"
+      ],
+      "exit_code": 5,
+      "stdout": "\n1 deselected in 0.68s\n",
+      "stderr": ""
+    },
+    "all_skipped": {
+      "command": [
+        "C:\\Users\\DavyJ\\miniconda3\\python.exe",
+        "-m",
+        "pytest",
+        "-q"
+      ],
+      "exit_code": 0,
+      "stdout": "s                                                                        [100%]\n1 skipped in 0.66s\n",
+      "stderr": ""
+    }
+  }
+}

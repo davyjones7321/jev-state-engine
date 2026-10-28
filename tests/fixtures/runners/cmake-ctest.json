@@ -1,0 +1,17 @@
+{
+  "profile_id": "cmake-ctest",
+  "runner": "ctest",
+  "supported_platforms": [
+    "linux",
+    "darwin",
+    "win32"
+  ],
+  "captured_on_host": false,
+  "host_platform": "win32",
+  "tool_version": null,
+  "skip_reason": "Toolchain 'ctest' not found in PATH on win32",
+  "known_reference": {
+    "zero_tests_exit": 0
+  },
+  "cases": {}
+}

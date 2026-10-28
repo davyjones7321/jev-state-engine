@@ -1,0 +1,68 @@
+{
+  "profile_id": "bun-test",
+  "runner": "bun",
+  "supported_platforms": [
+    "linux",
+    "darwin",
+    "win32"
+  ],
+  "captured_on_host": true,
+  "host_platform": "win32",
+  "tool_version": "1.3.14",
+  "skip_reason": null,
+  "known_reference": {
+    "zero_tests_exit": 1,
+    "filter_matches_nothing_exit": 1,
+    "all_skipped_exit": 0,
+    "failure_marker": "(fail) Suite > test"
+  },
+  "cases": {
+    "pass": {
+      "command": [
+        "C:\\Users\\DavyJ\\.bun\\bin\\bun.EXE",
+        "test"
+      ],
+      "exit_code": 0,
+      "stdout": "bun test v1.3.14 (0d9b296a)\n",
+      "stderr": "\ntest_p.test.js:\n(pass) pass [0.20ms]\n\n 1 pass\n 0 fail\n 1 expect() calls\nRan 1 test across 1 file. [80.00ms]\n"
+    },
+    "fail": {
+      "command": [
+        "C:\\Users\\DavyJ\\.bun\\bin\\bun.EXE",
+        "test"
+      ],
+      "exit_code": 1,
+      "stdout": "bun test v1.3.14 (0d9b296a)\n",
+      "stderr": "\ntest_p.test.js:\n(pass) pass [0.14ms]\n\ntest_f.test.js:\n1 | import { test, expect } from 'bun:test'; test('fail', () => { expect(1).toBe(2); });\n                                                                            ^\nerror: expect(received).toBe(expected)\n\nExpected: 2\nReceived: 1\n\n      at <anonymous> (C:\\Users\\DavyJ\\AppData\\Local\\Temp\\tmpixvpjx30\\test_f.test.js:1:73)\n(fail) fail [0.70ms]\n\n 1 pass\n 1 fail\n 2 expect() calls\nRan 2 tests across 2 files. [57.00ms]\n"
+    },
+    "zero_tests": {
+      "command": [
+        "C:\\Users\\DavyJ\\.bun\\bin\\bun.EXE",
+        "test"
+      ],
+      "exit_code": 1,
+      "stdout": "bun test v1.3.14 (0d9b296a)\n",
+      "stderr": "No tests found!\n\nTests need \".test\", \"_test_\", \".spec\" or \"_spec_\" in the filename (ex: \"MyApp.test.ts\")\n\nLearn more about bun test: https://bun.com/docs/cli/test\n"
+    },
+    "filter_matches_nothing": {
+      "command": [
+        "C:\\Users\\DavyJ\\.bun\\bin\\bun.EXE",
+        "test",
+        "-t",
+        "nonexistent"
+      ],
+      "exit_code": 1,
+      "stdout": "bun test v1.3.14 (0d9b296a)\n",
+      "stderr": "\ntest_p.test.js:\n\nerror: regex \"nonexistent\" matched 0 tests. Searched 1 file (skipping 1 test) [52.00ms]\n"
+    },
+    "all_skipped": {
+      "command": [
+        "C:\\Users\\DavyJ\\.bun\\bin\\bun.EXE",
+        "test"
+      ],
+      "exit_code": 0,
+      "stdout": "bun test v1.3.14 (0d9b296a)\n",
+      "stderr": "\ntest_p.test.js:\n(skip) skip\n\n 0 pass\n 1 skip\n 0 fail\nRan 1 test across 1 file. [50.00ms]\n"
+    }
+  }
+}

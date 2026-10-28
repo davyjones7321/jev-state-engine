@@ -1,0 +1,16 @@
+{
+  "profile_id": "swiftpm-test",
+  "runner": "swift",
+  "supported_platforms": [
+    "linux",
+    "darwin"
+  ],
+  "captured_on_host": false,
+  "host_platform": "win32",
+  "tool_version": null,
+  "skip_reason": "Toolchain 'swift' not found in PATH on win32",
+  "known_reference": {
+    "zero_tests_exit": 0
+  },
+  "cases": {}
+}

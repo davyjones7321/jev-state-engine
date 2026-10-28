@@ -1,0 +1,15 @@
+{
+  "profile_id": "xcode-test",
+  "runner": "xcodebuild",
+  "supported_platforms": [
+    "darwin"
+  ],
+  "captured_on_host": false,
+  "host_platform": "win32",
+  "tool_version": null,
+  "skip_reason": "Profile 'xcode-test' is macOS-only (darwin), unavailable on win32",
+  "known_reference": {
+    "zero_tests_exit": 0
+  },
+  "cases": {}
+}
