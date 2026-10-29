@@ -13,12 +13,14 @@ from jev.repo_config import (
     PROTECTED_FILES,
     PROTECTED_PREFIXES,
     RepoConfig,
-    TrustBinding,
-    compute_approval_hash,
+    TrustRecord,
+    compute_command_hash,
     compute_repo_id,
+    get_trust_file_path,
     is_build_or_test_config,
     is_lockfile,
     is_protected_path,
+    is_shared_test_config_or_fixture,
     load_repo_config,
     record_trust,
     save_repo_config,
@@ -36,6 +38,29 @@ def _create_git_repo(path: Path, initial_text: str = "# Test Repo\n") -> Path:
     subprocess.run(["git", "add", "."], cwd=path, check=True, capture_output=True)
     subprocess.run(["git", "commit", "-m", "Initial commit"], cwd=path, check=True, capture_output=True)
     return path
+
+
+def _setup_trusted_test_repo(path: Path, test_body: str = "def test_ok(): pass\n") -> tuple[Path, RepoConfig]:
+    repo_dir = _create_git_repo(path)
+    (repo_dir / "test_suite.py").write_text(test_body, encoding="utf-8")
+    cfg = RepoConfig(
+        runner_profile_id="pytest",
+        test_command=[sys.executable, "-m", "pytest", "-q", "test_suite.py"],
+        cwd=".",
+    )
+    save_repo_config(cfg, repo_dir)
+    record_trust(cfg, repo_dir=repo_dir)
+    subprocess.run(["git", "add", "."], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "Add trusted test suite"], cwd=repo_dir, check=True, capture_output=True)
+    return repo_dir, cfg
+
+
+@pytest.fixture(autouse=True)
+def isolate_jev_home(tmp_path, monkeypatch):
+    """Isolate JEV_HOME trust storage for every test."""
+    jev_home = tmp_path / ".jev_home"
+    monkeypatch.setenv("JEV_HOME", str(jev_home))
+    return jev_home
 
 
 # ==============================================================================
@@ -122,70 +147,7 @@ def test_protected_path_in_diff_is_scope_violation(tmp_path):
 
 
 # ==============================================================================
-# 2. Command Change Invalidates Approval
-# ==============================================================================
-
-def test_command_change_invalidates_approval(tmp_path):
-    repo_dir = _create_git_repo(tmp_path / "repo")
-    cfg = RepoConfig(
-        runner_profile_id="pytest",
-        test_command=["pytest", "-q"],
-        cwd=".",
-    )
-    cfg = record_trust(cfg, repo_dir=repo_dir)
-    assert cfg.trust is not None
-    is_valid, err = validate_trust(cfg, repo_dir=repo_dir)
-    assert is_valid is True
-    assert err is None
-
-    # Change test command without owner re-approval
-    cfg.test_command = ["pytest", "-v", "--capture=no"]
-    is_valid, err = validate_trust(cfg, repo_dir=repo_dir)
-    assert is_valid is False
-    assert "command changed: approval invalidated" in err
-
-
-def test_untrusted_repo_config_returns_no_command(tmp_path):
-    repo_dir = _create_git_repo(tmp_path / "repo")
-    cfg = RepoConfig(
-        runner_profile_id="pytest",
-        test_command=["pytest", "-q"],
-        cwd=".",
-    )
-    cfg = record_trust(cfg, repo_dir=repo_dir)
-    # Save valid config
-    save_repo_config(cfg, repo_dir)
-
-    # Valid config resolves trusted command
-    res = resolve_test_command(repo_dir)
-    assert res.source == "trusted_repo_config"
-    assert res.command == ["pytest", "-q"]
-
-    # Tamper with test command in .jev/config.json directly
-    tampered_data = json.loads((repo_dir / ".jev" / "config.json").read_text(encoding="utf-8"))
-    tampered_data["test_command"] = ["pytest", "--tampered-flag"]
-    (repo_dir / ".jev" / "config.json").write_text(json.dumps(tampered_data), encoding="utf-8")
-
-    # Now resolving returns untrusted config with command=None
-    res_tampered = resolve_test_command(repo_dir)
-    assert res_tampered.source == "untrusted_repo_config"
-    assert res_tampered.command is None
-    assert "approval_invalidated" in res_tampered.reason
-
-    # Workspace evaluate_tests produces UNMEASURED with approval_valid=False
-    ws = Workspace(repo_dir=repo_dir)
-    ws.create_subgoal_worktree(subgoal_id="sg-untrusted")
-    subgoal = Subgoal(id="sg-untrusted", description="test untrusted", scope=["src/app.py"])
-    ws.stage_file_mutation("src/app.py", "x = 1\n")
-    ev = ws.evaluate_tests(subgoal=subgoal)
-    assert ev is not None
-    assert ev.mech_status == MechStatus.UNMEASURED
-    assert ev.reason == MechReason.NO_COMMAND
-    assert ev.approval_valid is False
-
-
-# ==============================================================================
-# 3. Lockfile Change Keeps Approval and Invalidates Comparison
+# 2. Lockfile & Config Classifications
 # ==============================================================================
 
 def test_lockfile_classification():
@@ -201,39 +163,6 @@ def test_lockfile_classification():
     assert is_lockfile("src/app.py") is False
 
 
-def test_lockfile_change_keeps_approval_and_invalidates_comparison(tmp_path):
-    repo_dir = _create_git_repo(tmp_path / "repo")
-    (repo_dir / "package.json").write_text('{"name": "test-pkg", "scripts": {"test": "echo test"}}', encoding="utf-8")
-    (repo_dir / "package-lock.json").write_text('{"name": "test-pkg", "version": "1.0.0", "lockfileVersion": 3}', encoding="utf-8")
-    subprocess.run(["git", "add", "."], cwd=repo_dir, check=True)
-    subprocess.run(["git", "commit", "-m", "Add package files"], cwd=repo_dir, check=True)
-
-    ws = Workspace(repo_dir=repo_dir)
-    ws.create_subgoal_worktree(subgoal_id="subgoal-lockfile")
-
-    # Worker stages lockfile-only change
-    ws.stage_file_mutation("package-lock.json", '{"name": "test-pkg", "version": "1.0.1", "lockfileVersion": 3}')
-
-    subgoal = Subgoal(id="subgoal-lockfile", description="update lockfile", scope=["package-lock.json"])
-    ev = ws.evaluate_tests(subgoal=subgoal)
-
-    assert ev is not None
-    assert ev.mech_status == MechStatus.UNMEASURED
-    assert ev.reason == MechReason.COMMAND_IDENTITY_CHANGED
-    assert ev.approval_valid is True
-    assert ev.comparison_valid is False
-    assert ev.verifier_modified is False
-
-    # Also test cache miss: lockfile hash in worktree differs from repo_dir
-    hash_repo = ws._compute_lockfile_hash(ws.repo_dir)
-    hash_wt = ws._compute_lockfile_hash(ws.worktree_dir)
-    assert hash_repo != hash_wt
-
-
-# ==============================================================================
-# 4. Config Edit Sets verifier_modified
-# ==============================================================================
-
 def test_build_test_config_classification():
     assert is_build_or_test_config("pytest.ini") is True
     assert is_build_or_test_config(".pytest.ini") is True
@@ -245,6 +174,7 @@ def test_build_test_config_classification():
     assert is_build_or_test_config("Makefile") is True
     assert is_build_or_test_config("Taskfile.yml") is True
     assert is_build_or_test_config("Justfile") is True
+    assert is_build_or_test_config("tsconfig.json") is True
     assert is_build_or_test_config("package.json") is True
     assert is_build_or_test_config("pyproject.toml") is True
 
@@ -253,20 +183,235 @@ def test_build_test_config_classification():
     assert is_build_or_test_config("package-lock.json") is False
 
 
-def test_config_edit_sets_verifier_modified(tmp_path):
+def test_shared_test_config_or_fixture_classification():
+    assert is_shared_test_config_or_fixture("tests/conftest.py") is True
+    assert is_shared_test_config_or_fixture("conftest.py") is True
+    assert is_shared_test_config_or_fixture("tests/fixtures/data.json") is True
+    assert is_shared_test_config_or_fixture("src/fixtures/mock.py") is True
+    assert is_shared_test_config_or_fixture("setupTests.ts") is True
+    assert is_shared_test_config_or_fixture("test/setupTests.js") is True
+
+    assert is_shared_test_config_or_fixture("tests/test_main.py") is False
+    assert is_shared_test_config_or_fixture("src/utils.py") is False
+
+
+# ==============================================================================
+# 3. Rule 1 & Rule 5: Trust Lives Outside the Repo; Embedded Trust Ignored
+# ==============================================================================
+
+def test_embedded_trust_is_ignored_and_never_runs(tmp_path):
+    """A config that carries its own computed trust is NOT trusted and its command never runs."""
     repo_dir = _create_git_repo(tmp_path / "repo")
-    (repo_dir / "pytest.ini").write_text("[pytest]\naddopts = -q\n", encoding="utf-8")
-    (repo_dir / "test_app.py").write_text("def test_ok(): pass\n", encoding="utf-8")
+    marker_file = repo_dir / "executed.marker"
+
+    # Write .jev/config.json carrying its own embedded trust field
+    cfg_file = repo_dir / ".jev" / "config.json"
+    cfg_file.parent.mkdir(parents=True, exist_ok=True)
+    cfg_file.write_text(
+        json.dumps({
+            "runner_profile_id": "custom",
+            "test_command": [sys.executable, "-c", f"from pathlib import Path; Path('{marker_file.as_posix()}').write_text('ran')"],
+            "trust": {
+                "repo_id": "fake",
+                "command_hash": "deadbeef",
+                "approved_by": "attacker",
+            }
+        }),
+        encoding="utf-8",
+    )
     subprocess.run(["git", "add", "."], cwd=repo_dir, check=True)
-    subprocess.run(["git", "commit", "-m", "Add pytest files"], cwd=repo_dir, check=True)
+    subprocess.run(["git", "commit", "-m", "Add embedded trust"], cwd=repo_dir, check=True)
+
+    # 1. Config loads, embedded trust is ignored and flagged
+    cfg = load_repo_config(repo_dir)
+    assert cfg is not None
+    assert cfg.ignored_embedded_trust is True
+
+    # 2. Resolving test command returns NO_COMMAND
+    res = resolve_test_command(repo_dir)
+    assert res.source == "untrusted_repo_config"
+    assert res.command is None
+    assert res.reason == "untrusted_repo_config: run scripts/trust_repo.py"
+
+    # 3. Running evaluate_tests resolves to UNMEASURED(NO_COMMAND)
+    ws = Workspace(repo_dir=repo_dir)
+    ws.create_subgoal_worktree(subgoal_id="sg-embedded")
+    subgoal = Subgoal(id="sg-embedded", description="verify untrusted", scope=["src/app.py"], expects_tests=True)
+    ws.stage_file_mutation("src/app.py", "x = 1\n")
+    ev = ws.evaluate_tests(subgoal=subgoal)
+
+    assert ev is not None
+    assert ev.mech_status == MechStatus.UNMEASURED
+    assert ev.reason == MechReason.NO_COMMAND
+    assert ev.approval_valid is False
+
+    # 4. Command was never executed
+    assert not marker_file.exists()
+
+
+def test_external_trust_approval_and_command_invalidation(tmp_path):
+    """Owner trust written outside repo makes it trusted; any change invalidates it; embedded trust is ignored."""
+    repo_dir = _create_git_repo(tmp_path / "repo")
+    cfg = RepoConfig(
+        runner_profile_id="pytest",
+        test_command=[sys.executable, "-c", "import sys; sys.exit(0)"],
+        cwd=".",
+    )
+    # Save declarations to .jev/config.json
+    save_repo_config(cfg, repo_dir)
+
+    # Inject embedded trust into .jev/config.json to ensure it is ignored
+    raw_cfg = json.loads((repo_dir / ".jev" / "config.json").read_text(encoding="utf-8"))
+    raw_cfg["trust"] = {"bogus": "embedded"}
+    (repo_dir / ".jev" / "config.json").write_text(json.dumps(raw_cfg), encoding="utf-8")
+
+    # Record genuine owner trust in external trust store under JEV_HOME
+    record = record_trust(cfg, repo_dir=repo_dir, approved_by="owner")
+    repo_id = compute_repo_id(repo_dir)
+    trust_path = get_trust_file_path(repo_id)
+    assert trust_path.exists()
+    assert str(trust_path).startswith(str(Path(os.environ["JEV_HOME"])))
+
+    # Config is now trusted
+    loaded = load_repo_config(repo_dir)
+    assert loaded.ignored_embedded_trust is True
+    is_valid, err = validate_trust(loaded, repo_dir=repo_dir)
+    assert is_valid is True
+    assert err is None
+
+    res = resolve_test_command(repo_dir)
+    assert res.source == "trusted_repo_config"
+    assert res.command == [sys.executable, "-c", "import sys; sys.exit(0)"]
+
+    # Tampering with test command invalidates external trust
+    loaded.test_command = [sys.executable, "-c", "import sys; sys.exit(1)"]
+    is_valid, err = validate_trust(loaded, repo_dir=repo_dir)
+    assert is_valid is False
+    assert "command changed: approval invalidated" in err
+
+    # Tampering on disk
+    raw_cfg["test_command"] = [sys.executable, "-c", "import sys; sys.exit(1)"]
+    (repo_dir / ".jev" / "config.json").write_text(json.dumps(raw_cfg), encoding="utf-8")
+    res_tampered = resolve_test_command(repo_dir)
+    assert res_tampered.source == "untrusted_repo_config"
+    assert res_tampered.command is None
+    assert res_tampered.reason == "untrusted_repo_config: run scripts/trust_repo.py"
+
+
+def test_trust_file_lives_under_jev_home_never_in_repo(tmp_path):
+    """The trust file lives under JEV_HOME, never inside the repo."""
+    repo_dir = _create_git_repo(tmp_path / "repo")
+    cfg = RepoConfig(
+        runner_profile_id="pytest",
+        test_command=["pytest", "-q"],
+        cwd=".",
+    )
+    save_repo_config(cfg, repo_dir)
+    record = record_trust(cfg, repo_dir=repo_dir)
+
+    repo_id = compute_repo_id(repo_dir)
+    trust_file = get_trust_file_path(repo_id)
+
+    # Must exist under JEV_HOME
+    assert trust_file.exists()
+    assert Path(os.environ["JEV_HOME"]) in trust_file.parents
+
+    # Must NEVER exist inside repo
+    assert not (repo_dir / ".jev" / "trust").exists()
+    assert not (repo_dir / "trust").exists()
+    assert not (repo_dir / f"{repo_id}.json").exists()
+
+    # Saved repo config must have no trust field
+    cfg_data = json.loads((repo_dir / ".jev" / "config.json").read_text(encoding="utf-8"))
+    assert "trust" not in cfg_data
+
+
+# ==============================================================================
+# 4. Rule 3, 4, 5: Structural Config Parsing & Pass Preservation
+# ==============================================================================
+
+def test_pyproject_version_bump_green_passes_unflagged(tmp_path):
+    """Source change plus pyproject version bump with green tests -> PASS, verifier_modified false."""
+    repo_dir = _create_git_repo(tmp_path / "repo")
+    (repo_dir / "pyproject.toml").write_text(
+        '[project]\nname = "demo"\nversion = "1.0.0"\n\n[tool.pytest.ini_options]\naddopts = "-q"\n',
+        encoding="utf-8",
+    )
+    (repo_dir / "test_app.py").write_text("def test_ok(): pass\n", encoding="utf-8")
+    (repo_dir / "app.py").write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo_dir, check=True)
+    subprocess.run(["git", "commit", "-m", "Initial pyproject"], cwd=repo_dir, check=True)
 
     ws = Workspace(repo_dir=repo_dir)
-    ws.create_subgoal_worktree(subgoal_id="subgoal-config-mod")
+    ws.create_subgoal_worktree(subgoal_id="sg-pyproj-bump")
 
-    # Worker edits pytest.ini
-    ws.stage_file_mutation("pytest.ini", "[pytest]\naddopts = -v --capture=no\n")
+    # Worker bumps version in pyproject.toml and modifies app.py
+    ws.stage_file_mutation(
+        "pyproject.toml",
+        '[project]\nname = "demo"\nversion = "1.0.1"\n\n[tool.pytest.ini_options]\naddopts = "-q"\n',
+    )
+    ws.stage_file_mutation("app.py", "x = 2\n")
 
-    subgoal = Subgoal(id="subgoal-config-mod", description="tune pytest options", scope=["pytest.ini"])
+    subgoal = Subgoal(id="sg-pyproj-bump", description="bump version", scope=["pyproject.toml", "app.py"])
+    ev = ws.evaluate_tests(subgoal=subgoal)
+
+    assert ev is not None
+    assert ev.mech_status == MechStatus.PASS
+    assert ev.verifier_modified is False
+    assert ev.comparison_valid is True
+
+
+def test_package_scripts_edit_green_passes_flagged(tmp_path):
+    """Package.json scripts edit with green tests -> PASS, verifier_modified true, mechanically_unverified."""
+    repo_dir, cfg = _setup_trusted_test_repo(tmp_path / "repo_pkg_green", "def test_ok(): pass\n")
+    (repo_dir / "package.json").write_text(
+        '{\n  "scripts": {\n    "build": "echo 1"\n  }\n}\n',
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "."], cwd=repo_dir, check=True)
+    subprocess.run(["git", "commit", "-m", "Add package.json"], cwd=repo_dir, check=True)
+
+    ws = Workspace(repo_dir=repo_dir)
+    ws.create_subgoal_worktree(subgoal_id="sg-pkg-pass")
+
+    # Worker edits package.json scripts
+    ws.stage_file_mutation(
+        "package.json",
+        '{\n  "scripts": {\n    "build": "echo 2",\n    "test": "custom-runner"\n  }\n}\n',
+    )
+
+    subgoal = Subgoal(id="sg-pkg-pass", description="modify scripts", scope=["package.json"])
+    ev = ws.evaluate_tests(subgoal=subgoal)
+
+    assert ev is not None
+    assert ev.mech_status == MechStatus.PASS
+    assert ev.verifier_modified is True
+    assert ev.mechanically_unverified is True
+    assert ev.unverified_kind == "verifier_modified"
+    assert ev.comparison_valid is False
+    assert ev.approval_valid is True
+
+
+def test_package_scripts_edit_failing_unmeasured_command_identity_changed(tmp_path):
+    """The same edit with a failing test -> UNMEASURED(COMMAND_IDENTITY_CHANGED)."""
+    repo_dir, cfg = _setup_trusted_test_repo(tmp_path / "repo_pkg_fail", "def test_fail(): assert False\n")
+    (repo_dir / "package.json").write_text(
+        '{\n  "scripts": {\n    "build": "echo 1"\n  }\n}\n',
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "."], cwd=repo_dir, check=True)
+    subprocess.run(["git", "commit", "-m", "Add package.json"], cwd=repo_dir, check=True)
+
+    ws = Workspace(repo_dir=repo_dir)
+    ws.create_subgoal_worktree(subgoal_id="sg-pkg-fail")
+
+    # Worker edits package.json scripts
+    ws.stage_file_mutation(
+        "package.json",
+        '{\n  "scripts": {\n    "build": "echo 2"\n  }\n}\n',
+    )
+
+    subgoal = Subgoal(id="sg-pkg-fail", description="break test script", scope=["package.json"])
     ev = ws.evaluate_tests(subgoal=subgoal)
 
     assert ev is not None
@@ -277,83 +422,152 @@ def test_config_edit_sets_verifier_modified(tmp_path):
     assert ev.approval_valid is True
 
 
-def test_package_scripts_edit_sets_verifier_modified(tmp_path):
-    repo_dir = _create_git_repo(tmp_path / "repo")
-    (repo_dir / "package.json").write_text('{\n  "scripts": {\n    "test": "node --test"\n  }\n}\n', encoding="utf-8")
+def test_dependency_only_package_json_edit_green_passes(tmp_path):
+    """Dependency-only package.json edit, green -> PASS."""
+    repo_dir, cfg = _setup_trusted_test_repo(tmp_path / "repo_pkg_deps", "def test_ok(): pass\n")
+    (repo_dir / "package.json").write_text(
+        '{\n  "dependencies": {\n    "dep-a": "1.0.0"\n  }\n}\n',
+        encoding="utf-8",
+    )
     subprocess.run(["git", "add", "."], cwd=repo_dir, check=True)
-    subprocess.run(["git", "commit", "-m", "Add package.json"], cwd=repo_dir, check=True)
+    subprocess.run(["git", "commit", "-m", "Add package.json with deps"], cwd=repo_dir, check=True)
 
     ws = Workspace(repo_dir=repo_dir)
-    ws.create_subgoal_worktree(subgoal_id="subgoal-pkg-scripts")
+    ws.create_subgoal_worktree(subgoal_id="sg-pkg-deps")
 
-    # Worker edits package.json scripts
-    ws.stage_file_mutation("package.json", '{\n  "scripts": {\n    "test": "node --test --bail"\n  }\n}\n')
+    # Worker edits only dependencies in package.json
+    ws.stage_file_mutation(
+        "package.json",
+        '{\n  "dependencies": {\n    "dep-a": "1.0.1",\n    "dep-b": "2.0.0"\n  }\n}\n',
+    )
 
-    subgoal = Subgoal(id="subgoal-pkg-scripts", description="modify test script", scope=["package.json"])
+    subgoal = Subgoal(id="sg-pkg-deps", description="update dependencies", scope=["package.json"])
+    ev = ws.evaluate_tests(subgoal=subgoal)
+
+    assert ev is not None
+    assert ev.mech_status == MechStatus.PASS
+    assert ev.verifier_modified is False
+    assert ev.comparison_valid is True
+
+
+def test_lockfile_only_green_passes_and_failing_baseline_unavailable(tmp_path):
+    """Lockfile-only change, green -> PASS; failing -> UNMEASURED with comparison_valid false."""
+    # Part 1: Green tests -> PASS
+    repo_dir_green, _ = _setup_trusted_test_repo(tmp_path / "repo_lock_green", "def test_ok(): pass\n")
+    (repo_dir_green / "package-lock.json").write_text('{"name": "test", "version": "1.0.0"}', encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo_dir_green, check=True)
+    subprocess.run(["git", "commit", "-m", "Initial lockfile"], cwd=repo_dir_green, check=True)
+
+    ws_green = Workspace(repo_dir=repo_dir_green)
+    ws_green.create_subgoal_worktree(subgoal_id="sg-lock-green")
+    ws_green.stage_file_mutation("package-lock.json", '{"name": "test", "version": "1.0.1"}')
+
+    subgoal_green = Subgoal(id="sg-lock-green", description="bump lock", scope=["package-lock.json"])
+    ev_green = ws_green.evaluate_tests(subgoal=subgoal_green)
+
+    assert ev_green is not None
+    assert ev_green.mech_status == MechStatus.PASS
+    assert ev_green.verifier_modified is False
+    assert ev_green.lockfile_changed is True
+    assert ev_green.mechanically_unverified is True
+    assert ev_green.unverified_kind == "verifier_modified"
+    assert ev_green.comparison_valid is False
+
+    # Part 2: Failing tests -> UNMEASURED(BASELINE_UNAVAILABLE) with comparison_valid=False, approval_valid unchanged
+    repo_dir_fail, _ = _setup_trusted_test_repo(tmp_path / "repo_lock_fail", "def test_fail(): assert False\n")
+    (repo_dir_fail / "package-lock.json").write_text('{"name": "test", "version": "1.0.0"}', encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo_dir_fail, check=True)
+    subprocess.run(["git", "commit", "-m", "Initial lockfile fail"], cwd=repo_dir_fail, check=True)
+
+    ws_fail = Workspace(repo_dir=repo_dir_fail)
+    ws_fail.create_subgoal_worktree(subgoal_id="sg-lock-fail")
+    ws_fail.stage_file_mutation("package-lock.json", '{"name": "test", "version": "1.0.1"}')
+
+    subgoal_fail = Subgoal(id="sg-lock-fail", description="bump lock fail", scope=["package-lock.json"])
+    ev_fail = ws_fail.evaluate_tests(subgoal=subgoal_fail)
+
+    assert ev_fail is not None
+    assert ev_fail.mech_status == MechStatus.UNMEASURED
+    assert ev_fail.reason == MechReason.BASELINE_UNAVAILABLE
+    assert ev_fail.comparison_valid is False
+    assert ev_fail.approval_valid is True
+    assert ev_fail.lockfile_changed is True
+    assert ev_fail.verifier_modified is False
+
+
+def test_tsconfig_edit_green_passes_flagged(tmp_path):
+    """Tsconfig edit, green -> PASS flagged."""
+    repo_dir, _ = _setup_trusted_test_repo(tmp_path / "repo_tsconfig", "def test_ok(): pass\n")
+    (repo_dir / "tsconfig.json").write_text('{"compilerOptions": {"strict": true}}', encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo_dir, check=True)
+    subprocess.run(["git", "commit", "-m", "Initial tsconfig"], cwd=repo_dir, check=True)
+
+    ws = Workspace(repo_dir=repo_dir)
+    ws.create_subgoal_worktree(subgoal_id="sg-tsconfig")
+
+    # Worker edits tsconfig.json
+    ws.stage_file_mutation("tsconfig.json", '{"compilerOptions": {"strict": false}}')
+
+    subgoal = Subgoal(id="sg-tsconfig", description="loosen tsconfig", scope=["tsconfig.json"])
+    ev = ws.evaluate_tests(subgoal=subgoal)
+
+    assert ev is not None
+    assert ev.mech_status == MechStatus.PASS
+    assert ev.verifier_modified is True
+    assert ev.mechanically_unverified is True
+    assert ev.unverified_kind == "verifier_modified"
+    assert ev.comparison_valid is False
+
+
+def test_shared_test_fixture_edit_failing_unmeasured_test_surface_changed(tmp_path):
+    """Shared test fixture edit with failing tests -> UNMEASURED(TEST_SURFACE_CHANGED)."""
+    repo_dir, _ = _setup_trusted_test_repo(tmp_path / "repo_fixture", "def test_fail(): assert False\n")
+    fixtures_dir = repo_dir / "tests" / "fixtures"
+    fixtures_dir.mkdir(parents=True, exist_ok=True)
+    (fixtures_dir / "base_data.json").write_text('{"v": 1}', encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo_dir, check=True)
+    subprocess.run(["git", "commit", "-m", "Initial fixture"], cwd=repo_dir, check=True)
+
+    ws = Workspace(repo_dir=repo_dir)
+    ws.create_subgoal_worktree(subgoal_id="sg-fixture")
+    ws.stage_file_mutation("tests/fixtures/base_data.json", '{"v": 2}')
+
+    subgoal = Subgoal(id="sg-fixture", description="edit fixture", scope=["tests/fixtures/base_data.json"])
     ev = ws.evaluate_tests(subgoal=subgoal)
 
     assert ev is not None
     assert ev.mech_status == MechStatus.UNMEASURED
-    assert ev.reason == MechReason.COMMAND_IDENTITY_CHANGED
-    assert ev.verifier_modified is True
+    assert ev.reason == MechReason.TEST_SURFACE_CHANGED
+    assert ev.test_surface_changed is True
+    assert ev.verifier_modified is False
     assert ev.comparison_valid is False
+    assert ev.approval_valid is True
 
 
-# ==============================================================================
-# 5. Trust Binding Integrity & Precedence
-# ==============================================================================
-
-def test_trusted_repo_config_precedence(tmp_path):
+def test_trust_repo_script_cli(tmp_path):
+    """scripts/trust_repo.py CLI approves and records trust without running test command."""
     repo_dir = _create_git_repo(tmp_path / "repo")
-    # Add cargo manifest to test that trusted repo config overrides cargo detection
-    (repo_dir / "Cargo.toml").write_text('[package]\nname = "test"\nversion = "0.1.0"\n', encoding="utf-8")
-    subprocess.run(["git", "add", "."], cwd=repo_dir, check=True)
-    subprocess.run(["git", "commit", "-m", "Add cargo manifest"], cwd=repo_dir, check=True)
-
-    # Without .jev/config.json, resolves cargo
-    res_default = resolve_test_command(repo_dir)
-    assert res_default.runner_profile_id == "cargo-test"
-
-    # Add trusted repo config specifying custom runner
-    cfg = RepoConfig(
-        runner_profile_id="custom-runner",
-        test_command=["./custom_test_runner", "--all"],
-        cwd=".",
-    )
-    cfg = record_trust(cfg, repo_dir=repo_dir)
-    save_repo_config(cfg, repo_dir)
-
-    # Now trusted repo config takes precedence
-    res_trusted = resolve_test_command(repo_dir)
-    assert res_trusted.source == "trusted_repo_config"
-    assert res_trusted.runner_profile_id == "custom-runner"
-    assert res_trusted.command == ["./custom_test_runner", "--all"]
-
-
-def test_trust_binding_mismatches(tmp_path):
-    repo_dir = _create_git_repo(tmp_path / "repo")
+    marker_file = repo_dir / "should_not_exist.txt"
     cfg = RepoConfig(
         runner_profile_id="pytest",
-        test_command=["pytest"],
+        test_command=[sys.executable, "-c", f"open('{marker_file.as_posix()}', 'w').write('ran')"],
         cwd=".",
     )
-    cfg = record_trust(cfg, repo_dir=repo_dir)
+    save_repo_config(cfg, repo_dir)
 
-    # Platform mismatch
-    is_valid, err = validate_trust(cfg, repo_dir=repo_dir, platform="fake_os_99")
-    assert is_valid is False
-    assert "platform mismatch" in err
+    script_path = Path(__file__).resolve().parent.parent / "scripts" / "trust_repo.py"
+    res = subprocess.run(
+        [sys.executable, str(script_path), str(repo_dir), "--yes"],
+        capture_output=True,
+        text=True,
+        check=True,
+        env=os.environ,
+    )
 
-    # Repo ID mismatch
-    other_repo = _create_git_repo(tmp_path / "other_repo", initial_text="# Other Repo Different Content\n")
+    # Trust record created
+    repo_id = compute_repo_id(repo_dir)
+    trust_file = get_trust_file_path(repo_id)
+    assert trust_file.exists()
 
-    is_valid, err = validate_trust(cfg, repo_dir=other_repo)
-    assert is_valid is False
-    assert "repo_id mismatch" in err
-
-    # Tampered hash
-    cfg_tampered = cfg.model_copy(deep=True)
-    cfg_tampered.trust.approval_hash = "0" * 64
-    is_valid, err = validate_trust(cfg_tampered, repo_dir=repo_dir)
-    assert is_valid is False
-    assert "approval hash mismatch" in err
+    # Command NEVER ran
+    assert not marker_file.exists()
