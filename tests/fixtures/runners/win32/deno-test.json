@@ -1,6 +1,6 @@
 {
-  "profile_id": "maven-surefire",
-  "runner": "mvn",
+  "profile_id": "deno-test",
+  "runner": "deno",
   "supported_platforms": [
     "linux",
     "darwin",
@@ -9,9 +9,7 @@
   "captured_on_host": false,
   "host_platform": "win32",
   "tool_version": null,
-  "skip_reason": "Toolchain 'mvn' not found in PATH on win32",
-  "known_reference": {
-    "zero_tests_exit": 0
-  },
+  "skip_reason": "deno not found",
+  "known_reference": {},
   "cases": {}
 }

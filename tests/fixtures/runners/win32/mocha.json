@@ -1,6 +1,6 @@
 {
-  "profile_id": "deno-test",
-  "runner": "deno",
+  "profile_id": "mocha",
+  "runner": "mocha",
   "supported_platforms": [
     "linux",
     "darwin",
@@ -9,10 +9,9 @@
   "captured_on_host": false,
   "host_platform": "win32",
   "tool_version": null,
-  "skip_reason": "Toolchain 'deno' not found in PATH on win32",
+  "skip_reason": "npm install timed out for mocha",
   "known_reference": {
-    "zero_tests_exit": 0,
-    "all_skipped_exit": 0
+    "zero_tests_exit": 1
   },
   "cases": {}
 }

@@ -1,6 +1,6 @@
 {
-  "profile_id": "vitest",
-  "runner": "vitest",
+  "profile_id": "mix-test",
+  "runner": "mix",
   "supported_platforms": [
     "linux",
     "darwin",
@@ -9,9 +9,7 @@
   "captured_on_host": false,
   "host_platform": "win32",
   "tool_version": null,
-  "skip_reason": "Toolchain 'vitest' not found in PATH on win32",
-  "known_reference": {
-    "zero_tests_exit": 1
-  },
+  "skip_reason": "mix not found",
+  "known_reference": {},
   "cases": {}
 }

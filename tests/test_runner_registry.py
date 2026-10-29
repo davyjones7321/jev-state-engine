@@ -3,7 +3,13 @@
 Tests for Phase 2A runner-profile registry, Pydantic schema validation,
 pure marker detection, ambiguity handling, regex safety against ReDoS,
 command identity, and cache key versioning.
+Includes Phase 2 Fixes: precedence tie-breaking for old-cascade polyglot layouts,
+also_matched and ambiguity_resolved_by tracking in command identity and MechanicalEvidence,
+differential resolution testing over a table of layouts, and verification of
+the 7 intentional new-coverage cases.
 """
+
+from __future__ import annotations
 
 import json
 import re
@@ -11,6 +17,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -237,34 +244,118 @@ def test_one_fixture_per_row_detection(tmp_path, profile_id, marker_filename, ex
 
 
 # ==============================================================================
-# 6. Ambiguity Handling
+# 6. Ambiguity Handling & Precedence Tie-Breaking
 # ==============================================================================
 
-def test_ambiguity_returns_no_command_with_candidate_ids(tmp_path):
-    """When multiple runner profiles match without precedence, return NO_COMMAND with candidates listed."""
-    # Both go.mod and Cargo.toml present
-    (tmp_path / "go.mod").write_text("module test\n", encoding="utf-8")
-    (tmp_path / "Cargo.toml").write_text("[package]\nname = \"test\"\n", encoding="utf-8")
+def test_precedence_tie_breaking_for_four_layouts(tmp_path):
+    """For the four layouts the old cascade resolved, precedence breaks ties preserving old behavior."""
+    # 1. go.mod + Cargo.toml -> go-test wins (precedence 2 < 3)
+    repo1 = tmp_path / "poly_go_cargo"
+    repo1.mkdir()
+    (repo1 / "go.mod").write_text("module test\n", encoding="utf-8")
+    (repo1 / "Cargo.toml").write_text("[package]\nname = \"test\"\n", encoding="utf-8")
 
-    res = resolve_test_command(tmp_path)
-    assert res.command is None
-    assert res.ecosystem is None
-    assert res.source == "ambiguous"
-    assert "Ambiguous runner profiles detected:" in res.reason
-    assert "cargo-test" in res.reason
-    assert "go-test" in res.reason
+    res1 = resolve_test_command(repo1)
+    assert res1.runner_profile_id == "go-test"
+    assert res1.command == ["go", "test", "./..."]
+    assert res1.also_matched == ["cargo-test"]
+    assert res1.ambiguity_resolved_by == "precedence"
+
+    # 2. pyproject.toml(pytest) + go.mod -> go-test wins (precedence 2 < 6)
+    repo2 = tmp_path / "poly_pytest_go"
+    repo2.mkdir()
+    (repo2 / "go.mod").write_text("module test\n", encoding="utf-8")
+    (repo2 / "pyproject.toml").write_text("[tool.pytest.ini_options]\n", encoding="utf-8")
+
+    res2 = resolve_test_command(repo2)
+    assert res2.runner_profile_id == "go-test"
+    assert res2.command == ["go", "test", "./..."]
+    assert res2.also_matched == ["pytest"]
+    assert res2.ambiguity_resolved_by == "precedence"
+
+    # 3. pom.xml + build.gradle -> maven-surefire wins (precedence 4 < 5)
+    repo3 = tmp_path / "poly_mvn_gradle"
+    repo3.mkdir()
+    (repo3 / "pom.xml").write_text("<project></project>\n", encoding="utf-8")
+    (repo3 / "build.gradle").write_text("// gradle\n", encoding="utf-8")
+
+    res3 = resolve_test_command(repo3)
+    assert res3.runner_profile_id == "maven-surefire"
+    assert res3.command is not None and "test" in res3.command
+    assert res3.also_matched == ["gradle-test"]
+    assert res3.ambiguity_resolved_by == "precedence"
+
+    # 4. main.tf + pytest markers -> pytest wins (precedence 6 < 7)
+    repo4 = tmp_path / "poly_tf_pytest"
+    repo4.mkdir()
+    (repo4 / "main.tf").write_text("resource \"null_resource\" \"x\" {}\n", encoding="utf-8")
+    (repo4 / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+
+    res4 = resolve_test_command(repo4)
+    assert res4.runner_profile_id == "pytest"
+    assert res4.command == [sys.executable, "-m", "pytest", "-q"]
+    assert res4.also_matched == ["terraform"]
+    assert res4.ambiguity_resolved_by == "precedence"
 
 
-def test_ambiguity_js_runners(tmp_path):
-    """Ambiguity between vitest and jest without package.json returns NO_COMMAND."""
-    (tmp_path / "vitest.config.ts").write_text("export default {}\n", encoding="utf-8")
-    (tmp_path / "jest.config.js").write_text("module.exports = {}\n", encoding="utf-8")
+def test_evidence_records_precedence_tie_breaking(tmp_path):
+    """When precedence breaks a tie, also_matched and ambiguity_resolved_by appear in command_identity and evidence."""
+    repo = tmp_path / "tie_break_repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, check=True, capture_output=True)
 
-    res = resolve_test_command(tmp_path)
-    assert res.command is None
-    assert res.source == "ambiguous"
-    assert "jest" in res.reason
-    assert "vitest" in res.reason
+    # Setup layout: main.tf + pytest.ini (pytest wins over terraform)
+    (repo / "main.tf").write_text("resource \"null_resource\" \"x\" {}\n", encoding="utf-8")
+    (repo / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_sample.py").write_text("def test_ok(): pass\n", encoding="utf-8")
+
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+
+    ws = Workspace(repo_dir=repo)
+    subgoal = MagicMock()
+    subgoal.id = "sg-tie"
+    subgoal.expects_tests = True
+
+    ev = ws.evaluate_tests(subgoal, test_targets=["tests/test_sample.py"])
+    assert ev is not None
+    assert ev.mech_status == MechStatus.PASS
+
+    # Verify command_identity and evidence records precedence tie-breaking
+    assert ev.command_identity["profile_id"] == "pytest"
+    assert ev.command_identity["also_matched"] == ["terraform"]
+    assert ev.command_identity["ambiguity_resolved_by"] == "precedence"
+
+
+def test_ambiguity_returns_no_command_for_unresolved_new_profiles(tmp_path):
+    """When multiple runner profiles match outside old cascade (precedence 100), return NO_COMMAND with candidate IDs."""
+    # 1. vitest + jest
+    repo1 = tmp_path / "ambig_js"
+    repo1.mkdir()
+    (repo1 / "vitest.config.ts").write_text("export default {}\n", encoding="utf-8")
+    (repo1 / "jest.config.js").write_text("module.exports = {}\n", encoding="utf-8")
+
+    res1 = resolve_test_command(repo1)
+    assert res1.command is None
+    assert res1.source == "ambiguous"
+    assert "Ambiguous runner profiles detected:" in res1.reason
+    assert "jest" in res1.reason
+    assert "vitest" in res1.reason
+
+    # 2. go.mod + jest.config.js (precedence 2 and 100)
+    repo2 = tmp_path / "ambig_go_jest"
+    repo2.mkdir()
+    (repo2 / "go.mod").write_text("module test\n", encoding="utf-8")
+    (repo2 / "jest.config.js").write_text("module.exports = {}\n", encoding="utf-8")
+
+    res2 = resolve_test_command(repo2)
+    assert res2.command is None
+    assert res2.source == "ambiguous"
+    assert "go-test" in res2.reason
+    assert "jest" in res2.reason
 
 
 def test_zero_matches_returns_no_command(tmp_path):
@@ -277,7 +368,203 @@ def test_zero_matches_returns_no_command(tmp_path):
 
 
 # ==============================================================================
-# 7. Package.json Script Precedence & Profile ID Extraction
+# 7. Differential Testing Over Layouts Table
+# ==============================================================================
+
+def _old_cascade_resolver(wt: Path) -> Tuple[Optional[str], Optional[List[str]]]:
+    """Reference implementation of the old cascade resolver for differential testing."""
+    pkg_json_path = wt / "package.json"
+    if pkg_json_path.exists():
+        try:
+            pkg_data = json.loads(pkg_json_path.read_text(encoding="utf-8", errors="replace"))
+            if isinstance(pkg_data, dict):
+                scripts = pkg_data.get("scripts")
+                if isinstance(scripts, dict) and "test" in scripts:
+                    if (wt / "yarn.lock").exists():
+                        return "yarn", ["yarn", "test"]
+                    elif (wt / "pnpm-lock.yaml").exists():
+                        return "pnpm", ["pnpm", "test"]
+                    else:
+                        return "npm", ["npm", "test"]
+        except Exception:
+            return "package_json", None
+
+    if (wt / "go.mod").exists():
+        return "go", ["go", "test", "./..."]
+
+    if (wt / "Cargo.toml").exists():
+        return "cargo", ["cargo", "test"]
+
+    if (wt / "pom.xml").exists():
+        mvn_cmd = "mvn"
+        if sys.platform == "win32" and (wt / "mvnw.cmd").exists():
+            mvn_cmd = str(wt / "mvnw.cmd")
+        elif (wt / "mvnw").exists():
+            mvn_cmd = "./mvnw"
+        elif (wt / "mvnw.cmd").exists():
+            mvn_cmd = str(wt / "mvnw.cmd")
+        return "maven", [mvn_cmd, "test"]
+
+    if (wt / "build.gradle").exists() or (wt / "build.gradle.kts").exists():
+        gradle_cmd = "gradle"
+        if sys.platform == "win32" and (wt / "gradlew.bat").exists():
+            gradle_cmd = str(wt / "gradlew.bat")
+        elif (wt / "gradlew").exists():
+            gradle_cmd = "./gradlew"
+        elif (wt / "gradlew.bat").exists():
+            gradle_cmd = str(wt / "gradlew.bat")
+        return "gradle", [gradle_cmd, "test"]
+
+    has_pytest = False
+    if (wt / "pytest.ini").exists():
+        has_pytest = True
+    elif (wt / "pyproject.toml").exists():
+        try:
+            pyproj_text = (wt / "pyproject.toml").read_text(encoding="utf-8", errors="replace")
+            if "[tool.pytest" in pyproj_text:
+                has_pytest = True
+        except Exception:
+            pass
+    if not has_pytest:
+        try:
+            has_pytest = (
+                any(wt.glob("test_*.py"))
+                or any(wt.glob("*_test.py"))
+                or ((wt / "tests").is_dir() and (any((wt / "tests").glob("*.py")) or any((wt / "tests").rglob("*.py"))))
+            )
+        except Exception:
+            pass
+
+    if has_pytest:
+        return "pytest", [sys.executable, "-m", "pytest", "-q"]
+
+    has_tf = False
+    try:
+        has_tf = any(wt.glob("*.tf")) or any(p for p in wt.rglob("*.tf") if ".terraform" not in p.parts)
+    except Exception:
+        pass
+    if has_tf:
+        return "terraform", ["terraform", "validate"]
+
+    has_ansible = (
+        (wt / "ansible.cfg").exists()
+        or (wt / "playbooks").is_dir()
+        or any(wt.glob("playbook*.yml"))
+        or any(wt.glob("playbook*.yaml"))
+    )
+    if has_ansible:
+        return "ansible", ["ansible-lint"]
+
+    if (wt / "Chart.yaml").exists():
+        return "helm", ["helm", "lint", "."],
+
+    return None, None
+
+
+@pytest.mark.parametrize(
+    "layout_name, file_map",
+    [
+        # Single markers
+        ("single_go", {"go.mod": "module test\n"}),
+        ("single_cargo", {"Cargo.toml": "[package]\nname = \"test\"\n"}),
+        ("single_maven", {"pom.xml": "<project></project>\n"}),
+        ("single_gradle", {"build.gradle": "// gradle\n"}),
+        ("single_pytest", {"pytest.ini": "[pytest]\n"}),
+        ("single_terraform", {"main.tf": "resource \"x\" \"y\" {}\n"}),
+        ("single_ansible", {"ansible.cfg": "[defaults]\n"}),
+        ("single_helm", {"Chart.yaml": "apiVersion: v2\nname: test\nversion: 0.1.0\n"}),
+
+        # Package.json variants
+        ("pkg_with_test_script", {"package.json": json.dumps({"scripts": {"test": "npm test"}})}),
+        ("pkg_without_test_script", {"package.json": json.dumps({"name": "only-lib"})}),
+        ("go_plus_pkg_with_test", {
+            "go.mod": "module test\n",
+            "package.json": json.dumps({"scripts": {"test": "npm test"}}),
+        }),
+        ("go_plus_pkg_without_test", {
+            "go.mod": "module test\n",
+            "package.json": json.dumps({"name": "only-lib"}),
+        }),
+        ("python_plus_pkg_with_test", {
+            "pytest.ini": "[pytest]\n",
+            "package.json": json.dumps({"scripts": {"test": "npm test"}}),
+        }),
+        ("python_plus_pkg_without_test", {
+            "pytest.ini": "[pytest]\n",
+            "package.json": json.dumps({"name": "only-lib"}),
+        }),
+
+        # Polyglot pairs (the four layouts resolved by old cascade)
+        ("poly_go_cargo", {
+            "go.mod": "module test\n",
+            "Cargo.toml": "[package]\nname = \"test\"\n",
+        }),
+        ("poly_pytest_go", {
+            "go.mod": "module test\n",
+            "pyproject.toml": "[tool.pytest.ini_options]\n",
+        }),
+        ("poly_mvn_gradle", {
+            "pom.xml": "<project></project>\n",
+            "build.gradle": "// gradle\n",
+        }),
+        ("poly_tf_pytest", {
+            "main.tf": "resource \"x\" \"y\" {}\n",
+            "pytest.ini": "[pytest]\n",
+        }),
+    ],
+)
+def test_differential_resolution_across_layouts_table(tmp_path, layout_name, file_map):
+    """Differential test over table of layouts: registry returns the same command as old cascade resolver."""
+    repo = tmp_path / layout_name
+    repo.mkdir()
+    for filename, content in file_map.items():
+        (repo / filename).write_text(content, encoding="utf-8")
+
+    old_eco, old_cmd = _old_cascade_resolver(repo)
+    new_res = resolve_test_command(repo)
+
+    assert new_res.command == old_cmd, (
+        f"Layout '{layout_name}': command mismatch. Old: {old_cmd}, New: {new_res.command}"
+    )
+    if old_eco is not None:
+        assert new_res.ecosystem == old_eco
+
+
+# ==============================================================================
+# 8. Seven Intentional New-Coverage Cases
+# ==============================================================================
+
+@pytest.mark.parametrize(
+    "case_name, marker_file, expected_profile_id, expected_cmd_token",
+    [
+        ("jest config only", "jest.config.js", "jest", "jest"),
+        ("vitest config only", "vitest.config.ts", "vitest", "vitest"),
+        (".NET", "App.csproj", "dotnet-test", "dotnet"),
+        ("Elixir", "mix.exs", "mix-test", "mix"),
+        ("Ruby", "Rakefile", "ruby-rake", "rake"),
+        ("PHP", "phpunit.xml", "phpunit", "phpunit"),
+        ("Deno", "deno.json", "deno-test", "deno"),
+    ],
+)
+def test_seven_intentional_new_coverage_cases(tmp_path, case_name, marker_file, expected_profile_id, expected_cmd_token):
+    """The 7 intentional new-coverage cases are resolved by the registry while old cascade returned None."""
+    repo = tmp_path / f"new_{expected_profile_id}"
+    repo.mkdir()
+    (repo / marker_file).write_text("# marker\n", encoding="utf-8")
+
+    # Old resolver returned None
+    old_eco, old_cmd = _old_cascade_resolver(repo)
+    assert old_cmd is None, f"Old resolver unexpectedly matched {case_name}"
+
+    # New resolver resolves to designated profile
+    new_res = resolve_test_command(repo)
+    assert new_res.runner_profile_id == expected_profile_id
+    assert new_res.command is not None
+    assert any(expected_cmd_token in arg for arg in new_res.command)
+
+
+# ==============================================================================
+# 9. Package.json Script Precedence & Profile ID Extraction
 # ==============================================================================
 
 def test_package_json_precedence_over_other_markers(tmp_path):
@@ -320,7 +607,7 @@ def test_derive_runner_profile_id_from_package_json(tmp_path, script_content, ex
 
 
 # ==============================================================================
-# 8. Command Identity and Base Cache Invalidation on Version Bump
+# 10. Command Identity and Base Cache Invalidation on Version Bump
 # ==============================================================================
 
 def _create_git_repo(tmp_path):

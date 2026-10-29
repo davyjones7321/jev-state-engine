@@ -1,6 +1,6 @@
 {
-  "profile_id": "jest",
-  "runner": "jest",
+  "profile_id": "dotnet-test",
+  "runner": "dotnet",
   "supported_platforms": [
     "linux",
     "darwin",
@@ -9,9 +9,7 @@
   "captured_on_host": false,
   "host_platform": "win32",
   "tool_version": null,
-  "skip_reason": "Toolchain 'jest' not found in PATH on win32",
-  "known_reference": {
-    "zero_tests_exit": 1
-  },
+  "skip_reason": "dotnet not found",
+  "known_reference": {},
   "cases": {}
 }

@@ -1,0 +1,65 @@
+{
+  "profile_id": "node-native-test",
+  "runner": "node",
+  "supported_platforms": [
+    "linux",
+    "darwin",
+    "win32"
+  ],
+  "captured_on_host": true,
+  "host_platform": "win32",
+  "tool_version": "v24.15.0",
+  "skip_reason": null,
+  "known_reference": {
+    "zero_tests_exit": 0,
+    "all_skipped_exit": 0
+  },
+  "cases": {
+    "pass": {
+      "command": [
+        "<NODE>",
+        "--test"
+      ],
+      "exit_code": 0,
+      "stdout": "\u00e2\u0153\u201d pass (<DUR>)\n\u00e2\u201e\u00b9 tests 1\n\u00e2\u201e\u00b9 suites 0\n\u00e2\u201e\u00b9 pass 1\n\u00e2\u201e\u00b9 fail 0\n\u00e2\u201e\u00b9 cancelled 0\n\u00e2\u201e\u00b9 skipped 0\n\u00e2\u201e\u00b9 todo 0\n\u00e2\u201e\u00b9 duration_ms <DUR>\n",
+      "stderr": ""
+    },
+    "fail": {
+      "command": [
+        "<NODE>",
+        "--test"
+      ],
+      "exit_code": 1,
+      "stdout": "\u00e2\u0153\u2013 fail (<DUR>)\n\u00e2\u0153\u201d pass (<DUR>)\n\u00e2\u201e\u00b9 tests 2\n\u00e2\u201e\u00b9 suites 0\n\u00e2\u201e\u00b9 pass 1\n\u00e2\u201e\u00b9 fail 1\n\u00e2\u201e\u00b9 cancelled 0\n\u00e2\u201e\u00b9 skipped 0\n\u00e2\u201e\u00b9 todo 0\n\u00e2\u201e\u00b9 duration_ms <DUR>\n\n\u00e2\u0153\u2013 failing tests:\n\ntest at test_f.test.js:1:75\n\u00e2\u0153\u2013 fail (<DUR>)\n  AssertionError [ERR_ASSERTION]: expected\n      at TestContext.<anonymous> (<TMP>\\tmpbqmwbx70\\node_fail\\test_f.test.js:1:103)\n      at Test.runInAsyncScope (node:async_hooks:227:14)\n      at Test.run (node:internal/test_runner/test:1201:25)\n      at Test.start (node:internal/test_runner/test:1096:17)\n      at startSubtestAfterBootstrap (node:internal/test_runner/harness:385:17) {\n    generatedMessage: false,\n    code: 'ERR_ASSERTION',\n    actual: undefined,\n    expected: undefined,\n    operator: 'fail',\n    diff: 'simple'\n  }\n",
+      "stderr": ""
+    },
+    "zero_tests": {
+      "command": [
+        "<NODE>",
+        "--test"
+      ],
+      "exit_code": 0,
+      "stdout": "\u00e2\u201e\u00b9 tests 0\n\u00e2\u201e\u00b9 suites 0\n\u00e2\u201e\u00b9 pass 0\n\u00e2\u201e\u00b9 fail 0\n\u00e2\u201e\u00b9 cancelled 0\n\u00e2\u201e\u00b9 skipped 0\n\u00e2\u201e\u00b9 todo 0\n\u00e2\u201e\u00b9 duration_ms <DUR>\n",
+      "stderr": ""
+    },
+    "filter_matches_nothing": {
+      "command": [
+        "<NODE>",
+        "--test",
+        "--test-name-pattern=nonexistent"
+      ],
+      "exit_code": 0,
+      "stdout": "\u00e2\u0153\u201d test_p.test.js (<DUR>)\n\u00e2\u201e\u00b9 tests 1\n\u00e2\u201e\u00b9 suites 0\n\u00e2\u201e\u00b9 pass 1\n\u00e2\u201e\u00b9 fail 0\n\u00e2\u201e\u00b9 cancelled 0\n\u00e2\u201e\u00b9 skipped 0\n\u00e2\u201e\u00b9 todo 0\n\u00e2\u201e\u00b9 duration_ms <DUR>\n",
+      "stderr": ""
+    },
+    "all_skipped": {
+      "command": [
+        "<NODE>",
+        "--test"
+      ],
+      "exit_code": 0,
+      "stdout": "\u00ef\u00b9\u00a3 skip (<DUR>) # SKIP\n\u00e2\u201e\u00b9 tests 1\n\u00e2\u201e\u00b9 suites 0\n\u00e2\u201e\u00b9 pass 0\n\u00e2\u201e\u00b9 fail 0\n\u00e2\u201e\u00b9 cancelled 0\n\u00e2\u201e\u00b9 skipped 1\n\u00e2\u201e\u00b9 todo 0\n\u00e2\u201e\u00b9 duration_ms <DUR>\n",
+      "stderr": ""
+    }
+  }
+}

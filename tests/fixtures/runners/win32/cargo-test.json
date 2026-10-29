@@ -1,0 +1,65 @@
+{
+  "profile_id": "cargo-test",
+  "runner": "cargo",
+  "supported_platforms": [
+    "linux",
+    "darwin",
+    "win32"
+  ],
+  "captured_on_host": true,
+  "host_platform": "win32",
+  "tool_version": "cargo 1.98.1 (797e8a9bc 2026-08-05)",
+  "skip_reason": null,
+  "known_reference": {
+    "zero_tests_exit": 0,
+    "all_skipped_exit": 0
+  },
+  "cases": {
+    "pass": {
+      "command": [
+        "<CARGO>",
+        "test"
+      ],
+      "exit_code": 0,
+      "stdout": "\nrunning 1 test\ntest tests::it_works ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in <DUR>\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in <DUR>\n\n",
+      "stderr": "   Compiling test_cargo v0.1.0 (<TMP>\\tmpbqmwbx70\\cargo_proj)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in <DUR>\n     Running unittests src\\lib.rs (target\\debug\\deps\\test_cargo-<HASH>.exe)\n   Doc-tests test_cargo\n"
+    },
+    "fail": {
+      "command": [
+        "<CARGO>",
+        "test"
+      ],
+      "exit_code": 101,
+      "stdout": "\nrunning 1 test\ntest it_fails ... FAILED\n\nfailures:\n\n---- it_fails stdout ----\n\nthread '<name>' (<TID>) panicked at src\\lib.rs:2:17:\nassertion failed: false\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    it_fails\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in <DUR>\n\n",
+      "stderr": "   Compiling test_cargo v0.1.0 (<TMP>\\tmpbqmwbx70\\cargo_proj)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in <DUR>\n     Running unittests src\\lib.rs (target\\debug\\deps\\test_cargo-<HASH>.exe)\nerror: test failed, to rerun pass `--lib`\n"
+    },
+    "zero_tests": {
+      "command": [
+        "<CARGO>",
+        "test"
+      ],
+      "exit_code": 0,
+      "stdout": "\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in <DUR>\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in <DUR>\n\n",
+      "stderr": "   Compiling test_cargo v0.1.0 (<TMP>\\tmpbqmwbx70\\cargo_proj)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in <DUR>\n     Running unittests src\\lib.rs (target\\debug\\deps\\test_cargo-<HASH>.exe)\n   Doc-tests test_cargo\n"
+    },
+    "filter_matches_nothing": {
+      "command": [
+        "<CARGO>",
+        "test",
+        "nonexistent"
+      ],
+      "exit_code": 0,
+      "stdout": "\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in <DUR>\n\n",
+      "stderr": "   Compiling test_cargo v0.1.0 (<TMP>\\tmpbqmwbx70\\cargo_proj)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in <DUR>\n     Running unittests src\\lib.rs (target\\debug\\deps\\test_cargo-<HASH>.exe)\n"
+    },
+    "all_skipped": {
+      "command": [
+        "<CARGO>",
+        "test"
+      ],
+      "exit_code": 0,
+      "stdout": "\nrunning 1 test\ntest it_skipped ... ignored\n\ntest result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in <DUR>\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in <DUR>\n\n",
+      "stderr": "   Compiling test_cargo v0.1.0 (<TMP>\\tmpbqmwbx70\\cargo_proj)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in <DUR>\n     Running unittests src\\lib.rs (target\\debug\\deps\\test_cargo-<HASH>.exe)\n   Doc-tests test_cargo\n"
+    }
+  }
+}

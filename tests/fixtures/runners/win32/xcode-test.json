@@ -7,9 +7,7 @@
   "captured_on_host": false,
   "host_platform": "win32",
   "tool_version": null,
-  "skip_reason": "Profile 'xcode-test' is macOS-only (darwin), unavailable on win32",
-  "known_reference": {
-    "zero_tests_exit": 0
-  },
+  "skip_reason": "xcode-test not supported on win32 (platforms: ['darwin'])",
+  "known_reference": {},
   "cases": {}
 }

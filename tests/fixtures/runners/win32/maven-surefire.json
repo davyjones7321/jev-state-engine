@@ -1,0 +1,15 @@
+{
+  "profile_id": "maven-surefire",
+  "runner": "maven",
+  "supported_platforms": [
+    "linux",
+    "darwin",
+    "win32"
+  ],
+  "captured_on_host": false,
+  "host_platform": "win32",
+  "tool_version": null,
+  "skip_reason": "mvn not found",
+  "known_reference": {},
+  "cases": {}
+}

@@ -1,6 +1,6 @@
 {
-  "profile_id": "ruby-rake",
-  "runner": "rake",
+  "profile_id": "ansible",
+  "runner": "ansible",
   "supported_platforms": [
     "linux",
     "darwin",
@@ -9,9 +9,7 @@
   "captured_on_host": false,
   "host_platform": "win32",
   "tool_version": null,
-  "skip_reason": "Toolchain 'rake' not found in PATH on win32",
-  "known_reference": {
-    "zero_tests_exit": 0
-  },
+  "skip_reason": "ansible-lint not found",
+  "known_reference": {},
   "cases": {}
 }

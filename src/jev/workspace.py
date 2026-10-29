@@ -648,6 +648,8 @@ class ResolvedTestCommand:
     reason: Optional[str] = None
     runner_profile_id: Optional[str] = None
     registry_version: Optional[str] = None
+    also_matched: Optional[List[str]] = None
+    ambiguity_resolved_by: Optional[str] = None
 
 
 def compare_test_runs(before: Optional[dict], after: Optional[dict]) -> dict:
@@ -676,6 +678,8 @@ def resolve_test_command(wt: Union[str, Path]) -> ResolvedTestCommand:
         reason=res.reason,
         runner_profile_id=res.runner_profile_id,
         registry_version=res.registry_version,
+        also_matched=res.also_matched,
+        ambiguity_resolved_by=res.ambiguity_resolved_by,
     )
 
 
@@ -798,6 +802,8 @@ class Workspace:
         r_profile_id = runner_profile_id or (res_cmd.runner_profile_id if res_cmd else None)
         r_reg_ver = registry_version or (res_cmd.registry_version if res_cmd else None)
         r_script = script_text or (res_cmd.reason if (res_cmd and res_cmd.source == "package.json") else None)
+        r_also_matched = (res_cmd.also_matched if res_cmd else None)
+        r_ambiguity_resolved_by = (res_cmd.ambiguity_resolved_by if res_cmd else None)
 
         self.last_test_run = {
             "ecosystem": ecosystem,
@@ -806,6 +812,8 @@ class Workspace:
             "runner_profile_id": r_profile_id,
             "registry_version": r_reg_ver,
             "script_text": r_script,
+            "also_matched": r_also_matched,
+            "ambiguity_resolved_by": r_ambiguity_resolved_by,
             "exit_code": exit_code,
             # Bounded evidence: short output is exact; longer output is explicitly marked as truncated.
             "stdout": stdout_tail,
@@ -2051,6 +2059,10 @@ class Workspace:
         }
         if script_text:
             cmd_identity["script_text"] = script_text
+        if last_run.get("also_matched"):
+            cmd_identity["also_matched"] = last_run["also_matched"]
+        if last_run.get("ambiguity_resolved_by"):
+            cmd_identity["ambiguity_resolved_by"] = last_run["ambiguity_resolved_by"]
 
         if last_run.get("launch_failed") or cand_outcome == TestOutcome.ENV_NOT_READY:
             return MechanicalEvidence(

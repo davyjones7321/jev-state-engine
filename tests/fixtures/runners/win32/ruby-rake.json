@@ -1,6 +1,6 @@
 {
-  "profile_id": "mix-test",
-  "runner": "mix",
+  "profile_id": "ruby-rake",
+  "runner": "rake",
   "supported_platforms": [
     "linux",
     "darwin",
@@ -9,9 +9,7 @@
   "captured_on_host": false,
   "host_platform": "win32",
   "tool_version": null,
-  "skip_reason": "Toolchain 'mix' not found in PATH on win32",
-  "known_reference": {
-    "zero_tests_exit": 0
-  },
+  "skip_reason": "ruby not found",
+  "known_reference": {},
   "cases": {}
 }

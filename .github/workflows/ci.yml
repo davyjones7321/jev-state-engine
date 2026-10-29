@@ -71,6 +71,20 @@ jobs:
         run: |
           python -m pytest -v -rs -m "not live"
 
+      - name: Capture Runner Fixtures
+        run: |
+          python scripts/capture_runner_fixtures.py --out-dir captured_fixtures_${{ matrix.os }}
+
+      - name: Upload Runner Fixtures Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: runner-fixtures-${{ matrix.os }}
+          path: captured_fixtures_${{ matrix.os }}
+
+      - name: Verify Live Exit Codes Against Committed Fixtures
+        run: |
+          python scripts/capture_runner_fixtures.py --verify-only
+
       - name: Run Phase Verification Script
         run: |
           python scripts/verify_phase.py HEAD~1 > verify_report_${{ matrix.os }}.txt

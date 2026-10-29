@@ -1,0 +1,15 @@
+{
+  "profile_id": "go-test",
+  "runner": "go",
+  "supported_platforms": [
+    "linux",
+    "darwin",
+    "win32"
+  ],
+  "captured_on_host": false,
+  "host_platform": "win32",
+  "tool_version": null,
+  "skip_reason": "go not found",
+  "known_reference": {},
+  "cases": {}
+}

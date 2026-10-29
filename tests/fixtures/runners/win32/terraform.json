@@ -9,9 +9,7 @@
   "captured_on_host": false,
   "host_platform": "win32",
   "tool_version": null,
-  "skip_reason": "Toolchain 'terraform' not found in PATH on win32",
-  "known_reference": {
-    "zero_tests_exit": 0
-  },
+  "skip_reason": "terraform not found",
+  "known_reference": {},
   "cases": {}
 }

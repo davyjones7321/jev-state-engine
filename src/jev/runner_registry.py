@@ -56,7 +56,8 @@ class RunnerProfile(BaseModel):
     build_argv_template: Optional[List[str]] = None
     test_argv_template: List[str]
     target_capabilities: List[str] = Field(default_factory=list)
-    zero_test_exit_behavior: int = 0
+    zero_test_exit_behavior: Optional[int] = None
+    precedence: int = 100
     zero_test_downgrade_markers: List[str] = Field(default_factory=list)
     failure_identity_patterns: List[str] = Field(default_factory=list)
     generated_output_hints: List[str] = Field(default_factory=list)
@@ -233,6 +234,8 @@ class ResolvedCommand:
     reason: Optional[str] = None
     runner_profile_id: Optional[str] = None
     registry_version: Optional[str] = None
+    also_matched: Optional[List[str]] = None
+    ambiguity_resolved_by: Optional[str] = None
 
 
 def resolve_from_registry(
@@ -312,20 +315,44 @@ def resolve_from_registry(
             registry_version=reg_ver,
         )
 
+    also_matched: Optional[List[str]] = None
+    ambiguity_resolved_by: Optional[str] = None
+
     if len(matching_profiles) > 1:
-        candidate_ids = sorted([p.profile_id for p in matching_profiles])
-        return ResolvedCommand(
-            ecosystem=None,
-            command=None,
-            source="ambiguous",
-            reason=f"Ambiguous runner profiles detected: {', '.join(candidate_ids)}",
-            runner_profile_id=None,
-            registry_version=reg_ver,
-        )
+        # Tie-breaker used ONLY for layouts the old cascade resolved (precedence <= 9)
+        OLD_CASCADE_MAX_PRECEDENCE = 9
+        if all(p.precedence <= OLD_CASCADE_MAX_PRECEDENCE for p in matching_profiles):
+            sorted_matches = sorted(matching_profiles, key=lambda p: p.precedence)
+            winner = sorted_matches[0]
+            also_matched = [p.profile_id for p in sorted_matches[1:]]
+            ambiguity_resolved_by = "precedence"
+            matching_profiles = [winner]
+        else:
+            candidate_ids = sorted([p.profile_id for p in matching_profiles])
+            return ResolvedCommand(
+                ecosystem=None,
+                command=None,
+                source="ambiguous",
+                reason=f"Ambiguous runner profiles detected: {', '.join(candidate_ids)}",
+                runner_profile_id=None,
+                registry_version=reg_ver,
+                also_matched=candidate_ids,
+            )
 
     # Exactly one profile matched
     profile = matching_profiles[0]
     pid = profile.profile_id
+
+    def _build_cmd(eco: str, cmd: List[str], src: str) -> ResolvedCommand:
+        return ResolvedCommand(
+            ecosystem=eco,
+            command=cmd,
+            source=src,
+            runner_profile_id=pid,
+            registry_version=reg_ver,
+            also_matched=also_matched,
+            ambiguity_resolved_by=ambiguity_resolved_by,
+        )
 
     if pid == "pytest":
         pytest_source = "pytest"
@@ -335,31 +362,13 @@ def resolve_from_registry(
             pytest_source = "pyproject.toml"
         else:
             pytest_source = "python_test_files"
-        return ResolvedCommand(
-            ecosystem="pytest",
-            command=[sys.executable, "-m", "pytest", "-q"],
-            source=pytest_source,
-            runner_profile_id="pytest",
-            registry_version=reg_ver,
-        )
+        return _build_cmd("pytest", [sys.executable, "-m", "pytest", "-q"], pytest_source)
 
     if pid == "go-test":
-        return ResolvedCommand(
-            ecosystem="go",
-            command=["go", "test", "./..."],
-            source="go.mod",
-            runner_profile_id="go-test",
-            registry_version=reg_ver,
-        )
+        return _build_cmd("go", ["go", "test", "./..."], "go.mod")
 
     if pid == "cargo-test":
-        return ResolvedCommand(
-            ecosystem="cargo",
-            command=["cargo", "test"],
-            source="Cargo.toml",
-            runner_profile_id="cargo-test",
-            registry_version=reg_ver,
-        )
+        return _build_cmd("cargo", ["cargo", "test"], "Cargo.toml")
 
     if pid == "maven-surefire":
         mvn_cmd = "mvn"
@@ -369,13 +378,7 @@ def resolve_from_registry(
             mvn_cmd = "./mvnw"
         elif (wt / "mvnw.cmd").exists():
             mvn_cmd = str(wt / "mvnw.cmd")
-        return ResolvedCommand(
-            ecosystem="maven",
-            command=[mvn_cmd, "test"],
-            source="pom.xml",
-            runner_profile_id="maven-surefire",
-            registry_version=reg_ver,
-        )
+        return _build_cmd("maven", [mvn_cmd, "test"], "pom.xml")
 
     if pid == "gradle-test":
         gradle_cmd = "gradle"
@@ -386,67 +389,25 @@ def resolve_from_registry(
         elif (wt / "gradlew.bat").exists():
             gradle_cmd = str(wt / "gradlew.bat")
         source = "build.gradle" if (wt / "build.gradle").exists() else "build.gradle.kts"
-        return ResolvedCommand(
-            ecosystem="gradle",
-            command=[gradle_cmd, "test"],
-            source=source,
-            runner_profile_id="gradle-test",
-            registry_version=reg_ver,
-        )
+        return _build_cmd("gradle", [gradle_cmd, "test"], source)
 
     if pid == "terraform":
-        return ResolvedCommand(
-            ecosystem="terraform",
-            command=["terraform", "validate"],
-            source="terraform",
-            runner_profile_id="terraform",
-            registry_version=reg_ver,
-        )
+        return _build_cmd("terraform", ["terraform", "validate"], "terraform")
 
     if pid == "ansible":
         import shutil
         if shutil.which("ansible-lint"):
-            return ResolvedCommand(
-                ecosystem="ansible",
-                command=["ansible-lint"],
-                source="ansible",
-                runner_profile_id="ansible",
-                registry_version=reg_ver,
-            )
+            return _build_cmd("ansible", ["ansible-lint"], "ansible")
         elif shutil.which("ansible-playbook"):
             playbooks = list(wt.glob("playbook*.yml")) + list(wt.glob("playbook*.yaml"))
             pb_arg = str(playbooks[0]) if playbooks else "."
-            return ResolvedCommand(
-                ecosystem="ansible",
-                command=["ansible-playbook", "--syntax-check", pb_arg],
-                source="ansible",
-                runner_profile_id="ansible",
-                registry_version=reg_ver,
-            )
+            return _build_cmd("ansible", ["ansible-playbook", "--syntax-check", pb_arg], "ansible")
         else:
-            return ResolvedCommand(
-                ecosystem="ansible",
-                command=["ansible-lint"],
-                source="ansible",
-                runner_profile_id="ansible",
-                registry_version=reg_ver,
-            )
+            return _build_cmd("ansible", ["ansible-lint"], "ansible")
 
     if pid == "helm":
-        return ResolvedCommand(
-            ecosystem="helm",
-            command=["helm", "lint", "."],
-            source="Chart.yaml",
-            runner_profile_id="helm",
-            registry_version=reg_ver,
-        )
+        return _build_cmd("helm", ["helm", "lint", "."], "Chart.yaml")
 
     # Other runner profiles
     source_marker = profile.marker_files[0] if profile.marker_files else profile.profile_id
-    return ResolvedCommand(
-        ecosystem=profile.runner,
-        command=list(profile.test_argv_template),
-        source=source_marker,
-        runner_profile_id=profile.profile_id,
-        registry_version=reg_ver,
-    )
+    return _build_cmd(profile.runner, list(profile.test_argv_template), source_marker)

@@ -6,14 +6,31 @@
       "registry_version": "1.0.0",
       "language": "python",
       "runner": "pytest",
-      "platforms": ["linux", "darwin", "win32"],
-      "marker_files": ["pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini"],
+      "platforms": [
+        "linux",
+        "darwin",
+        "win32"
+      ],
+      "marker_files": [
+        "pytest.ini",
+        "pyproject.toml",
+        "setup.cfg",
+        "tox.ini"
+      ],
       "min_version": "6.0.0",
       "max_version": null,
       "executable_rule": "python",
       "build_argv_template": null,
-      "test_argv_template": ["python", "-m", "pytest", "-q"],
-      "target_capabilities": ["file", "node_id"],
+      "test_argv_template": [
+        "python",
+        "-m",
+        "pytest",
+        "-q"
+      ],
+      "target_capabilities": [
+        "file",
+        "node_id"
+      ],
       "zero_test_exit_behavior": 5,
       "zero_test_downgrade_markers": [
         "^=+\\s+no tests ran",
@@ -24,22 +41,39 @@
         "^FAILED\\s+([^:]+)::(\\S+)",
         "___+\\s+([^_]+)\\s+___+"
       ],
-      "generated_output_hints": [".pytest_cache", "__pycache__"],
-      "fixture_ids": ["pytest-v8"]
+      "generated_output_hints": [
+        ".pytest_cache",
+        "__pycache__"
+      ],
+      "fixture_ids": [
+        "pytest-v8"
+      ],
+      "precedence": 6
     },
     {
       "profile_id": "node-native-test",
       "registry_version": "1.0.0",
       "language": "javascript",
       "runner": "node",
-      "platforms": ["linux", "darwin", "win32"],
-      "marker_files": ["node_test.config.js"],
+      "platforms": [
+        "linux",
+        "darwin",
+        "win32"
+      ],
+      "marker_files": [
+        "node_test.config.js"
+      ],
       "min_version": "18.0.0",
       "max_version": null,
       "executable_rule": "path",
       "build_argv_template": null,
-      "test_argv_template": ["node", "--test"],
-      "target_capabilities": ["file"],
+      "test_argv_template": [
+        "node",
+        "--test"
+      ],
+      "target_capabilities": [
+        "file"
+      ],
       "zero_test_exit_behavior": 0,
       "zero_test_downgrade_markers": [
         "pass 0",
@@ -47,48 +81,87 @@
         "cancelled 0"
       ],
       "failure_identity_patterns": [
-        "✖\\s+(.*)\\s+\\(\\d+.*ms\\)"
+        "\u2716\\s+(.*)\\s+\\(\\d+.*ms\\)"
       ],
       "generated_output_hints": [],
-      "fixture_ids": ["node-v20"]
+      "fixture_ids": [
+        "node-v20"
+      ],
+      "precedence": 100
     },
     {
       "profile_id": "jest",
       "registry_version": "1.0.0",
       "language": "javascript",
       "runner": "jest",
-      "platforms": ["linux", "darwin", "win32"],
-      "marker_files": ["jest.config.js", "jest.config.ts", "jest.config.json", "jest.config.mjs", "jest.config.cjs"],
+      "platforms": [
+        "linux",
+        "darwin",
+        "win32"
+      ],
+      "marker_files": [
+        "jest.config.js",
+        "jest.config.ts",
+        "jest.config.json",
+        "jest.config.mjs",
+        "jest.config.cjs"
+      ],
       "min_version": "27.0.0",
       "max_version": null,
       "executable_rule": "path",
       "build_argv_template": null,
-      "test_argv_template": ["npx", "jest"],
-      "target_capabilities": ["file", "filter"],
-      "zero_test_exit_behavior": 1,
+      "test_argv_template": [
+        "npx",
+        "jest"
+      ],
+      "target_capabilities": [
+        "file",
+        "filter"
+      ],
+      "zero_test_exit_behavior": null,
       "zero_test_downgrade_markers": [
         "No tests found, exiting with code 1"
       ],
       "failure_identity_patterns": [
-        "●\\s+(.*)"
+        "\u25cf\\s+(.*)"
       ],
-      "generated_output_hints": [".jest-cache"],
-      "fixture_ids": ["jest-v29"]
+      "generated_output_hints": [
+        ".jest-cache"
+      ],
+      "fixture_ids": [
+        "jest-v29"
+      ],
+      "precedence": 100
     },
     {
       "profile_id": "mocha",
       "registry_version": "1.0.0",
       "language": "javascript",
       "runner": "mocha",
-      "platforms": ["linux", "darwin", "win32"],
-      "marker_files": [".mocharc.json", ".mocharc.yaml", ".mocharc.yml", ".mocharc.js", ".mocharc.cjs"],
+      "platforms": [
+        "linux",
+        "darwin",
+        "win32"
+      ],
+      "marker_files": [
+        ".mocharc.json",
+        ".mocharc.yaml",
+        ".mocharc.yml",
+        ".mocharc.js",
+        ".mocharc.cjs"
+      ],
       "min_version": "9.0.0",
       "max_version": null,
       "executable_rule": "path",
       "build_argv_template": null,
-      "test_argv_template": ["npx", "mocha"],
-      "target_capabilities": ["file"],
-      "zero_test_exit_behavior": 1,
+      "test_argv_template": [
+        "npx",
+        "mocha"
+      ],
+      "target_capabilities": [
+        "file"
+      ],
+      "zero_test_exit_behavior": null,
       "zero_test_downgrade_markers": [
         "0 passing"
       ],
@@ -96,44 +169,78 @@
         "\\d+\\)\\s+(.*):"
       ],
       "generated_output_hints": [],
-      "fixture_ids": ["mocha-v10"]
+      "fixture_ids": [
+        "mocha-v10"
+      ],
+      "precedence": 100
     },
     {
       "profile_id": "vitest",
       "registry_version": "1.0.0",
       "language": "typescript",
       "runner": "vitest",
-      "platforms": ["linux", "darwin", "win32"],
-      "marker_files": ["vitest.config.ts", "vitest.config.js", "vitest.config.mjs"],
+      "platforms": [
+        "linux",
+        "darwin",
+        "win32"
+      ],
+      "marker_files": [
+        "vitest.config.ts",
+        "vitest.config.js",
+        "vitest.config.mjs"
+      ],
       "min_version": "0.34.0",
       "max_version": null,
       "executable_rule": "path",
       "build_argv_template": null,
-      "test_argv_template": ["npx", "vitest", "run"],
-      "target_capabilities": ["file", "filter"],
-      "zero_test_exit_behavior": 1,
+      "test_argv_template": [
+        "npx",
+        "vitest",
+        "run"
+      ],
+      "target_capabilities": [
+        "file",
+        "filter"
+      ],
+      "zero_test_exit_behavior": null,
       "zero_test_downgrade_markers": [
         "No test files found"
       ],
       "failure_identity_patterns": [
         "FAIL\\s+(.*)"
       ],
-      "generated_output_hints": [".vitest"],
-      "fixture_ids": ["vitest-v1"]
+      "generated_output_hints": [
+        ".vitest"
+      ],
+      "fixture_ids": [
+        "vitest-v1"
+      ],
+      "precedence": 100
     },
     {
       "profile_id": "bun-test",
       "registry_version": "1.0.0",
       "language": "typescript",
       "runner": "bun",
-      "platforms": ["linux", "darwin", "win32"],
-      "marker_files": ["bunfig.toml"],
+      "platforms": [
+        "linux",
+        "darwin",
+        "win32"
+      ],
+      "marker_files": [
+        "bunfig.toml"
+      ],
       "min_version": "1.0.0",
       "max_version": null,
       "executable_rule": "path",
       "build_argv_template": null,
-      "test_argv_template": ["bun", "test"],
-      "target_capabilities": ["file"],
+      "test_argv_template": [
+        "bun",
+        "test"
+      ],
+      "target_capabilities": [
+        "file"
+      ],
       "zero_test_exit_behavior": 1,
       "zero_test_downgrade_markers": [
         "0 pass",
@@ -143,22 +250,40 @@
         "\\(fail\\)\\s+(.*)"
       ],
       "generated_output_hints": [],
-      "fixture_ids": ["bun-v1"]
+      "fixture_ids": [
+        "bun-v1"
+      ],
+      "precedence": 100
     },
     {
       "profile_id": "deno-test",
       "registry_version": "1.0.0",
       "language": "typescript",
       "runner": "deno",
-      "platforms": ["linux", "darwin", "win32"],
-      "marker_files": ["deno.json", "deno.jsonc"],
+      "platforms": [
+        "linux",
+        "darwin",
+        "win32"
+      ],
+      "marker_files": [
+        "deno.json",
+        "deno.jsonc"
+      ],
       "min_version": "1.30.0",
       "max_version": null,
       "executable_rule": "path",
-      "build_argv_template": ["deno", "check"],
-      "test_argv_template": ["deno", "test"],
-      "target_capabilities": ["file"],
-      "zero_test_exit_behavior": 0,
+      "build_argv_template": [
+        "deno",
+        "check"
+      ],
+      "test_argv_template": [
+        "deno",
+        "test"
+      ],
+      "target_capabilities": [
+        "file"
+      ],
+      "zero_test_exit_behavior": null,
       "zero_test_downgrade_markers": [
         "0 passed; 0 failed"
       ],
@@ -166,22 +291,41 @@
         "FAILED\\s+\\|\\s+(.*)"
       ],
       "generated_output_hints": [],
-      "fixture_ids": ["deno-v1"]
+      "fixture_ids": [
+        "deno-v1"
+      ],
+      "precedence": 100
     },
     {
       "profile_id": "go-test",
       "registry_version": "1.0.0",
       "language": "go",
       "runner": "go",
-      "platforms": ["linux", "darwin", "win32"],
-      "marker_files": ["go.mod"],
+      "platforms": [
+        "linux",
+        "darwin",
+        "win32"
+      ],
+      "marker_files": [
+        "go.mod"
+      ],
       "min_version": "1.18",
       "max_version": null,
       "executable_rule": "path",
-      "build_argv_template": ["go", "build", "./..."],
-      "test_argv_template": ["go", "test", "./..."],
-      "target_capabilities": ["package"],
-      "zero_test_exit_behavior": 0,
+      "build_argv_template": [
+        "go",
+        "build",
+        "./..."
+      ],
+      "test_argv_template": [
+        "go",
+        "test",
+        "./..."
+      ],
+      "target_capabilities": [
+        "package"
+      ],
+      "zero_test_exit_behavior": null,
       "zero_test_downgrade_markers": [
         "\\[no test files\\]",
         "\\[no tests to run\\]"
@@ -190,21 +334,39 @@
         "--- FAIL:\\s+(\\S+)"
       ],
       "generated_output_hints": [],
-      "fixture_ids": ["go-v1.22"]
+      "fixture_ids": [
+        "go-v1.22"
+      ],
+      "precedence": 2
     },
     {
       "profile_id": "cargo-test",
       "registry_version": "1.0.0",
       "language": "rust",
       "runner": "cargo",
-      "platforms": ["linux", "darwin", "win32"],
-      "marker_files": ["Cargo.toml"],
+      "platforms": [
+        "linux",
+        "darwin",
+        "win32"
+      ],
+      "marker_files": [
+        "Cargo.toml"
+      ],
       "min_version": "1.60.0",
       "max_version": null,
       "executable_rule": "path",
-      "build_argv_template": ["cargo", "check"],
-      "test_argv_template": ["cargo", "test"],
-      "target_capabilities": ["package", "test_name"],
+      "build_argv_template": [
+        "cargo",
+        "check"
+      ],
+      "test_argv_template": [
+        "cargo",
+        "test"
+      ],
+      "target_capabilities": [
+        "package",
+        "test_name"
+      ],
       "zero_test_exit_behavior": 0,
       "zero_test_downgrade_markers": [
         "running 0 tests"
@@ -212,115 +374,216 @@
       "failure_identity_patterns": [
         "test\\s+(\\S+)\\s+\\.\\.\\.\\s+FAILED"
       ],
-      "generated_output_hints": ["target"],
-      "fixture_ids": ["cargo-v1.75"]
+      "generated_output_hints": [
+        "target"
+      ],
+      "fixture_ids": [
+        "cargo-v1.75"
+      ],
+      "precedence": 3
     },
     {
       "profile_id": "maven-surefire",
       "registry_version": "1.0.0",
       "language": "java",
       "runner": "maven",
-      "platforms": ["linux", "darwin", "win32"],
-      "marker_files": ["pom.xml"],
+      "platforms": [
+        "linux",
+        "darwin",
+        "win32"
+      ],
+      "marker_files": [
+        "pom.xml"
+      ],
       "min_version": "3.6.0",
       "max_version": null,
       "executable_rule": "wrapper_or_path",
-      "build_argv_template": ["mvn", "compile"],
-      "test_argv_template": ["mvn", "test"],
-      "target_capabilities": ["class", "method"],
-      "zero_test_exit_behavior": 0,
+      "build_argv_template": [
+        "mvn",
+        "compile"
+      ],
+      "test_argv_template": [
+        "mvn",
+        "test"
+      ],
+      "target_capabilities": [
+        "class",
+        "method"
+      ],
+      "zero_test_exit_behavior": null,
       "zero_test_downgrade_markers": [
         "Tests run: 0, Failures: 0, Errors: 0, Skipped: 0"
       ],
       "failure_identity_patterns": [
         "FAILURE! - in\\s+(\\S+)"
       ],
-      "generated_output_hints": ["target/surefire-reports"],
-      "fixture_ids": ["maven-v3"]
+      "generated_output_hints": [
+        "target/surefire-reports"
+      ],
+      "fixture_ids": [
+        "maven-v3"
+      ],
+      "precedence": 4
     },
     {
       "profile_id": "gradle-test",
       "registry_version": "1.0.0",
       "language": "java",
       "runner": "gradle",
-      "platforms": ["linux", "darwin", "win32"],
-      "marker_files": ["build.gradle", "build.gradle.kts"],
+      "platforms": [
+        "linux",
+        "darwin",
+        "win32"
+      ],
+      "marker_files": [
+        "build.gradle",
+        "build.gradle.kts"
+      ],
       "min_version": "7.0",
       "max_version": null,
       "executable_rule": "wrapper_or_path",
-      "build_argv_template": ["gradle", "classes"],
-      "test_argv_template": ["gradle", "test"],
-      "target_capabilities": ["class"],
-      "zero_test_exit_behavior": 0,
+      "build_argv_template": [
+        "gradle",
+        "classes"
+      ],
+      "test_argv_template": [
+        "gradle",
+        "test"
+      ],
+      "target_capabilities": [
+        "class"
+      ],
+      "zero_test_exit_behavior": null,
       "zero_test_downgrade_markers": [
         "NO-SOURCE"
       ],
       "failure_identity_patterns": [
         "^(\\S+)\\s+>\\s+(\\S+)\\s+FAILED"
       ],
-      "generated_output_hints": ["build/reports/tests"],
-      "fixture_ids": ["gradle-v8"]
+      "generated_output_hints": [
+        "build/reports/tests"
+      ],
+      "fixture_ids": [
+        "gradle-v8"
+      ],
+      "precedence": 5
     },
     {
       "profile_id": "dotnet-test",
       "registry_version": "1.0.0",
       "language": "csharp",
       "runner": "dotnet",
-      "platforms": ["linux", "darwin", "win32"],
-      "marker_files": ["*.csproj", "*.fsproj", "*.sln"],
+      "platforms": [
+        "linux",
+        "darwin",
+        "win32"
+      ],
+      "marker_files": [
+        "*.csproj",
+        "*.fsproj",
+        "*.sln"
+      ],
       "min_version": "6.0",
       "max_version": null,
       "executable_rule": "path",
-      "build_argv_template": ["dotnet", "build"],
-      "test_argv_template": ["dotnet", "test"],
-      "target_capabilities": ["filter"],
-      "zero_test_exit_behavior": 0,
+      "build_argv_template": [
+        "dotnet",
+        "build"
+      ],
+      "test_argv_template": [
+        "dotnet",
+        "test"
+      ],
+      "target_capabilities": [
+        "filter"
+      ],
+      "zero_test_exit_behavior": null,
       "zero_test_downgrade_markers": [
         "Total tests: 0"
       ],
       "failure_identity_patterns": [
         "Failed\\s+(\\S+)"
       ],
-      "generated_output_hints": ["bin", "obj"],
-      "fixture_ids": ["dotnet-v8"]
+      "generated_output_hints": [
+        "bin",
+        "obj"
+      ],
+      "fixture_ids": [
+        "dotnet-v8"
+      ],
+      "precedence": 100
     },
     {
       "profile_id": "cmake-ctest",
       "registry_version": "1.0.0",
       "language": "cpp",
       "runner": "ctest",
-      "platforms": ["linux", "darwin", "win32"],
-      "marker_files": ["CMakeLists.txt"],
+      "platforms": [
+        "linux",
+        "darwin",
+        "win32"
+      ],
+      "marker_files": [
+        "CMakeLists.txt"
+      ],
       "min_version": "3.15",
       "max_version": null,
       "executable_rule": "path",
-      "build_argv_template": ["cmake", "--build", "build"],
-      "test_argv_template": ["ctest", "--output-on-failure"],
-      "target_capabilities": ["regex"],
-      "zero_test_exit_behavior": 0,
+      "build_argv_template": [
+        "cmake",
+        "--build",
+        "build"
+      ],
+      "test_argv_template": [
+        "ctest",
+        "--output-on-failure"
+      ],
+      "target_capabilities": [
+        "regex"
+      ],
+      "zero_test_exit_behavior": null,
       "zero_test_downgrade_markers": [
         "No tests were found!!!"
       ],
       "failure_identity_patterns": [
         "The following tests FAILED:"
       ],
-      "generated_output_hints": ["Testing/Temporary"],
-      "fixture_ids": ["cmake-v3"]
+      "generated_output_hints": [
+        "Testing/Temporary"
+      ],
+      "fixture_ids": [
+        "cmake-v3"
+      ],
+      "precedence": 100
     },
     {
       "profile_id": "ruby-rake",
       "registry_version": "1.0.0",
       "language": "ruby",
       "runner": "rake",
-      "platforms": ["linux", "darwin", "win32"],
-      "marker_files": ["Rakefile", "Gemfile"],
+      "platforms": [
+        "linux",
+        "darwin",
+        "win32"
+      ],
+      "marker_files": [
+        "Rakefile",
+        "Gemfile"
+      ],
       "min_version": "3.0",
       "max_version": null,
       "executable_rule": "path",
       "build_argv_template": null,
-      "test_argv_template": ["bundle", "exec", "rake", "test"],
-      "target_capabilities": ["file"],
-      "zero_test_exit_behavior": 0,
+      "test_argv_template": [
+        "bundle",
+        "exec",
+        "rake",
+        "test"
+      ],
+      "target_capabilities": [
+        "file"
+      ],
+      "zero_test_exit_behavior": null,
       "zero_test_downgrade_markers": [
         "0 runs, 0 assertions, 0 failures, 0 errors"
       ],
@@ -328,22 +591,36 @@
         "(\\d+)\\) Failure:\\n(\\S+)"
       ],
       "generated_output_hints": [],
-      "fixture_ids": ["rake-v13"]
+      "fixture_ids": [
+        "rake-v13"
+      ],
+      "precedence": 100
     },
     {
       "profile_id": "phpunit",
       "registry_version": "1.0.0",
       "language": "php",
       "runner": "phpunit",
-      "platforms": ["linux", "darwin", "win32"],
-      "marker_files": ["phpunit.xml", "phpunit.xml.dist"],
+      "platforms": [
+        "linux",
+        "darwin",
+        "win32"
+      ],
+      "marker_files": [
+        "phpunit.xml",
+        "phpunit.xml.dist"
+      ],
       "min_version": "9.0",
       "max_version": null,
       "executable_rule": "path",
       "build_argv_template": null,
-      "test_argv_template": ["vendor/bin/phpunit"],
-      "target_capabilities": ["filter"],
-      "zero_test_exit_behavior": 0,
+      "test_argv_template": [
+        "vendor/bin/phpunit"
+      ],
+      "target_capabilities": [
+        "filter"
+      ],
+      "zero_test_exit_behavior": null,
       "zero_test_downgrade_markers": [
         "No tests executed!"
       ],
@@ -351,68 +628,118 @@
         "There was \\d+ failure:"
       ],
       "generated_output_hints": [],
-      "fixture_ids": ["phpunit-v10"]
+      "fixture_ids": [
+        "phpunit-v10"
+      ],
+      "precedence": 100
     },
     {
       "profile_id": "swiftpm-test",
       "registry_version": "1.0.0",
       "language": "swift",
       "runner": "swift",
-      "platforms": ["linux", "darwin"],
-      "marker_files": ["Package.swift"],
+      "platforms": [
+        "linux",
+        "darwin"
+      ],
+      "marker_files": [
+        "Package.swift"
+      ],
       "min_version": "5.5",
       "max_version": null,
       "executable_rule": "path",
-      "build_argv_template": ["swift", "build"],
-      "test_argv_template": ["swift", "test"],
-      "target_capabilities": ["filter"],
-      "zero_test_exit_behavior": 0,
+      "build_argv_template": [
+        "swift",
+        "build"
+      ],
+      "test_argv_template": [
+        "swift",
+        "test"
+      ],
+      "target_capabilities": [
+        "filter"
+      ],
+      "zero_test_exit_behavior": null,
       "zero_test_downgrade_markers": [
         "Executed 0 tests"
       ],
       "failure_identity_patterns": [
         "Test Case '(.*)' failed"
       ],
-      "generated_output_hints": [".build"],
-      "fixture_ids": ["swift-v5"]
+      "generated_output_hints": [
+        ".build"
+      ],
+      "fixture_ids": [
+        "swift-v5"
+      ],
+      "precedence": 100
     },
     {
       "profile_id": "mix-test",
       "registry_version": "1.0.0",
       "language": "elixir",
       "runner": "mix",
-      "platforms": ["linux", "darwin", "win32"],
-      "marker_files": ["mix.exs"],
+      "platforms": [
+        "linux",
+        "darwin",
+        "win32"
+      ],
+      "marker_files": [
+        "mix.exs"
+      ],
       "min_version": "1.12",
       "max_version": null,
       "executable_rule": "path",
-      "build_argv_template": ["mix", "compile"],
-      "test_argv_template": ["mix", "test"],
-      "target_capabilities": ["file"],
-      "zero_test_exit_behavior": 0,
+      "build_argv_template": [
+        "mix",
+        "compile"
+      ],
+      "test_argv_template": [
+        "mix",
+        "test"
+      ],
+      "target_capabilities": [
+        "file"
+      ],
+      "zero_test_exit_behavior": null,
       "zero_test_downgrade_markers": [
         "0 failures"
       ],
       "failure_identity_patterns": [
         "\\d+\\) test (.*)"
       ],
-      "generated_output_hints": ["_build"],
-      "fixture_ids": ["mix-v1.14"]
+      "generated_output_hints": [
+        "_build"
+      ],
+      "fixture_ids": [
+        "mix-v1.14"
+      ],
+      "precedence": 100
     },
     {
       "profile_id": "xcode-test",
       "registry_version": "1.0.0",
       "language": "swift",
       "runner": "xcodebuild",
-      "platforms": ["darwin"],
-      "marker_files": ["*.xcodeproj", "*.xcworkspace"],
+      "platforms": [
+        "darwin"
+      ],
+      "marker_files": [
+        "*.xcodeproj",
+        "*.xcworkspace"
+      ],
       "min_version": null,
       "max_version": null,
       "executable_rule": "path",
       "build_argv_template": null,
-      "test_argv_template": ["xcodebuild", "test"],
-      "target_capabilities": ["scheme"],
-      "zero_test_exit_behavior": 0,
+      "test_argv_template": [
+        "xcodebuild",
+        "test"
+      ],
+      "target_capabilities": [
+        "scheme"
+      ],
+      "zero_test_exit_behavior": null,
       "zero_test_downgrade_markers": [
         "Executed 0 tests"
       ],
@@ -420,70 +747,114 @@
         "Test Case '(.*)' failed"
       ],
       "generated_output_hints": [],
-      "fixture_ids": ["xcode-v15"]
+      "fixture_ids": [
+        "xcode-v15"
+      ],
+      "precedence": 100
     },
     {
       "profile_id": "terraform",
       "registry_version": "1.0.0",
       "language": "hcl",
       "runner": "terraform",
-      "platforms": ["linux", "darwin", "win32"],
-      "marker_files": ["*.tf"],
+      "platforms": [
+        "linux",
+        "darwin",
+        "win32"
+      ],
+      "marker_files": [
+        "*.tf"
+      ],
       "min_version": "1.0.0",
       "max_version": null,
       "executable_rule": "path",
       "build_argv_template": null,
-      "test_argv_template": ["terraform", "validate"],
+      "test_argv_template": [
+        "terraform",
+        "validate"
+      ],
       "target_capabilities": [],
-      "zero_test_exit_behavior": 0,
+      "zero_test_exit_behavior": null,
       "zero_test_downgrade_markers": [],
       "failure_identity_patterns": [
         "Error:\\s+(.*)"
       ],
-      "generated_output_hints": [".terraform"],
-      "fixture_ids": ["terraform-v1"]
+      "generated_output_hints": [
+        ".terraform"
+      ],
+      "fixture_ids": [
+        "terraform-v1"
+      ],
+      "precedence": 7
     },
     {
       "profile_id": "ansible",
       "registry_version": "1.0.0",
       "language": "yaml",
       "runner": "ansible",
-      "platforms": ["linux", "darwin", "win32"],
-      "marker_files": ["ansible.cfg", "playbook*.yml", "playbook*.yaml", "playbooks"],
+      "platforms": [
+        "linux",
+        "darwin",
+        "win32"
+      ],
+      "marker_files": [
+        "ansible.cfg",
+        "playbook*.yml",
+        "playbook*.yaml",
+        "playbooks"
+      ],
       "min_version": "2.9",
       "max_version": null,
       "executable_rule": "ansible_rule",
       "build_argv_template": null,
-      "test_argv_template": ["ansible-lint"],
+      "test_argv_template": [
+        "ansible-lint"
+      ],
       "target_capabilities": [],
-      "zero_test_exit_behavior": 0,
+      "zero_test_exit_behavior": null,
       "zero_test_downgrade_markers": [],
       "failure_identity_patterns": [
         "ERROR!\\s+(.*)"
       ],
       "generated_output_hints": [],
-      "fixture_ids": ["ansible-v2"]
+      "fixture_ids": [
+        "ansible-v2"
+      ],
+      "precedence": 8
     },
     {
       "profile_id": "helm",
       "registry_version": "1.0.0",
       "language": "yaml",
       "runner": "helm",
-      "platforms": ["linux", "darwin", "win32"],
-      "marker_files": ["Chart.yaml"],
+      "platforms": [
+        "linux",
+        "darwin",
+        "win32"
+      ],
+      "marker_files": [
+        "Chart.yaml"
+      ],
       "min_version": "3.0.0",
       "max_version": null,
       "executable_rule": "path",
       "build_argv_template": null,
-      "test_argv_template": ["helm", "lint", "."],
+      "test_argv_template": [
+        "helm",
+        "lint",
+        "."
+      ],
       "target_capabilities": [],
-      "zero_test_exit_behavior": 0,
+      "zero_test_exit_behavior": null,
       "zero_test_downgrade_markers": [],
       "failure_identity_patterns": [
         "\\[ERROR\\]\\s+(.*)"
       ],
       "generated_output_hints": [],
-      "fixture_ids": ["helm-v3"]
+      "fixture_ids": [
+        "helm-v3"
+      ],
+      "precedence": 9
     }
   ]
 }

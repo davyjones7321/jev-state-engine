@@ -1,6 +1,6 @@
 {
-  "profile_id": "ansible",
-  "runner": "ansible-lint",
+  "profile_id": "jest",
+  "runner": "jest",
   "supported_platforms": [
     "linux",
     "darwin",
@@ -9,9 +9,9 @@
   "captured_on_host": false,
   "host_platform": "win32",
   "tool_version": null,
-  "skip_reason": "Toolchain 'ansible-lint' not found in PATH on win32",
+  "skip_reason": "npm install timed out for jest",
   "known_reference": {
-    "zero_tests_exit": 0
+    "zero_tests_exit": 1
   },
   "cases": {}
 }
