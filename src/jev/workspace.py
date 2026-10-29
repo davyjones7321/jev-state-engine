@@ -29,6 +29,16 @@ from jev.mech_evidence import (
 )
 from jev.process_runner import CommandResult, run_command
 
+from jev.repo_config import (
+    PROTECTED_FILES,
+    is_build_or_test_config,
+    is_lockfile,
+    is_protected_path,
+    load_repo_config,
+    normalize_command_argv,
+    validate_trust,
+)
+
 PROTECTED_PATHS = (".git/", ".jev/")
 
 
@@ -667,8 +677,31 @@ def compare_test_runs(before: Optional[dict], after: Optional[dict]) -> dict:
 def resolve_test_command(wt: Union[str, Path]) -> ResolvedTestCommand:
     """Detects the test command from repository manifests without running subprocesses or writing files.
 
-    Thin wrapper delegating detection to the runner profiles registry.
+    Resolution order: trusted repository config, exact registry match, approved proposal, UNMEASURED(NO_COMMAND).
     """
+    cfg = load_repo_config(wt)
+    if cfg and cfg.test_command:
+        is_trusted, trust_err = validate_trust(cfg, wt)
+        if is_trusted:
+            cmd_argv = normalize_command_argv(cfg.test_command)
+            return ResolvedTestCommand(
+                ecosystem=cfg.runner_profile_id or "trusted_config",
+                command=cmd_argv,
+                source="trusted_repo_config",
+                reason=None,
+                runner_profile_id=cfg.runner_profile_id,
+                registry_version=cfg.trust.registry_version if cfg.trust else None,
+            )
+        else:
+            return ResolvedTestCommand(
+                ecosystem=cfg.runner_profile_id or "untrusted_config",
+                command=None,
+                source="untrusted_repo_config",
+                reason=f"approval_invalidated: {trust_err}",
+                runner_profile_id=cfg.runner_profile_id,
+                registry_version=cfg.trust.registry_version if cfg.trust else None,
+            )
+
     from jev.runner_registry import resolve_from_registry
     res = resolve_from_registry(wt)
     return ResolvedTestCommand(
@@ -1030,6 +1063,9 @@ class Workspace:
         if norm_str == "node_modules" or norm_str.startswith("node_modules/"):
             raise PermissionError(f"Modifying files in node_modules is blocked: '{path}'.")
 
+        if is_protected_path(norm_str) or is_protected_path(path):
+            raise PermissionError(f"Modifying protected path is blocked: '{path}'.")
+
         target_path = self.resolve_in_worktree(norm_str)
         try:
             rel = target_path.resolve().relative_to(self.worktree_dir.resolve())
@@ -1044,6 +1080,9 @@ class Workspace:
 
         if rel_posix == "node_modules" or rel_posix.startswith("node_modules/"):
             raise PermissionError(f"Modifying files in node_modules is blocked: '{path}'.")
+
+        if is_protected_path(rel_posix):
+            raise PermissionError(f"Modifying protected path is blocked: '{path}'.")
 
         target_path.parent.mkdir(parents=True, exist_ok=True)
         content_bytes = content.encode("utf-8") if isinstance(content, str) else content
@@ -1695,6 +1734,8 @@ class Workspace:
                 )
 
         if res.command is None:
+            if res.source == "untrusted_repo_config":
+                return self._record_test_run(res.ecosystem, None, None, "", res.reason or "Untrusted repo config", TestOutcome.ENV_NOT_READY)
             if res.ecosystem == "package_json" and res.reason:
                 return self._record_test_run("package_json", None, -1, "", res.reason, TestOutcome.FAILED)
             return self._record_test_run(None, None, None, "", "", TestOutcome.NO_TESTS_COLLECTED)
@@ -1997,6 +2038,21 @@ class Workspace:
         if not should_run:
             return None
 
+        resolved_cmd = getattr(self, "_current_resolved_test_command", None) or self.resolve_test_command()
+        self._current_resolved_test_command = resolved_cmd
+        if resolved_cmd and resolved_cmd.source == "untrusted_repo_config":
+            return MechanicalEvidence(
+                mech_status=MechStatus.UNMEASURED,
+                reason=MechReason.NO_COMMAND,
+                evidence_level=EvidenceLevel.NONE,
+                comparison=Comparison.NOT_COMPARED,
+                comparison_valid=False,
+                approval_valid=False,
+                mechanically_unverified=True,
+                command_identity={"cmd": None, "source": "untrusted_repo_config", "reason": resolved_cmd.reason},
+                target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+            )
+
         # 2a. Pre-run target check
         if test_targets:
             for t in test_targets:
@@ -2063,6 +2119,43 @@ class Workspace:
             cmd_identity["also_matched"] = last_run["also_matched"]
         if last_run.get("ambiguity_resolved_by"):
             cmd_identity["ambiguity_resolved_by"] = last_run["ambiguity_resolved_by"]
+
+        resolved_cmd = getattr(self, "_current_resolved_test_command", None)
+        if resolved_cmd and resolved_cmd.source == "untrusted_repo_config":
+            return MechanicalEvidence(
+                mech_status=MechStatus.UNMEASURED,
+                reason=MechReason.NO_COMMAND,
+                evidence_level=EvidenceLevel.NONE,
+                comparison=Comparison.NOT_COMPARED,
+                comparison_valid=False,
+                approval_valid=False,
+                mechanically_unverified=True,
+                command_identity={**cmd_identity, "cmd": None},
+                target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+            )
+
+        staged_paths = list(self.worker_staged_paths)
+        diff_str = ""
+        if not staged_paths:
+            diff_str = self.get_staged_diff()
+            staged_paths = list(self._extract_files_from_diff(diff_str))
+
+        verifier_mod = any(is_build_or_test_config(p, diff_str) for p in staged_paths)
+        lockfile_only = bool(staged_paths) and all(is_lockfile(p) for p in staged_paths)
+
+        if verifier_mod or lockfile_only:
+            return MechanicalEvidence(
+                mech_status=MechStatus.UNMEASURED,
+                reason=MechReason.COMMAND_IDENTITY_CHANGED,
+                evidence_level=EvidenceLevel.NONE,
+                comparison=Comparison.INCONCLUSIVE,
+                comparison_valid=False,
+                approval_valid=True,
+                verifier_modified=True if verifier_mod else False,
+                mechanically_unverified=True,
+                command_identity={**cmd_identity, "cmd": last_run.get("argv")},
+                target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+            )
 
         if last_run.get("launch_failed") or cand_outcome == TestOutcome.ENV_NOT_READY:
             return MechanicalEvidence(
@@ -2209,7 +2302,7 @@ class Workspace:
                     )
 
         test_cmd = last_run.get("argv") or []
-        lockfile_hash = self._compute_lockfile_hash(self.repo_dir)
+        lockfile_hash = self._compute_lockfile_hash(self.worktree_dir) or self._compute_lockfile_hash(self.repo_dir)
         tool_version = self._get_tool_version(last_run.get("tool_path"))
 
         cache_key = (
@@ -2793,6 +2886,14 @@ class Workspace:
             scope_list = list(scope) if scope is not None else []
 
         touched_files = self._extract_files_from_diff(diff_str)
+
+        for f in sorted(touched_files):
+            if is_protected_path(f):
+                return ScopeCheckResult(
+                    passed=False,
+                    out_of_scope=[f],
+                    detail=f"Scope violation: protected path '{f}' cannot be touched by worker",
+                )
 
         norm_scope = {Path(f).as_posix() for f in scope_list}
         out_of_scope = [

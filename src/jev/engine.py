@@ -2879,6 +2879,10 @@ def node_implement(
             if norm_path.startswith("./"):
                 norm_path = norm_path[2:]
 
+            from jev.repo_config import is_protected_path
+            if is_protected_path(norm_path) or is_protected_path(path):
+                return f"Error: Access denied staging mutation for '{path}': modifying protected paths is a scope violation."
+
             norm_scope = set()
             for s in (subgoal.scope or []):
                 s_norm = Path(s).as_posix()

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import getpass
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -70,6 +71,13 @@ def test_fixtures_are_normalized():
 
     current_user = getpass.getuser()
     violations = []
+    ci_generic_users = {"runner", "runneradmin", "root", "ubuntu", "administrator"}
+
+    user_path_pattern = (
+        re.compile(rf"[/\\]{re.escape(current_user)}[/\\]", re.IGNORECASE)
+        if current_user and len(current_user) > 2
+        else None
+    )
 
     for fpath in all_json_files:
         text = fpath.read_text(encoding="utf-8")
@@ -79,10 +87,36 @@ def test_fixtures_are_normalized():
             violations.append(f"{rel_path}: contains 'Users\\'")
         if "/home/" in text:
             violations.append(f"{rel_path}: contains '/home/'")
-        if current_user and len(current_user) > 2 and current_user in text:
-            violations.append(f"{rel_path}: contains username '{current_user}'")
+        if current_user and len(current_user) > 2:
+            if current_user.lower() in ci_generic_users:
+                # On CI VMs (like GitHub Actions 'runner' or 'runneradmin'), check for path occurrences
+                # rather than raw substring, preventing collisions with JSON keys ('"runner": "pytest"')
+                if user_path_pattern and user_path_pattern.search(text):
+                    violations.append(f"{rel_path}: contains user path segment '{current_user}'")
+            else:
+                if current_user in text:
+                    violations.append(f"{rel_path}: contains username '{current_user}'")
 
     assert not violations, f"Fixture normalization violations found:\n" + "\n".join(violations)
+
+
+def test_fixtures_normalization_ci_runner_account_does_not_false_positive(monkeypatch):
+    """Simulates running on GitHub Actions Ubuntu runner (user 'runner') to prove no false positives on schema keys."""
+    monkeypatch.setattr(getpass, "getuser", lambda: "runner")
+    test_fixtures_are_normalized()
+
+
+def test_fixtures_normalization_catches_leaked_ci_user_path(monkeypatch, tmp_path):
+    """Proves that a leaked user path segment like '/home/runner/' or '\\runner\\' is still caught as a violation."""
+    monkeypatch.setattr(getpass, "getuser", lambda: "runner")
+    fake_fixtures_dir = tmp_path / "runners" / "linux"
+    fake_fixtures_dir.mkdir(parents=True)
+    bad_fixture = fake_fixtures_dir / "bad.json"
+    bad_fixture.write_text('{"profile_id": "test", "stdout": "error in /home/runner/project/test.py"}', encoding="utf-8")
+
+    monkeypatch.setattr("tests.test_runner_fixtures.FIXTURES_ROOT", tmp_path / "runners")
+    with pytest.raises(AssertionError, match="Fixture normalization violations found"):
+        test_fixtures_are_normalized()
 
 
 def test_fixture_structure_and_schema():
