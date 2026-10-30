@@ -12,7 +12,9 @@ the 7 intentional new-coverage cases.
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -223,7 +225,7 @@ def test_version_predicates_evaluation():
         ("mix-test", "mix.exs", ["mix", "test"]),
         ("xcode-test", "app.xcodeproj", ["xcodebuild", "test"]),
         ("terraform", "main.tf", ["terraform", "validate"]),
-        ("ansible", "ansible.cfg", ["ansible-lint"]),
+        ("ansible", "ansible.cfg", ["ansible"]),
         ("helm", "Chart.yaml", ["helm", "lint", "."]),
     ],
 )
@@ -453,7 +455,14 @@ def _old_cascade_resolver(wt: Path) -> Tuple[Optional[str], Optional[List[str]]]
         or any(wt.glob("playbook*.yaml"))
     )
     if has_ansible:
-        return "ansible", ["ansible-lint"]
+        if shutil.which("ansible-lint"):
+            return "ansible", ["ansible-lint"]
+        elif shutil.which("ansible-playbook"):
+            playbooks = list(wt.glob("playbook*.yml")) + list(wt.glob("playbook*.yaml"))
+            pb_arg = str(playbooks[0]) if playbooks else "."
+            return "ansible", ["ansible-playbook", "--syntax-check", pb_arg]
+        else:
+            return "ansible", ["ansible-lint"]
 
     if (wt / "Chart.yaml").exists():
         return "helm", ["helm", "lint", "."],
