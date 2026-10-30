@@ -62,6 +62,7 @@ class RunnerProfile(BaseModel):
     precedence: int = 100
     zero_test_downgrade_markers: List[str] = Field(default_factory=list)
     failure_identity_patterns: List[str] = Field(default_factory=list)
+    empty_output_behavior: Optional[str] = "weak"
     generated_output_hints: List[str] = Field(default_factory=list)
     fixture_ids: List[str] = Field(default_factory=list)
 
@@ -559,4 +560,309 @@ def build_targeted_command(
 
     # Unsupported target capabilities
     return (None, "unsupported_target", TargetConfidence.HEURISTIC)
+
+
+def get_zero_test_downgrade_markers(profile: Optional[RunnerProfile] = None) -> List[str]:
+    """Returns the zero-test downgrade markers for a profile, supplemented with measured markers from real toolchains."""
+    markers: List[str] = []
+    if profile is not None:
+        markers.extend(profile.zero_test_downgrade_markers)
+
+    pid = profile.profile_id if profile else None
+    runner_specific: List[str] = []
+    if pid == "bun-test":
+        runner_specific = [
+            r"No tests found",
+            r"matched 0 tests",
+            r"0 pass",
+            r"0 fail",
+        ]
+    elif pid == "pytest":
+        runner_specific = [
+            r"no tests ran",
+            r"collected 0 items",
+            r"NO_TESTS",
+            r"\b0 selected\b",
+            r"\d+\s+deselected\b",
+        ]
+    elif pid == "jest":
+        runner_specific = [
+            r"No tests found",
+        ]
+    elif pid == "vitest":
+        runner_specific = [
+            r"No test files found",
+            r"no tests found",
+        ]
+    elif pid == "mocha":
+        runner_specific = [
+            r"0 passing",
+        ]
+    elif pid == "cargo-test":
+        runner_specific = [
+            r"running 0 tests",
+            r"0 passed;\s*0 failed",
+        ]
+    elif pid == "node-native-test":
+        runner_specific = [
+            r"pass 0\b",
+            r"fail 0\b",
+            r"tests 0\b",
+        ]
+    elif pid == "go-test":
+        runner_specific = [
+            r"\[no test files\]",
+            r"\[no tests to run\]",
+        ]
+    elif pid == "deno-test":
+        runner_specific = [
+            r"0 passed;\s*0 failed",
+        ]
+    elif pid == "maven-surefire":
+        runner_specific = [
+            r"Tests run:\s*0,\s*Failures:\s*0",
+        ]
+    elif pid == "gradle-test":
+        runner_specific = [
+            r"NO-SOURCE",
+        ]
+    elif pid == "dotnet-test":
+        runner_specific = [
+            r"Total tests:\s*0",
+        ]
+    elif pid == "cmake-ctest":
+        runner_specific = [
+            r"No tests were found",
+        ]
+    elif pid == "ruby-rake":
+        runner_specific = [
+            r"0 runs,\s*0 assertions",
+        ]
+    elif pid == "phpunit":
+        runner_specific = [
+            r"No tests executed",
+        ]
+    elif pid in ("swiftpm-test", "xcode-test"):
+        runner_specific = [
+            r"Executed 0 tests",
+        ]
+    elif pid == "mix-test":
+        runner_specific = [
+            r"0 failures",
+            r"0 tests",
+        ]
+    else:
+        runner_specific = [
+            r"collected 0 items",
+            r"no tests ran",
+            r"No tests found",
+            r"matched 0 tests",
+            r"0 pass",
+            r"running 0 tests",
+            r"\[no test files\]",
+            r"Total tests:\s*0",
+            r"No tests were found",
+            r"Executed 0 tests",
+        ]
+
+    for m in runner_specific:
+        if m not in markers:
+            markers.append(m)
+    return markers
+
+
+def is_zero_test_marker_match(
+    profile: Optional[RunnerProfile],
+    output: str,
+    exit_code: Optional[int] = None,
+) -> bool:
+    """Checks if output contains any zero-test downgrade marker.
+    
+    Markers are strictly downgrade-only: they may turn a candidate FAIL into
+    UNMEASURED(NO_TEST_EXECUTION_SIGNAL), but never upgrade anything.
+    """
+    if not output:
+        return False
+
+    clean = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", output)
+    markers = get_zero_test_downgrade_markers(profile)
+    for marker in markers:
+        try:
+            if re.search(marker, clean, re.IGNORECASE | re.MULTILINE):
+                return True
+        except Exception:
+            if marker.lower() in clean.lower():
+                return True
+    return False
+
+
+def parse_test_counts_summary(
+    profile: Optional[RunnerProfile],
+    output: str,
+    exit_code: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Parses execution summary counts from runner output.
+    
+    Returns a dict with:
+        passed: int
+        failed: int
+        skipped: int
+        all_skipped: bool
+        has_positive_pass: bool
+        parsed: bool
+    """
+    clean = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", output or "")
+    pid = profile.profile_id if profile else None
+
+    passed = 0
+    failed = 0
+    skipped = 0
+    matched = False
+
+    # 1. Pytest: 'X passed', 'X failed', 'X skipped', 'X error'
+    m_pass = re.search(r"\b(\d+)\s+passed\b", clean, re.I)
+    m_fail = re.search(r"\b(\d+)\s+failed\b", clean, re.I)
+    m_err = re.search(r"\b(\d+)\s+error(?:s)?\b", clean, re.I)
+    m_skip = re.search(r"\b(\d+)\s+skipped\b", clean, re.I)
+    if m_pass or m_fail or m_err or m_skip:
+        matched = True
+        if m_pass:
+            passed += int(m_pass.group(1))
+        if m_fail:
+            failed += int(m_fail.group(1))
+        if m_err:
+            failed += int(m_err.group(1))
+        if m_skip:
+            skipped += int(m_skip.group(1))
+
+    # 2. Bun: 'X pass', 'X fail', 'X skip'
+    if not matched:
+        b_pass = re.search(r"^\s*(\d+)\s+pass\b", clean, re.MULTILINE | re.I)
+        b_fail = re.search(r"^\s*(\d+)\s+fail\b", clean, re.MULTILINE | re.I)
+        b_skip = re.search(r"^\s*(\d+)\s+skip\b", clean, re.MULTILINE | re.I)
+        if b_pass or b_fail or b_skip:
+            matched = True
+            if b_pass:
+                passed += int(b_pass.group(1))
+            if b_fail:
+                failed += int(b_fail.group(1))
+            if b_skip:
+                skipped += int(b_skip.group(1))
+
+    # 3. Cargo: 'test result: ok. 1 passed; 0 failed; 0 ignored'
+    if not matched:
+        c_m = re.search(
+            r"test result:\s*(?:ok|FAILED)\.\s*(\d+)\s+passed;\s*(\d+)\s+failed;\s*(\d+)\s+ignored",
+            clean,
+            re.I,
+        )
+        if c_m:
+            matched = True
+            passed = int(c_m.group(1))
+            failed = int(c_m.group(2))
+            skipped = int(c_m.group(3))
+
+    # 4. Node native: 'ℹ pass 1', 'ℹ fail 0', 'ℹ skipped 0'
+    if not matched:
+        n_pass = re.search(r"\bpass\s+(\d+)\b", clean, re.I)
+        n_fail = re.search(r"\bfail\s+(\d+)\b", clean, re.I)
+        n_skip = re.search(r"\bskipped\s+(\d+)\b", clean, re.I)
+        if n_pass or n_fail or n_skip:
+            matched = True
+            if n_pass:
+                passed += int(n_pass.group(1))
+            if n_fail:
+                failed += int(n_fail.group(1))
+            if n_skip:
+                skipped += int(n_skip.group(1))
+
+    # 5. Jest / Vitest: 'Tests: 1 passed, 1 total'
+    if not matched:
+        j_pass = re.search(r"Tests:\s*.*?(\d+)\s+passed", clean, re.I)
+        j_fail = re.search(r"Tests:\s*.*?(\d+)\s+failed", clean, re.I)
+        j_skip = re.search(r"Tests:\s*.*?(\d+)\s+skipped", clean, re.I)
+        if j_pass or j_fail or j_skip:
+            matched = True
+            if j_pass:
+                passed += int(j_pass.group(1))
+            if j_fail:
+                failed += int(j_fail.group(1))
+            if j_skip:
+                skipped += int(j_skip.group(1))
+
+    # 6. Deno: '1 passed; 0 failed; 0 ignored'
+    if not matched:
+        d_m = re.search(r"(\d+)\s+passed;\s*(\d+)\s+failed;\s*(\d+)\s+ignored", clean, re.I)
+        if d_m:
+            matched = True
+            passed = int(d_m.group(1))
+            failed = int(d_m.group(2))
+            skipped = int(d_m.group(3))
+
+    # 7. Mocha: '1 passing', '0 failing'
+    if not matched:
+        m_pass = re.search(r"(\d+)\s+passing\b", clean, re.I)
+        m_fail = re.search(r"(\d+)\s+failing\b", clean, re.I)
+        if m_pass or m_fail:
+            matched = True
+            if m_pass:
+                passed += int(m_pass.group(1))
+            if m_fail:
+                failed += int(m_fail.group(1))
+
+    # 8. Maven: 'Tests run: 1, Failures: 0, Errors: 0, Skipped: 0'
+    if not matched:
+        mv_m = re.search(r"Tests run:\s*(\d+),\s*Failures:\s*(\d+),\s*Errors:\s*(\d+),\s*Skipped:\s*(\d+)", clean, re.I)
+        if mv_m:
+            matched = True
+            total = int(mv_m.group(1))
+            failed = int(mv_m.group(2)) + int(mv_m.group(3))
+            skipped = int(mv_m.group(4))
+            passed = max(0, total - failed - skipped)
+
+    # 9. DotNet: 'Passed: 1, Failed: 0, Skipped: 0'
+    if not matched:
+        dn_pass = re.search(r"Passed:\s*(\d+)", clean, re.I)
+        dn_fail = re.search(r"Failed:\s*(\d+)", clean, re.I)
+        dn_skip = re.search(r"Skipped:\s*(\d+)", clean, re.I)
+        if dn_pass or dn_fail or dn_skip:
+            matched = True
+            if dn_pass:
+                passed += int(dn_pass.group(1))
+            if dn_fail:
+                failed += int(dn_fail.group(1))
+            if dn_skip:
+                skipped += int(dn_skip.group(1))
+
+    # 10. Go: 'ok  package  0.01s' or '--- PASS: TestName'
+    if not matched and pid == "go-test":
+        if re.search(r"^ok\s+\S+", clean, re.MULTILINE) or "--- PASS:" in clean:
+            matched = True
+            passed = len(re.findall(r"--- PASS:", clean)) or 1
+        elif re.search(r"^FAIL\s+\S+", clean, re.MULTILINE) or "--- FAIL:" in clean:
+            matched = True
+            failed = len(re.findall(r"--- FAIL:", clean)) or 1
+
+    skip_indicators = (
+        "(skip) skip" in clean or
+        re.search(r"\bignored\b", clean, re.I) is not None or
+        re.search(r"#\s*SKIP\b", clean) is not None or
+        re.search(r"^\s*s\s+\[100%\]", clean, re.MULTILINE) is not None
+    )
+    all_skipped = False
+    if passed == 0 and failed == 0:
+        if skipped > 0 or skip_indicators:
+            all_skipped = True
+
+    has_positive_pass = bool(matched and passed > 0 and not all_skipped)
+
+    return {
+        "passed": passed,
+        "failed": failed,
+        "skipped": skipped,
+        "all_skipped": all_skipped,
+        "has_positive_pass": has_positive_pass,
+        "parsed": matched,
+    }
+
 

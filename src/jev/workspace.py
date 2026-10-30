@@ -180,10 +180,15 @@ logger = logging.getLogger(__name__)
 MAX_READ_CHARS = 40_000
 
 
-def parse_failing_test_ids(output: str, ecosystem: Optional[str] = None, exit_code: Optional[int] = None) -> Optional[Set[str]]:
+def parse_failing_test_ids(
+    output: str,
+    ecosystem: Optional[str] = None,
+    exit_code: Optional[int] = None,
+    profile: Optional[Any] = None,
+) -> Optional[Set[str]]:
     """Parse failing test identifiers from test runner output.
 
-    Supports pytest, unittest, jest/vitest, go, and cargo.
+    Supports pytest, unittest, jest/vitest, go, cargo, and registry profile failure patterns.
     Returns:
     - Set[str] of failing test IDs if parsed
     - set() if output indicates clean pass (no failures)
@@ -237,6 +242,29 @@ def parse_failing_test_ids(output: str, ecosystem: Optional[str] = None, exit_co
         token = match.group(1).strip()
         if token:
             ids.add(token)
+
+    # 6. Profile failure identity patterns (diagnostic and comparison evidence only)
+    if profile is None and ecosystem:
+        try:
+            from jev.runner_registry import load_registry
+            profile = load_registry().get_profile(ecosystem)
+        except Exception:
+            profile = None
+
+    if profile and getattr(profile, "failure_identity_patterns", None):
+        for pattern in profile.failure_identity_patterns:
+            try:
+                for match in re.finditer(pattern, clean, re.MULTILINE):
+                    if match.groups():
+                        token = "::".join(str(g).strip() for g in match.groups() if g).strip()
+                    else:
+                        token = match.group(0).strip()
+                    token = re.sub(r"\s*\[[\d\.]+.*\]$", "", token).strip()
+                    token = re.sub(r"\s*\([\d\.]+.*ms\)$", "", token).strip()
+                    if token:
+                        ids.add(token)
+            except Exception:
+                pass
 
     if exit_code is not None and exit_code != 0:
         if ids:
@@ -863,13 +891,33 @@ class Workspace:
         if stderr_tail:
             output_tail = f"{output_tail}\n[stderr]\n{stderr_tail}".strip() if output_tail else stderr_tail
 
+        res_cmd = getattr(self, "_current_resolved_test_command", None)
+        r_profile_id = runner_profile_id or (res_cmd.runner_profile_id if res_cmd else None)
+        r_reg_ver = registry_version or (res_cmd.registry_version if res_cmd else None)
+        r_script = script_text or (res_cmd.reason if (res_cmd and res_cmd.source == "package.json") else None)
+        r_also_matched = (res_cmd.also_matched if res_cmd else None)
+        r_ambiguity_resolved_by = (res_cmd.ambiguity_resolved_by if res_cmd else None)
+
+        from jev.runner_registry import load_registry, parse_test_counts_summary, is_zero_test_marker_match
+        reg_profile = None
+        if r_profile_id or ecosystem:
+            try:
+                reg_profile = load_registry().get_profile(r_profile_id or ecosystem)
+            except Exception:
+                reg_profile = None
+
         full_output = f"{stdout}\n{stderr}" if stderr else stdout
-        parsed_ids = parse_failing_test_ids(full_output, ecosystem=ecosystem, exit_code=exit_code)
+        parsed_ids = parse_failing_test_ids(full_output, ecosystem=ecosystem, exit_code=exit_code, profile=reg_profile)
+        counts_summary = parse_test_counts_summary(reg_profile, full_output, exit_code)
+        is_zero_test = is_zero_test_marker_match(reg_profile, full_output, exit_code)
+
         if outcome == TestOutcome.PASSED or exit_code == 0:
             parsed_ids = set()
         elif (outcome == TestOutcome.FAILED or (exit_code is not None and exit_code != 0)):
             if parsed_ids is not None and len(parsed_ids) == 0:
                 parsed_ids = None
+            if not parsed_ids and is_zero_test:
+                outcome = TestOutcome.NO_TESTS_COLLECTED
 
         cmd_result = getattr(self, "_last_test_command_result", None)
         self._last_test_command_result = None
@@ -891,13 +939,6 @@ class Workspace:
             c_cwd = str(getattr(self, "worktree_dir", Path.cwd()))
             c_tool_path = resolved_tool
 
-        res_cmd = getattr(self, "_current_resolved_test_command", None)
-        r_profile_id = runner_profile_id or (res_cmd.runner_profile_id if res_cmd else None)
-        r_reg_ver = registry_version or (res_cmd.registry_version if res_cmd else None)
-        r_script = script_text or (res_cmd.reason if (res_cmd and res_cmd.source == "package.json") else None)
-        r_also_matched = (res_cmd.also_matched if res_cmd else None)
-        r_ambiguity_resolved_by = (res_cmd.ambiguity_resolved_by if res_cmd else None)
-
         self.last_test_run = {
             "ecosystem": ecosystem,
             "command": command,
@@ -918,6 +959,10 @@ class Workspace:
             "output_tail": output_tail,
             "outcome": outcome.value if hasattr(outcome, "value") else str(outcome),
             "failing_test_ids": list(parsed_ids) if parsed_ids is not None else None,
+            "parsed_counts": counts_summary if counts_summary.get("has_positive_pass") else None,
+            "counts_summary": counts_summary,
+            "all_skipped": counts_summary.get("all_skipped", False),
+            "zero_tests_matched": is_zero_test,
             "launch_failed": c_launch_failed,
             "timed_out": c_timed_out,
             "argv": c_argv,
@@ -2140,8 +2185,13 @@ class Workspace:
 
                 failing_ids = None
                 if exit_code != 0:
-                    parsed = parse_failing_test_ids((cmd_res.stdout or "") + "\n" + (cmd_res.stderr or ""), exit_code=exit_code)
-                    failing_ids = list(parsed) if parsed else None
+                    base_out = (cmd_res.stdout or "") + "\n" + (cmd_res.stderr or "")
+                    from jev.runner_registry import is_zero_test_marker_match
+                    parsed = parse_failing_test_ids(base_out, exit_code=exit_code)
+                    if not parsed and is_zero_test_marker_match(None, base_out, exit_code):
+                        status = BaseStatus.UNMEASURED
+                    else:
+                        failing_ids = list(parsed) if parsed else None
 
                 res_data = {
                     "base_status": status,
@@ -2471,16 +2521,83 @@ class Workspace:
                 target_confidence=target_confidence,
             )
 
+        cand_exit = last_run.get("exit_code")
+        full_output = f"{last_run.get('stdout_tail') or ''}\n{last_run.get('stderr_tail') or ''}"
+
+        from jev.runner_registry import is_zero_test_marker_match, parse_test_counts_summary
+        counts_summary = last_run.get("counts_summary") or parse_test_counts_summary(profile, full_output, cand_exit)
+        is_zero_test = last_run.get("zero_tests_matched") if "zero_tests_matched" in last_run else is_zero_test_marker_match(profile, full_output, cand_exit)
+        failing_ids = last_run.get("failing_test_ids")
+
+        # Zero-test downgrade marker: turns a candidate FAIL into UNMEASURED(NO_TEST_EXECUTION_SIGNAL)
+        # Markers are downgrade-only: they never upgrade anything.
+        # Zero-test exit 1 with matching marker is never FAILED_BY_DIFF!
+        if (cand_exit is not None and cand_exit != 0) or cand_outcome == TestOutcome.FAILED:
+            if not failing_ids and is_zero_test:
+                return MechanicalEvidence(
+                    mech_status=MechStatus.UNMEASURED,
+                    reason=MechReason.NO_TEST_EXECUTION_SIGNAL,
+                    evidence_level=EvidenceLevel.NONE,
+                    comparison=Comparison.NOT_COMPARED,
+                    comparison_valid=False,
+                    approval_valid=True,
+                    mechanically_unverified=True,
+                    command_identity={**cmd_identity, "cmd": last_run.get("argv")},
+                    target_scope=target_scope_dict,
+                    target_rule=target_rule,
+                    target_confidence=target_confidence,
+                    worker_staged_paths=staged_paths,
+                )
+
         if cand_outcome == TestOutcome.NO_TESTS_COLLECTED:
-            return None
+            return MechanicalEvidence(
+                mech_status=MechStatus.UNMEASURED,
+                reason=MechReason.NO_TEST_EXECUTION_SIGNAL,
+                evidence_level=EvidenceLevel.NONE,
+                comparison=Comparison.NOT_COMPARED,
+                comparison_valid=False,
+                approval_valid=True,
+                mechanically_unverified=True,
+                command_identity={**cmd_identity, "cmd": last_run.get("argv")},
+                target_scope=target_scope_dict,
+                target_rule=target_rule,
+                target_confidence=target_confidence,
+                worker_staged_paths=staged_paths,
+            )
 
         # 2c. exit 0 -> PASS (Rule 3: CONFIG EDITS NEVER DISCARD A PASS)
-        cand_exit = last_run.get("exit_code")
         if cand_exit == 0 or cand_outcome == TestOutcome.PASSED:
-            # Rule: Heuristic pass stays exit_only
-            if target_confidence == TargetConfidence.HEURISTIC:
+            all_skipped = counts_summary.get("all_skipped", False)
+            empty_out = not full_output.strip()
+            expects_tests = getattr(subgoal, "expects_tests", True) if test_policy == "auto" else (test_policy == "always")
+
+            # Empty output with exit 0 and expected tests becomes weak or unmeasured by profile policy
+            if empty_out and expects_tests:
+                empty_policy = getattr(profile, "empty_output_behavior", "weak") if profile else "weak"
+                if empty_policy == "unmeasured":
+                    return MechanicalEvidence(
+                        mech_status=MechStatus.UNMEASURED,
+                        reason=MechReason.NO_TEST_EXECUTION_SIGNAL,
+                        evidence_level=EvidenceLevel.NONE,
+                        comparison=Comparison.NOT_COMPARED,
+                        comparison_valid=False,
+                        approval_valid=True,
+                        mechanically_unverified=True,
+                        command_identity={**cmd_identity, "cmd": last_run.get("argv")},
+                        target_scope=target_scope_dict,
+                        target_rule=target_rule,
+                        target_confidence=target_confidence,
+                        worker_staged_paths=staged_paths,
+                    )
+                else:
+                    ev_level = EvidenceLevel.EXIT_ONLY
+            elif all_skipped:
+                # Rule: all-skipped never becomes counted/named PASS
                 ev_level = EvidenceLevel.EXIT_ONLY
-            elif last_run.get("parsed_counts"):
+            elif target_confidence == TargetConfidence.HEURISTIC or (test_targets and not widened_due_to_shared):
+                # Rule: Heuristic pass or targeted run stays exit_only
+                ev_level = EvidenceLevel.EXIT_ONLY
+            elif counts_summary.get("has_positive_pass"):
                 ev_level = EvidenceLevel.COUNTED
             else:
                 ev_level = EvidenceLevel.EXIT_ONLY
@@ -2647,6 +2764,25 @@ class Workspace:
             )
 
         rerun_exit = rerun_details.get("exit_code")
+        rerun_out = f"{rerun_details.get('stdout_tail') or ''}\n{rerun_details.get('stderr_tail') or ''}"
+        rerun_failing_ids = rerun_details.get("failing_test_ids")
+        if (rerun_exit is not None and rerun_exit != 0) or rerun_outcome == TestOutcome.FAILED:
+            if not rerun_failing_ids and is_zero_test_marker_match(profile, rerun_out, rerun_exit):
+                return MechanicalEvidence(
+                    mech_status=MechStatus.UNMEASURED,
+                    reason=MechReason.NO_TEST_EXECUTION_SIGNAL,
+                    evidence_level=EvidenceLevel.NONE,
+                    comparison=Comparison.NOT_COMPARED,
+                    comparison_valid=False,
+                    approval_valid=True,
+                    mechanically_unverified=True,
+                    command_identity={**cmd_identity, "cmd": last_run.get("argv")},
+                    target_scope=target_scope_dict,
+                    target_rule=target_rule,
+                    target_confidence=target_confidence,
+                    worker_staged_paths=staged_paths,
+                )
+
         if rerun_exit == 0 or rerun_outcome == TestOutcome.PASSED:
             return MechanicalEvidence(
                 mech_status=MechStatus.UNMEASURED,
