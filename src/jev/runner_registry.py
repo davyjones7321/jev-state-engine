@@ -14,6 +14,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from jev.mech_evidence import TargetConfidence
+
 
 def validate_regex_pattern(pattern: str) -> str:
     """Validates regex pattern for length cap (200), nested quantifiers, and compilability."""
@@ -411,3 +413,150 @@ def resolve_from_registry(
     # Other runner profiles
     source_marker = profile.marker_files[0] if profile.marker_files else profile.profile_id
     return _build_cmd(profile.runner, list(profile.test_argv_template), source_marker)
+
+
+def build_targeted_command(
+    profile: Optional[RunnerProfile],
+    base_command: List[str],
+    targets: Sequence[Union[str, Path]],
+    worktree_dir: Optional[Path] = None,
+) -> Tuple[Optional[List[str]], str, TargetConfidence]:
+    """Builds the targeted command for a runner profile.
+
+    Returns:
+        (targeted_argv, selection_rule, target_confidence)
+        If targeted_argv is None, indicates the target cannot be represented for this runner,
+        prompting fallback to declared full suite.
+    """
+    if not targets:
+        return (list(base_command), "declared_full_suite", TargetConfidence.DECLARED_FULL_SUITE)
+
+    if profile is None:
+        return (None, "unsupported_target", TargetConfidence.HEURISTIC)
+
+    targets_str = [str(t) for t in targets]
+    pid = profile.profile_id
+    caps = profile.target_capabilities
+
+    # 1. pytest: ["file", "node_id"]
+    if pid == "pytest":
+        has_node_id = any("::" in t for t in targets_str)
+        rule = "exact_node_id" if has_node_id else "exact_file"
+        return ([*base_command, *targets_str], rule, TargetConfidence.EXACT)
+
+    # 2. File-targeting profiles: bun-test, deno-test, mix-test, node-native-test, mocha, ruby-rake, vitest, jest
+    if "file" in caps:
+        # If any target has node_id separator "::" but runner does not support node_id
+        if any("::" in t for t in targets_str) and "node_id" not in caps and "filter" not in caps:
+            return (None, "unsupported_target", TargetConfidence.HEURISTIC)
+
+        if pid == "ruby-rake":
+            # rake test TEST=path/to/test.rb
+            return ([*base_command, f"TEST={targets_str[0]}"], "exact_file", TargetConfidence.EXACT)
+
+        # For npm/yarn/pnpm using package scripts:
+        if base_command and base_command[0] in ("npm", "yarn", "pnpm"):
+            if base_command[0] == "npm" and worktree_dir and ((worktree_dir / "bun.lock").exists() or (worktree_dir / "bun.lockb").exists()):
+                return (["bun", "run", "test", *targets_str], "exact_file", TargetConfidence.EXACT)
+            elif base_command[0] == "npm":
+                return ([*base_command, "--", *targets_str], "exact_file", TargetConfidence.EXACT)
+            else:
+                return ([*base_command, *targets_str], "exact_file", TargetConfidence.EXACT)
+
+        return ([*base_command, *targets_str], "exact_file", TargetConfidence.EXACT)
+
+    # 3. go-test: ["package"]
+    if pid == "go-test":
+        # Check if targets are package targets
+        valid_pkgs: List[str] = []
+        for t in targets_str:
+            # If target ends with .go, it's a bare file, not a package
+            if t.endswith(".go"):
+                return (None, "unsupported_target", TargetConfidence.HEURISTIC)
+            normalized = t.replace("\\", "/")
+            if not normalized.startswith("./") and normalized != ".":
+                normalized = f"./{normalized}"
+            valid_pkgs.append(normalized)
+
+        # Replace ./... in base_command with target package(s)
+        cmd = []
+        replaced = False
+        for arg in base_command:
+            if arg == "./...":
+                cmd.extend(valid_pkgs)
+                replaced = True
+            else:
+                cmd.append(arg)
+        if not replaced:
+            cmd.extend(valid_pkgs)
+        return (cmd, "exact_package", TargetConfidence.EXACT)
+
+    # 4. cargo-test: ["package", "test_name"]
+    if pid == "cargo-test":
+        cmd = list(base_command)
+        first_t = targets_str[0]
+        # If target looks like a test file in tests/ e.g. tests/it.rs
+        if first_t.startswith("tests/") or first_t.startswith("tests\\") or first_t.endswith(".rs"):
+            test_stem = Path(first_t).stem
+            cmd.extend(["--test", test_stem])
+            return (cmd, "exact_task", TargetConfidence.EXACT)
+        elif first_t.startswith("-p"):
+            cmd.extend(first_t.split())
+            return (cmd, "exact_package", TargetConfidence.EXACT)
+        else:
+            # Package or test target: cargo test -p <pkg>
+            for t in targets_str:
+                cmd.extend(["-p", t])
+            return (cmd, "exact_package", TargetConfidence.EXACT)
+
+    # 5. maven-surefire: ["class", "method"]
+    if pid == "maven-surefire":
+        classes = []
+        for t in targets_str:
+            if t.endswith(".java") or t.endswith(".kt"):
+                classes.append(Path(t).stem)
+            else:
+                classes.append(t)
+        class_spec = ",".join(classes)
+        return ([*base_command, f"-Dtest={class_spec}"], "exact_class", TargetConfidence.EXACT)
+
+    # 6. gradle-test: ["class"]
+    if pid == "gradle-test":
+        cmd = list(base_command)
+        for t in targets_str:
+            cls_name = Path(t).stem if (t.endswith(".java") or t.endswith(".kt") or t.endswith(".groovy")) else t
+            cmd.extend(["--tests", cls_name])
+        return (cmd, "exact_class", TargetConfidence.EXACT)
+
+    # 7. dotnet-test: ["filter"]
+    if pid == "dotnet-test":
+        filter_parts = []
+        for t in targets_str:
+            if "~" in t or "=" in t:
+                filter_parts.append(t)
+            else:
+                filter_parts.append(f"FullyQualifiedName~{t}")
+        filter_expr = "|".join(filter_parts)
+        return ([*base_command, "--filter", filter_expr], "exact_filter", TargetConfidence.EXACT)
+
+    # 8. cmake-ctest: ["regex"]
+    if pid == "cmake-ctest":
+        # If target ends with source extension, ctest does not support file paths
+        if any(Path(t).suffix.lower() in (".c", ".cpp", ".cc", ".cxx", ".h", ".hpp") for t in targets_str):
+            return (None, "unsupported_target", TargetConfidence.HEURISTIC)
+        regex_expr = "|".join(targets_str)
+        return ([*base_command, "-R", regex_expr], "exact_regex", TargetConfidence.EXACT)
+
+    # 9. phpunit: ["filter"]
+    if pid == "phpunit":
+        filter_expr = "|".join(targets_str)
+        return ([*base_command, "--filter", filter_expr], "exact_filter", TargetConfidence.EXACT)
+
+    # 10. swiftpm-test: ["filter"]
+    if pid == "swiftpm-test":
+        filter_expr = "|".join(targets_str)
+        return ([*base_command, "--filter", filter_expr], "exact_filter", TargetConfidence.EXACT)
+
+    # Unsupported target capabilities
+    return (None, "unsupported_target", TargetConfidence.HEURISTIC)
+

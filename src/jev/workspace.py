@@ -86,6 +86,64 @@ def compute_failure_fingerprint(output: str, worktree_dir: Optional[Union[str, P
     return hashlib.sha256(normalized_block.encode("utf-8", errors="replace")).hexdigest()
 
 
+def is_shared_surface_path(path: Union[str, Path]) -> bool:
+    """Returns True if path is shared test surface, fixtures, helpers, build files, lockfiles, config, or generated inputs."""
+    if not path:
+        return False
+    if is_shared_test_config_or_fixture(path):
+        return True
+    if is_build_or_test_config(path):
+        return True
+    if is_lockfile(path):
+        return True
+
+    p = Path(path)
+    name = p.name.lower()
+    parts = [part.lower() for part in p.parts]
+
+    # Shared fixtures and helpers
+    if any(part in ("fixtures", "fixture", "test_fixtures", "__fixtures__", "helpers", "test_helpers", "test_utils", "support") for part in parts):
+        return True
+    if "fixture" in name or "test_helper" in name or "test_util" in name or "test_support" in name:
+        return True
+
+    # Build files & lockfiles
+    build_files = {
+        "pom.xml", "cargo.toml", "cmakelists.txt", "makefile", "package.json",
+        "setup.py", "setup.cfg", "pyproject.toml", "mix.exs", "gemfile",
+        "rakefile", "chart.yaml", "ansible.cfg",
+    }
+    if name in build_files or name.startswith("build.gradle") or name.endswith(".csproj") or name.endswith(".fsproj") or name.endswith(".sln"):
+        return True
+    if name.endswith(".lock") or name.endswith(".lockb") or name.endswith("-lock.json") or name == "pnpm-lock.yaml":
+        return True
+
+    # Test config
+    test_configs = {
+        "pytest.ini", "tox.ini", "jest.config.js", "jest.config.ts", "jest.config.json",
+        "jest.config.mjs", "jest.config.cjs", ".mocharc.json", ".mocharc.yaml",
+        ".mocharc.yml", ".mocharc.js", ".mocharc.cjs", "vitest.config.ts",
+        "vitest.config.js", "vitest.config.mjs", "phpunit.xml", "phpunit.xml.dist",
+        "deno.json", "deno.jsonc", "bunfig.toml", "node_test.config.js",
+    }
+    if name in test_configs or name.startswith("tsconfig") or name.startswith(".jest"):
+        return True
+
+    # Generated code inputs
+    if p.suffix.lower() in (".proto", ".thrift", ".graphql", ".gql", ".sql"):
+        return True
+    if name.startswith("schema") and p.suffix.lower() in (".json", ".yaml", ".yml"):
+        return True
+
+    # Root config
+    if len(parts) == 1:
+        if name.startswith(".") or name in ("dockerfile", "docker-compose.yml", "docker-compose.yaml"):
+            return True
+
+    return False
+
+
+
 class PathCollisionError(RuntimeError):
     """Raised when an engine command modifies or deletes a worker-staged file."""
     pass
@@ -1748,27 +1806,57 @@ class Workspace:
                 path, sep, node = raw.partition("::") if res.ecosystem == "pytest" else (raw, "", "")
                 if not path or (sep and not node) or (res.ecosystem != "pytest" and "::" in raw):
                     raise ValueError(f"Invalid test target: {raw!r}")
-                candidate = self.resolve_in_worktree(path)
-                if not candidate.exists():
-                    raise ValueError(f"Test target does not exist: {raw!r}")
                 # Keep each target a worktree-relative argv item, never a runner option.
-                relative = candidate.relative_to(wt).as_posix()
-                if relative == ".":
-                    raise ValueError("A test target must narrow the suite")
-                if relative.startswith("-"):
+                if raw.startswith("../") or raw.startswith("..\\") or raw.startswith("/") or (len(raw) > 2 and raw[1] == ":"):
+                    raise ValueError(f"Invalid test target: {raw!r}")
+                if raw.startswith("-"):
                     raise ValueError(f"Test target cannot start with '-': {raw!r}")
-                if res.ecosystem in ("npm", "yarn", "pnpm") and not re.fullmatch(r"[A-Za-z0-9_./@-]+", relative):
+                if res.ecosystem in ("npm", "yarn", "pnpm") and not re.fullmatch(r"[A-Za-z0-9_./@-]+", raw):
                     raise ValueError(f"Package test target contains unsupported characters: {raw!r}")
-                validated.append(relative + (sep + node if sep else ""))
 
-            if res.ecosystem == "pytest":
-                res = ResolvedTestCommand(res.ecosystem, [*res.command, *validated], res.source) if res.command else res
-            elif res.ecosystem in ("npm", "yarn", "pnpm") and res.command:
-                if res.ecosystem == "npm" and ((wt / "bun.lock").exists() or (wt / "bun.lockb").exists()):
-                    res = ResolvedTestCommand("bun", ["bun", "run", "test", *validated], res.source)
+                candidate = self.resolve_in_worktree(path)
+                if candidate.exists():
+                    relative = candidate.relative_to(wt).as_posix()
+                    if relative == ".":
+                        raise ValueError("A test target must narrow the suite")
+                    if self._is_junction_or_symlink(candidate):
+                        candidate.resolve().relative_to(Path(self.worktree_dir).resolve())
+                    validated.append(relative + (sep + node if sep else ""))
                 else:
-                    separator = ["--"] if res.ecosystem == "npm" else []
-                    res = ResolvedTestCommand(res.ecosystem, [*res.command, *separator, *validated], res.source)
+                    non_file_runners = ("dotnet-test", "cmake-ctest", "maven-surefire", "gradle-test", "cargo-test", "phpunit", "swiftpm-test")
+                    is_known_non_file_runner = res.runner_profile_id in non_file_runners or res.ecosystem in ("dotnet", "ctest", "maven", "gradle", "cargo", "phpunit", "swift")
+                    has_file_ext = any(raw.lower().endswith(ext) for ext in (".py", ".js", ".ts", ".jsx", ".tsx", ".exs", ".ex", ".go", ".rs", ".java", ".kt", ".cpp", ".c", ".h", ".cs", ".php", ".rb"))
+                    if is_known_non_file_runner and not has_file_ext:
+                        validated.append(raw)
+                    else:
+                        raise ValueError(f"Test target does not exist: {raw!r}")
+
+            from jev.runner_registry import load_registry, build_targeted_command
+            reg = load_registry()
+            profile = reg.get_profile(res.runner_profile_id or res.ecosystem) if res else None
+            if profile is None and res and res.ecosystem == "pytest":
+                profile = reg.get_profile("pytest")
+
+            targeted_cmd, rule, confidence = build_targeted_command(
+                profile=profile,
+                base_command=res.command or [],
+                targets=validated,
+                worktree_dir=wt,
+            )
+
+            if targeted_cmd is None and res.ecosystem == "pytest" and res.command:
+                targeted_cmd = [*res.command, *validated]
+                rule = "exact_file"
+                confidence = TargetConfidence.EXACT
+
+            if targeted_cmd is not None and rule != "unsupported_target":
+                res = ResolvedTestCommand(
+                    ecosystem=res.ecosystem,
+                    command=targeted_cmd,
+                    source=res.source,
+                    runner_profile_id=res.runner_profile_id or (profile.profile_id if profile else None),
+                    registry_version=res.registry_version,
+                )
             else:
                 return self._record_test_run(
                     res.ecosystem, None, None, "", "Targeted tests unsupported for this ecosystem", TestOutcome.NO_TESTS_COLLECTED
@@ -1799,7 +1887,11 @@ class Workspace:
             except Exception as e:
                 return self._record_test_run(ecosystem or "trusted_config", cmd, -1, "", str(e), TestOutcome.FAILED, executed_command=cmd)
 
-        if ecosystem in ("yarn", "pnpm", "npm", "bun", "go", "cargo", "maven", "gradle"):
+        if ecosystem in (
+            "yarn", "pnpm", "npm", "bun", "go", "cargo", "maven", "gradle",
+            "deno", "mix", "ctest", "dotnet", "phpunit", "swift",
+            "node", "vitest", "jest", "mocha",
+        ):
             resolved = shutil.which(cmd[0])
             if not resolved:
                 return self._record_test_run(
@@ -2109,13 +2201,135 @@ class Workspace:
                 target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
             )
 
+        # Staged paths and changes classification
+        staged_paths = list(self.worker_staged_paths)
+        diff_str = ""
+        if not staged_paths:
+            diff_str = self.get_staged_diff()
+            staged_paths = list(self._extract_files_from_diff(diff_str))
+        if not staged_paths:
+            base_ref_cand = base_commit or self.base_commit
+            if base_ref_cand:
+                diff_res = self._run_git(["diff", "--name-only", str(base_ref_cand)])
+                if diff_res.returncode == 0 and diff_res.stdout.strip():
+                    staged_paths = [p.strip() for p in diff_res.stdout.splitlines() if p.strip()]
+            if not staged_paths:
+                status_res = self._run_git(["status", "--porcelain"])
+                if status_res.returncode == 0 and status_res.stdout.strip():
+                    for line in status_res.stdout.splitlines():
+                        if len(line) > 3:
+                            staged_paths.append(line[3:].strip())
+
+        verifier_mod = any(
+            is_build_or_test_config(p, self._get_base_content(p, base_commit), self._get_candidate_content(p))
+            for p in staged_paths
+        )
+        test_surface_changed = any(is_shared_test_config_or_fixture(p) for p in staged_paths)
+        lockfile_changed = any(is_lockfile(p) for p in staged_paths)
+        lockfile_only = bool(staged_paths) and all(is_lockfile(p) for p in staged_paths)
+        has_shared_surface = any(is_shared_surface_path(p) for p in staged_paths)
+
+        # Target selection, hierarchy, widening, missing path check, and fallback
+        from jev.runner_registry import load_registry, build_targeted_command
+        reg = load_registry()
+        profile = reg.get_profile(resolved_cmd.runner_profile_id or resolved_cmd.ecosystem) if resolved_cmd else None
+        if profile is None and resolved_cmd and resolved_cmd.ecosystem == "pytest":
+            profile = reg.get_profile("pytest")
+
+        cfg = load_repo_config(self.worktree_dir)
+        repo_declared_target = getattr(cfg, "target_rule", None) if cfg else None
+
+        effective_targets: Optional[List[str]] = None
+        target_rule: str = "declared_full_suite"
+        target_confidence: TargetConfidence = TargetConfidence.DECLARED_FULL_SUITE
+        fallback_scope: Optional[Dict[str, Any]] = None
+        widened_due_to_shared: bool = False
+
+        if test_targets:
+            raw_targets = [str(t) for t in test_targets]
+            # Missing target path detected before execution
+            for t in raw_targets:
+                file_part = t.partition("::")[0]
+                if "." in Path(file_part).name or "/" in file_part or "\\" in file_part:
+                    target_p = Path(self.worktree_dir / file_part)
+                    if not target_p.exists():
+                        return MechanicalEvidence(
+                            mech_status=MechStatus.UNMEASURED,
+                            reason=MechReason.NO_TEST_EXECUTION_SIGNAL,
+                            evidence_level=EvidenceLevel.NONE,
+                            comparison=Comparison.NOT_COMPARED,
+                            comparison_valid=False,
+                            approval_valid=False,
+                            mechanically_unverified=True,
+                            command_identity={"cmd": None, "source": resolved_cmd.source if resolved_cmd else "unknown", "profile_id": resolved_cmd.runner_profile_id if resolved_cmd else None},
+                            target_scope={"kind": "targets", "paths": raw_targets, "new_target": False},
+                            target_rule="missing_target_path",
+                            target_confidence=TargetConfidence.EXACT,
+                        )
+                    if self._is_junction_or_symlink(target_p):
+                        try:
+                            target_p.resolve().relative_to(Path(self.worktree_dir).resolve())
+                        except Exception:
+                            return MechanicalEvidence(
+                                mech_status=MechStatus.UNMEASURED,
+                                reason=MechReason.NO_TEST_EXECUTION_SIGNAL,
+                                evidence_level=EvidenceLevel.NONE,
+                                comparison=Comparison.NOT_COMPARED,
+                                comparison_valid=False,
+                                approval_valid=False,
+                                mechanically_unverified=True,
+                                command_identity={"cmd": None, "source": resolved_cmd.source if resolved_cmd else "unknown", "profile_id": resolved_cmd.runner_profile_id if resolved_cmd else None},
+                                target_scope={"kind": "targets", "paths": raw_targets, "new_target": False},
+                                target_rule="missing_target_path",
+                                target_confidence=TargetConfidence.EXACT,
+                            )
+
+            if has_shared_surface:
+                # Widen for shared fixtures, helpers, build files, lockfiles, test config, generated-code inputs and root config
+                effective_targets = None
+                target_rule = "widened_shared_surface"
+                target_confidence = TargetConfidence.HEURISTIC
+                fallback_scope = {"kind": "full_suite"}
+                widened_due_to_shared = True
+            else:
+
+                # Hierarchy & Capability Check
+                targeted_argv, rule, confidence = build_targeted_command(
+                    profile=profile,
+                    base_command=resolved_cmd.command or [] if resolved_cmd else [],
+                    targets=raw_targets,
+                    worktree_dir=self.worktree_dir,
+                )
+
+                if targeted_argv is not None and rule != "unsupported_target":
+                    effective_targets = raw_targets
+                    target_rule = rule
+                    if repo_declared_target:
+                        target_confidence = TargetConfidence.REPOSITORY_DECLARED
+                    else:
+                        target_confidence = confidence
+                elif resolved_cmd and resolved_cmd.ecosystem == "pytest":
+                    effective_targets = raw_targets
+                    target_rule = "exact_file"
+                    target_confidence = TargetConfidence.EXACT
+                else:
+                    # Unsupported file target falls back to full suite
+                    effective_targets = None
+                    target_rule = "unsupported_target_fallback"
+                    target_confidence = TargetConfidence.HEURISTIC
+                    fallback_scope = {"kind": "full_suite"}
+        else:
+            effective_targets = None
+            target_rule = "declared_full_suite"
+            target_confidence = TargetConfidence.DECLARED_FULL_SUITE
+
         # Phase 4: Preflight check before candidate or base execution
         from jev.preflight import run_preflight, PreflightStatus
         preflight_res = run_preflight(
             repo_dir=self.repo_dir,
             worktree_dir=self.worktree_dir,
             resolved_cmd=resolved_cmd,
-            test_targets=test_targets,
+            test_targets=effective_targets,
             test_timeout=self.test_timeout,
         )
         self.last_preflight = preflight_res
@@ -2144,40 +2358,22 @@ class Workspace:
                 }
             return preflight_res.evidence
 
-        # 2a. Pre-run target check
+        # Check targets at base
+        is_new_target = False
         if test_targets:
-            for t in test_targets:
-                raw_t = str(t)
-                file_part, sep, node_part = raw_t.partition("::")
-                target_path = Path(self.worktree_dir / file_part)
-                try:
-                    resolved_target = target_path.resolve()
-                    resolved_wt = Path(self.worktree_dir).resolve()
-                    resolved_target.relative_to(resolved_wt)
-                except Exception:
-                    return MechanicalEvidence(
-                        mech_status=MechStatus.UNMEASURED,
-                        reason=MechReason.NO_TEST_EXECUTION_SIGNAL,
-                        mechanically_unverified=True,
-                        target_scope={"kind": "targets", "paths": [str(x) for x in test_targets], "new_target": False},
-                    )
-                if not target_path.exists():
-                    return MechanicalEvidence(
-                        mech_status=MechStatus.UNMEASURED,
-                        reason=MechReason.NO_TEST_EXECUTION_SIGNAL,
-                        mechanically_unverified=True,
-                        target_scope={"kind": "targets", "paths": [str(x) for x in test_targets], "new_target": False},
-                    )
-                if self._is_junction_or_symlink(target_path):
-                    try:
-                        resolved_target.relative_to(resolved_wt)
-                    except Exception:
-                        return MechanicalEvidence(
-                            mech_status=MechStatus.UNMEASURED,
-                            reason=MechReason.NO_TEST_EXECUTION_SIGNAL,
-                            mechanically_unverified=True,
-                            target_scope={"kind": "targets", "paths": [str(x) for x in test_targets], "new_target": False},
-                        )
+            base_commit_ref = str(base_commit).strip() if base_commit else (self.base_commit or self._get_head_commit() or "HEAD")
+            if base_commit_ref:
+                present_at_base, total_targets = self._check_targets_at_commit(base_commit_ref, test_targets)
+                is_new_target = (present_at_base == 0)
+
+        target_kind = "widened" if widened_due_to_shared else ("fallback" if fallback_scope else ("targets" if test_targets else "full_suite"))
+        target_scope_dict = {
+            "kind": target_kind,
+            "paths": [str(x) for x in (test_targets or [])],
+            "selection_rule": target_rule,
+            "fallback_scope": fallback_scope,
+            "new_target": is_new_target,
+        }
 
         # 2b. Candidate run 1
         subgoal_id = getattr(subgoal, "id", "default")
@@ -2188,14 +2384,14 @@ class Workspace:
                 reason=MechReason.TOOLING_ERROR,
                 mechanically_unverified=True,
                 command_identity={"cmd": getattr(self.last_test_run, "get", lambda k: None)("argv") if self.last_test_run else None},
-                target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+                target_scope=target_scope_dict,
+                target_rule=target_rule,
+                target_confidence=target_confidence,
             )
         self._candidate_run_counts[attempt_key] = self._candidate_run_counts.get(attempt_key, 0) + 1
-        cand_outcome = self.run_tests(targets=test_targets)
+        cand_outcome = self.run_tests(targets=effective_targets)
         last_run = self.last_test_run or {}
 
-        from jev.runner_registry import load_registry
-        reg = load_registry()
         registry_version = last_run.get("registry_version") or reg.registry_version
         runner_profile_id = last_run.get("runner_profile_id")
         script_text = last_run.get("script_text")
@@ -2211,6 +2407,32 @@ class Workspace:
         if last_run.get("ambiguity_resolved_by"):
             cmd_identity["ambiguity_resolved_by"] = last_run["ambiguity_resolved_by"]
 
+        # Heuristic target failure widens once to narrowest proven scope and never strikes alone
+        if cand_outcome == TestOutcome.FAILED and target_confidence == TargetConfidence.HEURISTIC and effective_targets is not None:
+            widened_outcome = self.run_tests(targets=None)
+            widened_exit = (self.last_test_run or {}).get("exit_code")
+            if widened_outcome == TestOutcome.PASSED or widened_exit == 0:
+                # The original failure is a target-selection failure, non-punitive!
+                return MechanicalEvidence(
+                    mech_status=MechStatus.UNMEASURED,
+                    reason=MechReason.NO_TEST_EXECUTION_SIGNAL,
+                    evidence_level=EvidenceLevel.NONE,
+                    comparison=Comparison.NOT_COMPARED,
+                    comparison_valid=False,
+                    approval_valid=False,
+                    mechanically_unverified=True,
+                    command_identity={**cmd_identity, "cmd": getattr(self.last_test_run, "get", lambda k: None)("argv")},
+                    target_scope={
+                        "kind": "widened_pass",
+                        "paths": [str(x) for x in test_targets],
+                        "fallback_scope": {"kind": "full_suite"},
+                        "selection_rule": "target_selection_failure",
+                        "new_target": False,
+                    },
+                    target_rule="target_selection_failure",
+                    target_confidence=TargetConfidence.HEURISTIC,
+                )
+
         resolved_cmd = getattr(self, "_current_resolved_test_command", None)
         if resolved_cmd and resolved_cmd.source == "untrusted_repo_config":
             return MechanicalEvidence(
@@ -2222,34 +2444,10 @@ class Workspace:
                 approval_valid=False,
                 mechanically_unverified=True,
                 command_identity={**cmd_identity, "cmd": None},
-                target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+                target_scope=target_scope_dict,
+                target_rule=target_rule,
+                target_confidence=target_confidence,
             )
-
-        staged_paths = list(self.worker_staged_paths)
-        diff_str = ""
-        if not staged_paths:
-            diff_str = self.get_staged_diff()
-            staged_paths = list(self._extract_files_from_diff(diff_str))
-        if not staged_paths:
-            base_ref_cand = base_commit or self.base_commit
-            if base_ref_cand:
-                diff_res = self._run_git(["diff", "--name-only", str(base_ref_cand)])
-                if diff_res.returncode == 0 and diff_res.stdout.strip():
-                    staged_paths = [p.strip() for p in diff_res.stdout.splitlines() if p.strip()]
-            if not staged_paths:
-                status_res = self._run_git(["status", "--porcelain"])
-                if status_res.returncode == 0 and status_res.stdout.strip():
-                    for line in status_res.stdout.splitlines():
-                        if len(line) > 3:
-                            staged_paths.append(line[3:].strip())
-
-        verifier_mod = any(
-            is_build_or_test_config(p, self._get_base_content(p, base_commit), self._get_candidate_content(p))
-            for p in staged_paths
-        )
-        test_surface_changed = any(is_shared_test_config_or_fixture(p) for p in staged_paths)
-        lockfile_changed = any(is_lockfile(p) for p in staged_paths)
-        lockfile_only = bool(staged_paths) and all(is_lockfile(p) for p in staged_paths)
 
         if last_run.get("launch_failed") or cand_outcome == TestOutcome.ENV_NOT_READY:
             return MechanicalEvidence(
@@ -2257,7 +2455,9 @@ class Workspace:
                 reason=MechReason.MISSING_TOOL,
                 mechanically_unverified=True,
                 command_identity={**cmd_identity, "cmd": last_run.get("argv")},
-                target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+                target_scope=target_scope_dict,
+                target_rule=target_rule,
+                target_confidence=target_confidence,
             )
 
         if last_run.get("timed_out"):
@@ -2266,7 +2466,9 @@ class Workspace:
                 reason=MechReason.TIMEOUT,
                 mechanically_unverified=True,
                 command_identity={**cmd_identity, "cmd": last_run.get("argv")},
-                target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+                target_scope=target_scope_dict,
+                target_rule=target_rule,
+                target_confidence=target_confidence,
             )
 
         if cand_outcome == TestOutcome.NO_TESTS_COLLECTED:
@@ -2275,6 +2477,19 @@ class Workspace:
         # 2c. exit 0 -> PASS (Rule 3: CONFIG EDITS NEVER DISCARD A PASS)
         cand_exit = last_run.get("exit_code")
         if cand_exit == 0 or cand_outcome == TestOutcome.PASSED:
+            # Rule: Heuristic pass stays exit_only
+            if target_confidence == TargetConfidence.HEURISTIC:
+                ev_level = EvidenceLevel.EXIT_ONLY
+            elif last_run.get("parsed_counts"):
+                ev_level = EvidenceLevel.COUNTED
+            else:
+                ev_level = EvidenceLevel.EXIT_ONLY
+
+            is_exit_only = (ev_level == EvidenceLevel.EXIT_ONLY)
+            # Rule: A targeted run is never labeled full-suite
+            # MechanicalEvidence invariant: exit_only or none forces full_suite_verified=False
+            full_suite_clean_flag = False if (is_exit_only or (test_targets and not widened_due_to_shared)) else True
+
             if verifier_mod or test_surface_changed or lockfile_changed:
                 return MechanicalEvidence(
                     mech_status=MechStatus.PASS,
@@ -2291,14 +2506,12 @@ class Workspace:
                     comparison=Comparison.NOT_COMPARED,
                     full_suite_verified=False,
                     command_identity={**cmd_identity, "cmd": last_run.get("argv")},
-                    target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+                    target_scope=target_scope_dict,
+                    target_rule=target_rule,
+                    target_confidence=target_confidence,
                     worker_staged_paths=staged_paths,
                 )
             else:
-                ev_level = EvidenceLevel.EXIT_ONLY
-                if last_run.get("parsed_counts"):
-                    ev_level = EvidenceLevel.COUNTED
-                is_exit_only = (ev_level == EvidenceLevel.EXIT_ONLY)
                 return MechanicalEvidence(
                     mech_status=MechStatus.PASS,
                     evidence_level=ev_level,
@@ -2311,8 +2524,11 @@ class Workspace:
                     approval_valid=True,
                     base_status=None,
                     comparison=Comparison.NOT_COMPARED,
+                    full_suite_verified=full_suite_clean_flag,
                     command_identity={**cmd_identity, "cmd": last_run.get("argv")},
-                    target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+                    target_scope=target_scope_dict,
+                    target_rule=target_rule,
+                    target_confidence=target_confidence,
                     worker_staged_paths=staged_paths,
                 )
 
@@ -2335,7 +2551,9 @@ class Workspace:
                 mechanically_unverified=True,
                 unverified_kind="verifier_modified",
                 command_identity={**cmd_identity, "cmd": last_run.get("argv")},
-                target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+                target_scope=target_scope_dict,
+                target_rule=target_rule,
+                target_confidence=target_confidence,
                 worker_staged_paths=staged_paths,
             )
 
@@ -2353,7 +2571,9 @@ class Workspace:
                 mechanically_unverified=True,
                 unverified_kind="test_surface_changed",
                 command_identity={**cmd_identity, "cmd": last_run.get("argv")},
-                target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+                target_scope=target_scope_dict,
+                target_rule=target_rule,
+                target_confidence=target_confidence,
                 worker_staged_paths=staged_paths,
             )
 
@@ -2371,7 +2591,9 @@ class Workspace:
                 mechanically_unverified=True,
                 unverified_kind="lockfile_changed",
                 command_identity={**cmd_identity, "cmd": last_run.get("argv")},
-                target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+                target_scope=target_scope_dict,
+                target_rule=target_rule,
+                target_confidence=target_confidence,
                 worker_staged_paths=staged_paths,
             )
 
@@ -2384,7 +2606,9 @@ class Workspace:
                 reason=MechReason.TOOLING_ERROR,
                 mechanically_unverified=True,
                 command_identity={**cmd_identity, "cmd": None},
-                target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+                target_scope=target_scope_dict,
+                target_rule=target_rule,
+                target_confidence=target_confidence,
             )
         if self._candidate_run_counts.get(attempt_key, 0) >= 2:
             return MechanicalEvidence(
@@ -2392,10 +2616,12 @@ class Workspace:
                 reason=MechReason.TOOLING_ERROR,
                 mechanically_unverified=True,
                 command_identity={**cmd_identity, "cmd": last_run.get("argv")},
-                target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+                target_scope=target_scope_dict,
+                target_rule=target_rule,
+                target_confidence=target_confidence,
             )
         self._candidate_run_counts[attempt_key] = self._candidate_run_counts.get(attempt_key, 0) + 1
-        rerun_outcome = self.run_tests(targets=test_targets)
+        rerun_outcome = self.run_tests(targets=effective_targets)
         rerun_details = self.last_test_run or {}
         rerun_details["rerun_context"] = "same_worktree_cleaned"
 
@@ -2405,7 +2631,9 @@ class Workspace:
                 reason=MechReason.TIMEOUT,
                 mechanically_unverified=True,
                 command_identity={**cmd_identity, "cmd": last_run.get("argv")},
-                target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+                target_scope=target_scope_dict,
+                target_rule=target_rule,
+                target_confidence=target_confidence,
             )
         if rerun_details.get("launch_failed"):
             return MechanicalEvidence(
@@ -2413,7 +2641,9 @@ class Workspace:
                 reason=MechReason.MISSING_TOOL,
                 mechanically_unverified=True,
                 command_identity={**cmd_identity, "cmd": last_run.get("argv")},
-                target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+                target_scope=target_scope_dict,
+                target_rule=target_rule,
+                target_confidence=target_confidence,
             )
 
         rerun_exit = rerun_details.get("exit_code")
@@ -2423,7 +2653,9 @@ class Workspace:
                 reason=MechReason.FLAKY,
                 mechanically_unverified=True,
                 command_identity={**cmd_identity, "cmd": last_run.get("argv")},
-                target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+                target_scope=target_scope_dict,
+                target_rule=target_rule,
+                target_confidence=target_confidence,
             )
 
         fp1 = compute_failure_fingerprint(
@@ -2440,7 +2672,9 @@ class Workspace:
                 reason=MechReason.FLAKY,
                 mechanically_unverified=True,
                 command_identity={**cmd_identity, "cmd": last_run.get("argv")},
-                target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+                target_scope=target_scope_dict,
+                target_rule=target_rule,
+                target_confidence=target_confidence,
             )
 
         # 2e. Base run
@@ -2457,16 +2691,18 @@ class Workspace:
                 output_non_empty = bool(out_content.strip())
 
                 note = "all targets absent at base (not_applicable)" if present_at_base == 0 else f"some targets absent at base ({present_at_base}/{total_targets} present) (not_applicable)"
+                rule_for_evidence = "provisional" if present_at_base == 0 else target_rule
                 if compile_passed and launcher_healthy and output_non_empty:
                     return MechanicalEvidence(
                         mech_status=MechStatus.FAIL,
                         evidence_level=EvidenceLevel.EXIT_ONLY,
                         base_status=base_status,
                         comparison=Comparison.CANDIDATE_ONLY,
-                        target_rule="provisional",
+                        target_rule=rule_for_evidence,
+                        target_confidence=target_confidence,
                         attribution_note=note,
                         command_identity={**cmd_identity, "cmd": last_run.get("argv")},
-                        target_scope={"kind": "targets", "paths": [str(x) for x in test_targets], "new_target": (present_at_base == 0)},
+                        target_scope=target_scope_dict,
                     )
                 else:
                     return MechanicalEvidence(
@@ -2475,10 +2711,11 @@ class Workspace:
                         base_status=base_status,
                         comparison=Comparison.INCONCLUSIVE,
                         mechanically_unverified=True,
-                        target_rule="provisional",
+                        target_rule=target_rule,
+                        target_confidence=target_confidence,
                         attribution_note=note,
                         command_identity={**cmd_identity, "cmd": last_run.get("argv")},
-                        target_scope={"kind": "targets", "paths": [str(x) for x in test_targets], "new_target": (present_at_base == 0)},
+                        target_scope=target_scope_dict,
                     )
 
         test_cmd = last_run.get("argv") or []
@@ -2509,7 +2746,9 @@ class Workspace:
                     comparison=Comparison.INCONCLUSIVE,
                     mechanically_unverified=True,
                     command_identity={**cmd_identity, "cmd": test_cmd},
-                    target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+                    target_scope=target_scope_dict,
+                    target_rule=target_rule,
+                    target_confidence=target_confidence,
                 )
 
             base_res_data = self._run_detached_base_tests(
@@ -2533,7 +2772,9 @@ class Workspace:
                 comparison=Comparison.INCONCLUSIVE,
                 mechanically_unverified=True,
                 command_identity={**cmd_identity, "cmd": test_cmd},
-                target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+                target_scope=target_scope_dict,
+                target_rule=target_rule,
+                target_confidence=target_confidence,
             )
 
         if base_status == BaseStatus.PASS:
@@ -2543,7 +2784,9 @@ class Workspace:
                 base_status=BaseStatus.PASS,
                 comparison=Comparison.CANDIDATE_ONLY,
                 command_identity={**cmd_identity, "cmd": test_cmd},
-                target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+                target_scope=target_scope_dict,
+                target_rule=target_rule,
+                target_confidence=target_confidence,
             )
 
         if base_status == BaseStatus.FAIL:
@@ -2559,7 +2802,9 @@ class Workspace:
                         comparison=Comparison.CANDIDATE_ONLY,
                         evidence_level=EvidenceLevel.NAMED,
                         command_identity={**cmd_identity, "cmd": test_cmd},
-                        target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+                        target_scope=target_scope_dict,
+                        target_rule=target_rule,
+                        target_confidence=target_confidence,
                     )
                 else:
                     return MechanicalEvidence(
@@ -2569,7 +2814,9 @@ class Workspace:
                         evidence_level=EvidenceLevel.NAMED,
                         mechanically_unverified=False,
                         command_identity={**cmd_identity, "cmd": test_cmd},
-                        target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+                        target_scope=target_scope_dict,
+                        target_rule=target_rule,
+                        target_confidence=target_confidence,
                     )
             else:
                 return MechanicalEvidence(
@@ -2579,7 +2826,9 @@ class Workspace:
                     comparison=Comparison.INCONCLUSIVE,
                     mechanically_unverified=True,
                     command_identity={**cmd_identity, "cmd": test_cmd},
-                    target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+                    target_scope=target_scope_dict,
+                    target_rule=target_rule,
+                    target_confidence=target_confidence,
                 )
 
         return MechanicalEvidence(
@@ -2589,7 +2838,9 @@ class Workspace:
             comparison=Comparison.INCONCLUSIVE,
             mechanically_unverified=True,
             command_identity={**cmd_identity, "cmd": test_cmd},
-            target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+            target_scope=target_scope_dict,
+            target_rule=target_rule,
+            target_confidence=target_confidence,
         )
 
 
