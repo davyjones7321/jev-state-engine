@@ -99,3 +99,67 @@
 ---
 
 ## 7. Verification Script Output
+
+```text
+=== Verification Report for base: origin/phase5-target-selection ===
+Branch: phase6-zero-test-evidence
+Commit: 18e3f618c594bdeb0946d9c28f947a8771522ed2
+
+--- Diff stat vs origin/phase5-target-selection ---
+docs/phases/phase6.md            | 101 +++++++
+ src/jev/runner_registry.py       | 306 ++++++++++++++++++++
+ src/jev/workspace.py             | 153 ++++++++--
+ tests/test_zero_test_evidence.py | 595 +++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 1139 insertions(+), 16 deletions(-)
+
+--- Test Changes ---
+Added tests:
+  + test_markers_and_failure_identity_patterns_are_separate_fields
+  + test_zero_test_exit_1_with_matching_marker_is_never_failed_by_diff_bun
+  + test_zero_test_exit_1_filter_matches_nothing_bun
+  + test_zero_test_exit_5_pytest_marker
+  + test_zero_test_exit_1_jest_and_vitest
+  + test_genuine_named_failure_stays_available_as_diagnostic_evidence
+  + test_failure_identity_patterns_never_prove_a_test_ran
+  + test_all_skipped_never_becomes_counted_named_pass_pytest
+  + test_all_skipped_never_becomes_counted_named_pass_bun
+  + test_all_skipped_never_becomes_counted_named_pass_cargo
+  + test_all_skipped_never_becomes_counted_named_pass_node
+  + test_scrambled_output_only_degrades_property
+  + test_scrambled_failing_output_never_upgrades_to_pass
+  + test_empty_output_exit_0_weak_policy
+  + test_empty_output_exit_0_unmeasured_policy
+  + test_markers_are_strictly_downgrade_only
+  + test_phase2b_captured_fixtures_cases
+
+--- Collected Test Counts ---
+  tests/test_zero_test_evidence.py: 20 tests collected in 1.02s
+
+--- Grep Checks ---
+Pattern 'git add -A' in src/jev/:
+  None found (clean)
+Pattern 'run_baseline_tests(' in src/jev/engine.py:
+  None found in engine.py (clean)
+Occurrences of 'FULL_SUITE_PASSED' in workspace.py and engine.py:
+  src/jev/engine.py:4779:                verify_classification = "FULL_SUITE_PASSED"
+  src/jev/workspace.py:2054:                    "outcome": TestOutcome.FULL_SUITE_PASSED.value,
+  src/jev/workspace.py:4410:                        test_classification = TestOutcome.FULL_SUITE_PASSED.value
+Occurrences of 'worktree_dir == self.repo_dir' in workspace.py (guard check):
+  src/jev/workspace.py:1333:        if self.worktree_dir == self.repo_dir:
+  src/jev/workspace.py:1366:        if self.worktree_dir == self.repo_dir:
+  src/jev/workspace.py:1397:        if self.worktree_dir == self.repo_dir:
+
+--- Pytest Offline Suite Summary ---
+SKIPPED [1] tests\test_runner_fixtures.py:361: gradle not found
+SKIPPED [1] tests\test_runner_fixtures.py:361: dotnet not found
+SKIPPED [1] tests\test_runner_fixtures.py:361: ctest not found
+SKIPPED [1] tests\test_runner_fixtures.py:361: ruby not found
+SKIPPED [1] tests\test_runner_fixtures.py:361: php not found
+SKIPPED [1] tests\test_runner_fixtures.py:325: Profile 'swiftpm-test' not supported on win32 (platforms: ['linux', 'darwin'])
+SKIPPED [1] tests\test_runner_fixtures.py:361: mix not found
+SKIPPED [1] tests\test_runner_fixtures.py:325: Profile 'xcode-test' not supported on win32 (platforms: ['darwin'])
+SKIPPED [1] tests\test_runner_fixtures.py:361: terraform not found
+SKIPPED [1] tests\test_runner_fixtures.py:361: ansible-lint not found
+SKIPPED [1] tests\test_runner_fixtures.py:361: helm not found
+942 passed, 18 skipped, 2 deselected, 2 warnings in 967.38s (0:16:07)
+```
