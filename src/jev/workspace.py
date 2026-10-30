@@ -736,6 +736,7 @@ class Workspace:
         self.base_commit: Optional[str] = self._get_head_commit()
         self.last_test_run: Optional[dict] = None
         self.last_compile_run: Optional[dict] = None
+        self.last_preflight: Optional[Any] = None
         self._baseline_test_cache: Dict[str, Dict[str, Any]] = {}
         self._base_test_cache: Dict[Any, Dict[str, Any]] = {}
         self._base_run_counts: Dict[str, int] = {}
@@ -1701,6 +1702,26 @@ class Workspace:
     def resolve_test_command(self) -> ResolvedTestCommand:
         return resolve_test_command(self.worktree_dir)
 
+    def run_preflight(
+        self,
+        subgoal: Optional[Subgoal] = None,
+        resolved_cmd: Optional[ResolvedTestCommand] = None,
+        test_targets: Optional[Sequence[Union[str, Path]]] = None,
+    ) -> Any:
+        """Runs Phase 4 preflight checks against the workspace and resolved command."""
+        from jev.preflight import run_preflight
+        rc = resolved_cmd or getattr(self, "_current_resolved_test_command", None) or self.resolve_test_command()
+        self._current_resolved_test_command = rc
+        res = run_preflight(
+            repo_dir=self.repo_dir,
+            worktree_dir=self.worktree_dir,
+            resolved_cmd=rc,
+            test_targets=test_targets,
+            test_timeout=self.test_timeout,
+        )
+        self.last_preflight = res
+        return res
+
     def run_tests(self, targets: Optional[Sequence[Union[str, Path]]] = None) -> TestOutcome:
         """Run the detected suite, optionally narrowing supported runners to relative test targets.
 
@@ -2087,6 +2108,41 @@ class Workspace:
                 command_identity={"cmd": None, "source": "untrusted_repo_config", "reason": resolved_cmd.reason},
                 target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
             )
+
+        # Phase 4: Preflight check before candidate or base execution
+        from jev.preflight import run_preflight, PreflightStatus
+        preflight_res = run_preflight(
+            repo_dir=self.repo_dir,
+            worktree_dir=self.worktree_dir,
+            resolved_cmd=resolved_cmd,
+            test_targets=test_targets,
+            test_timeout=self.test_timeout,
+        )
+        self.last_preflight = preflight_res
+        if preflight_res.status != PreflightStatus.IN_PROFILE:
+            if preflight_res.reason in (MechReason.MISSING_TOOL, MechReason.ENVIRONMENT_UNAVAILABLE):
+                self.last_test_run = {
+                    "ran": False,
+                    "command": preflight_res.command,
+                    "exit_code": None,
+                    "stdout_tail": "",
+                    "stderr_tail": preflight_res.detail,
+                    "output_tail": preflight_res.detail,
+                    "outcome": TestOutcome.ENV_NOT_READY.value,
+                    "launch_failed": True,
+                }
+            elif preflight_res.reason == MechReason.TOOLING_ERROR:
+                self.last_test_run = {
+                    "ran": False,
+                    "command": preflight_res.command,
+                    "exit_code": None,
+                    "stdout_tail": "",
+                    "stderr_tail": preflight_res.detail,
+                    "output_tail": preflight_res.detail,
+                    "outcome": TestOutcome.FAILED.value,
+                    "launch_failed": False,
+                }
+            return preflight_res.evidence
 
         # 2a. Pre-run target check
         if test_targets:
@@ -3704,6 +3760,7 @@ class Workspace:
     ) -> MechanicalCheckResult:
         self.last_test_run = None
         self.last_compile_run = None
+        self.last_preflight = None
 
         # 1. check_build
         build_res = self.check_build(subgoal.scope)

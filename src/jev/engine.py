@@ -3752,6 +3752,9 @@ def node_gate(
         "checks_run": getattr(mech_result, "checks_run", []),
         "checks": getattr(mech_result, "checks", {}),
     }
+    if workspace is not None and getattr(workspace, "last_preflight", None) is not None:
+        pf = getattr(workspace, "last_preflight")
+        tier0_telemetry["preflight"] = pf.model_dump() if hasattr(pf, "model_dump") else str(pf)
     if not tier0_telemetry["checks"]:
         failed = mech_result.failed_check
         tier0_telemetry["checks"] = {
