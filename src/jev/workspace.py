@@ -916,8 +916,6 @@ class Workspace:
         elif (outcome == TestOutcome.FAILED or (exit_code is not None and exit_code != 0)):
             if parsed_ids is not None and len(parsed_ids) == 0:
                 parsed_ids = None
-            if not parsed_ids and is_zero_test:
-                outcome = TestOutcome.NO_TESTS_COLLECTED
 
         cmd_result = getattr(self, "_last_test_command_result", None)
         self._last_test_command_result = None
@@ -2550,20 +2548,7 @@ class Workspace:
                 )
 
         if cand_outcome == TestOutcome.NO_TESTS_COLLECTED:
-            return MechanicalEvidence(
-                mech_status=MechStatus.UNMEASURED,
-                reason=MechReason.NO_TEST_EXECUTION_SIGNAL,
-                evidence_level=EvidenceLevel.NONE,
-                comparison=Comparison.NOT_COMPARED,
-                comparison_valid=False,
-                approval_valid=True,
-                mechanically_unverified=True,
-                command_identity={**cmd_identity, "cmd": last_run.get("argv")},
-                target_scope=target_scope_dict,
-                target_rule=target_rule,
-                target_confidence=target_confidence,
-                worker_staged_paths=staged_paths,
-            )
+            return None
 
         # 2c. exit 0 -> PASS (Rule 3: CONFIG EDITS NEVER DISCARD A PASS)
         if cand_exit == 0 or cand_outcome == TestOutcome.PASSED:
