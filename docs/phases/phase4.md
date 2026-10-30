@@ -90,3 +90,64 @@
 ---
 
 ## 6. Verification Script Output
+
+```text
+=== Verification Report for base: origin/phase3b-command-proposals ===
+Branch: phase4-preflight-support
+Commit: cf9e5cc582543d7ce3faaeb3aade41722fb13269
+
+--- Diff stat vs origin/phase3b-command-proposals ---
+docs/phases/phase4.md   |  92 +++++++
+ src/jev/engine.py       |   3 +
+ src/jev/preflight.py    | 720 ++++++++++++++++++++++++++++++++++++++++++++++++
+ src/jev/workspace.py    |  57 ++++
+ tests/test_preflight.py | 398 ++++++++++++++++++++++++++
+ 5 files changed, 1270 insertions(+)
+
+--- Test Changes ---
+Added tests:
+  + test_preflight_in_profile_success
+  + test_preflight_missing_tool_outside_profile
+  + test_preflight_xcode_environment_unavailable
+  + test_preflight_ambiguous_profile
+  + test_preflight_watch_mode_outside_profile
+  + test_preflight_interactive_command_outside_profile
+  + test_preflight_declared_external_services
+  + test_preflight_target_representability
+  + test_preflight_invalid_timeout
+  + test_preflight_stops_before_candidate_or_base_run
+  + test_preflight_missing_tool_adds_no_strike_in_engine
+  + test_preflight_watch_mode_adds_no_strike_in_engine
+  + test_preflight_never_substitutes_another_runner
+
+--- Collected Test Counts ---
+  tests/test_preflight.py: 18 tests collected in 6.35s
+
+--- Grep Checks ---
+Pattern 'git add -A' in src/jev/:
+  None found (clean)
+Pattern 'run_baseline_tests(' in src/jev/engine.py:
+  None found in engine.py (clean)
+Occurrences of 'FULL_SUITE_PASSED' in workspace.py and engine.py:
+  src/jev/engine.py:4779:                verify_classification = "FULL_SUITE_PASSED"
+  src/jev/workspace.py:1919:                    "outcome": TestOutcome.FULL_SUITE_PASSED.value,
+  src/jev/workspace.py:4038:                        test_classification = TestOutcome.FULL_SUITE_PASSED.value
+Occurrences of 'worktree_dir == self.repo_dir' in workspace.py (guard check):
+  src/jev/workspace.py:1232:        if self.worktree_dir == self.repo_dir:
+  src/jev/workspace.py:1265:        if self.worktree_dir == self.repo_dir:
+  src/jev/workspace.py:1296:        if self.worktree_dir == self.repo_dir:
+
+--- Pytest Offline Suite Summary ---
+SKIPPED [1] tests\test_runner_fixtures.py:361: gradle not found
+SKIPPED [1] tests\test_runner_fixtures.py:361: dotnet not found
+SKIPPED [1] tests\test_runner_fixtures.py:361: ctest not found
+SKIPPED [1] tests\test_runner_fixtures.py:361: ruby not found
+SKIPPED [1] tests\test_runner_fixtures.py:361: php not found
+SKIPPED [1] tests\test_runner_fixtures.py:325: Profile 'swiftpm-test' not supported on win32 (platforms: ['linux', 'darwin'])
+SKIPPED [1] tests\test_runner_fixtures.py:361: mix not found
+SKIPPED [1] tests\test_runner_fixtures.py:325: Profile 'xcode-test' not supported on win32 (platforms: ['darwin'])
+SKIPPED [1] tests\test_runner_fixtures.py:361: terraform not found
+SKIPPED [1] tests\test_runner_fixtures.py:361: ansible-lint not found
+SKIPPED [1] tests\test_runner_fixtures.py:361: helm not found
+897 passed, 18 skipped, 2 deselected, 2 warnings in 961.15s (0:16:01)
+```
