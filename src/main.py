@@ -160,6 +160,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Perform a one-shot healthcheck against the configured advisory endpoint and exit.",
     )
     parser.add_argument(
+        "--approved-proposals",
+        "--proposals",
+        choices=["on", "off"],
+        default="off",
+        dest="approved_proposals",
+        help="Build command proposals for unknown ecosystems (on, off; defaults to off).",
+    )
+    parser.add_argument(
         "--env-file",
         type=str,
         default=None,
@@ -308,6 +316,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
             if no_cmd:
                 print(f"Evidence: {ev_level} (no tests ran: no test framework configured)")
+                if getattr(args, "approved_proposals", "off") == "on":
+                    from jev.proposals import build_proposal_from_repo, list_proposals
+                    proposals = list_proposals(repo_dir)
+                    prop = proposals[0] if proposals else build_proposal_from_repo(repo_dir)
+                    if prop:
+                        print(f"Proposal: {prop.id} (run 'python scripts/approve.py {prop.id}' to review and approve)")
             else:
                 print(f"Evidence: {ev_level} (no tests ran: subgoals do not expect tests)")
     else:
