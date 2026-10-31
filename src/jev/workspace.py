@@ -3,6 +3,7 @@ import hashlib
 import json
 import logging
 import os
+import posixpath
 import re
 import shutil
 import signal
@@ -86,10 +87,99 @@ def compute_failure_fingerprint(output: str, worktree_dir: Optional[Union[str, P
     return hashlib.sha256(normalized_block.encode("utf-8", errors="replace")).hexdigest()
 
 
+def is_shared_test_surface(
+    path: Union[str, Path],
+    base_content: Optional[str] = None,
+    candidate_content: Optional[str] = None,
+) -> bool:
+    """Returns True if path is shared test surface:
+    test configuration, discovery rules, shared fixtures, shared helpers,
+    package scripts, build/test task definitions, or lockfiles.
+    The targeted test file(s) the worker created or edited are NOT shared surface.
+    """
+    if not path:
+        return False
+    raw = str(path).replace("\\", "/").strip()
+    norm = posixpath.normpath(raw)
+    if norm.startswith("./"):
+        norm = norm[2:]
+    parts = norm.split("/")
+    filename = parts[-1]
+    name_lower = filename.lower()
+    parts_lower = [p.lower() for p in parts]
+
+    # 1. Lockfiles
+    if is_lockfile(path):
+        return True
+
+    # 2. Build or test config, task definitions, package scripts
+    if filename in ("package.json", "pyproject.toml"):
+        if base_content is not None or candidate_content is not None:
+            if is_build_or_test_config(path, base_content, candidate_content):
+                return True
+            else:
+                return False
+    elif is_build_or_test_config(path):
+        return True
+
+    # 3. Shared fixtures or conftest
+    if is_shared_test_config_or_fixture(path):
+        return True
+
+    # 4. Shared helpers, support, or utilities directories
+    if any(p in ("fixtures", "fixture", "test_fixtures", "__fixtures__", "helpers", "test_helpers", "test_utils", "support", "test_support") for p in parts_lower[:-1]):
+        return True
+
+    # 5. Helper files by name that are NOT test files (e.g. helpers.py, test_utils.py, support.ts)
+    if not (name_lower.startswith("test_") or name_lower.endswith("_test.py") or ".test." in name_lower or ".spec." in name_lower):
+        if any(k in name_lower for k in ("fixture", "helper", "test_util", "support")):
+            return True
+
+    return False
+
+
+def is_test_file(path: Union[str, Path]) -> bool:
+    """Returns True if path is an authored/targeted test file (and not shared surface)."""
+    if not path:
+        return False
+    if is_shared_test_surface(path):
+        return False
+    raw = str(path).replace("\\", "/").strip()
+    norm = posixpath.normpath(raw)
+    if norm.startswith("./"):
+        norm = norm[2:]
+    parts = norm.split("/")
+    filename = parts[-1]
+    name_lower = filename.lower()
+    parts_lower = [p.lower() for p in parts]
+
+    if (name_lower.startswith("test_") and name_lower.endswith(".py")) or name_lower.endswith("_test.py"):
+        return True
+    if any(name_lower.endswith(ext) for ext in (
+        ".test.ts", ".test.tsx", ".test.js", ".test.jsx", ".test.mjs", ".test.cjs",
+        ".spec.ts", ".spec.tsx", ".spec.js", ".spec.jsx", ".spec.mjs", ".spec.cjs"
+    )):
+        return True
+    if name_lower.endswith("_test.go"):
+        return True
+    if name_lower.endswith("_test.rs"):
+        return True
+    if (name_lower.endswith("test.java") or name_lower.endswith("tests.java") or name_lower.endswith("test.kt")):
+        return True
+    if any(p in ("tests", "test", "__tests__", "spec", "specs") for p in parts_lower[:-1]):
+        ext = posixpath.splitext(name_lower)[1]
+        if ext in (".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java", ".kt", ".rb", ".php", ".cs"):
+            return True
+
+    return False
+
+
 def is_shared_surface_path(path: Union[str, Path]) -> bool:
     """Returns True if path is shared test surface, fixtures, helpers, build files, lockfiles, config, or generated inputs."""
     if not path:
         return False
+    if is_shared_test_surface(path):
+        return True
     if is_shared_test_config_or_fixture(path):
         return True
     if is_build_or_test_config(path):
@@ -1337,11 +1427,15 @@ class Workspace:
             for line in status_res.stdout.splitlines():
                 if len(line) < 4:
                     continue
+                code = line[:2]
                 raw_path = line[3:].strip()
                 if raw_path.startswith('"') and raw_path.endswith('"'):
                     raw_path = raw_path[1:-1]
                 posix_path = Path(raw_path).as_posix()
                 if posix_path not in self.worker_staged_paths:
+                    # Files already staged in git index are worker-staged, not engine deltas
+                    if code[0] in ("M", "A", "D", "R", "C"):
+                        continue
                     if posix_path not in self.engine_touched_paths:
                         self.engine_touched_paths.append(posix_path)
 
@@ -1365,45 +1459,50 @@ class Workspace:
             return
         if self.worktree_dir == self.repo_dir:
             return
+
         status_res = self._run_git(["status", "--porcelain", "-uall"])
-        if status_res.returncode != 0 or not status_res.stdout:
-            return
+        if status_res.returncode == 0 and status_res.stdout:
+            tracked_to_revert: List[str] = []
+            untracked_to_clean: List[str] = []
 
-        tracked_to_revert: List[str] = []
-        untracked_to_clean: List[str] = []
+            for line in status_res.stdout.splitlines():
+                if len(line) < 4:
+                    continue
+                code = line[:2]
+                raw_path = line[3:].strip()
+                if raw_path.startswith('"') and raw_path.endswith('"'):
+                    raw_path = raw_path[1:-1]
+                posix_path = Path(raw_path).as_posix()
+                if posix_path in self.engine_touched_paths:
+                    if code == "??":
+                        untracked_to_clean.append(posix_path)
+                    else:
+                        tracked_to_revert.append(posix_path)
 
-        for line in status_res.stdout.splitlines():
-            if len(line) < 4:
-                continue
-            code = line[:2]
-            raw_path = line[3:].strip()
-            if raw_path.startswith('"') and raw_path.endswith('"'):
-                raw_path = raw_path[1:-1]
-            posix_path = Path(raw_path).as_posix()
-            if posix_path in self.engine_touched_paths:
-                if code == "??":
-                    untracked_to_clean.append(posix_path)
-                else:
-                    tracked_to_revert.append(posix_path)
+            if tracked_to_revert:
+                self._run_git(["checkout", "--"] + tracked_to_revert)
+            if untracked_to_clean:
+                self._run_git(["clean", "-f", "--"] + untracked_to_clean)
 
-        if tracked_to_revert:
-            self._run_git(["checkout", "--"] + tracked_to_revert)
-        if untracked_to_clean:
-            self._run_git(["clean", "-f", "--"] + untracked_to_clean)
         self.engine_touched_paths.clear()
+
+    def record_engine_touched(self, path: Union[str, Path]) -> None:
+        """Record a path as engine-touched."""
+        posix_p = Path(path).as_posix()
+        if posix_p not in self.engine_touched_paths:
+            self.engine_touched_paths.append(posix_p)
 
     def discard_engine_touched(self) -> None:
         """Compute deltas and discard all engine-touched artifacts."""
-        if self.worktree_dir == self.repo_dir:
-            return
         self._compute_provenance_deltas()
         self._discard_engine_touched()
 
     def commit_subgoal(self, message: str = "Subgoal committed") -> None:
         self._compute_provenance_deltas()
-        if self.collision_paths:
+        colliding = set(self.collision_paths) | (set(self.worker_staged_paths) & set(self.engine_touched_paths))
+        if colliding:
             raise PathCollisionError(
-                f"Collision detected: worker-staged file(s) modified or deleted by engine: {', '.join(self.collision_paths)}"
+                f"Collision detected: worker-staged file(s) modified or deleted by engine: {', '.join(sorted(colliding))}"
             )
         if self.worker_staged_paths:
             self._run_git(["add", "--"] + list(self.worker_staged_paths))
@@ -1412,6 +1511,60 @@ class Workspace:
             if self.strict_provenance:
                 return
             self._run_git(["commit", "-m", message])
+
+    def classify_touched_paths(
+        self,
+        staged_paths: Optional[Sequence[str]] = None,
+        base_commit: Optional[str] = None,
+    ) -> Dict[str, List[str]]:
+        """Classifies touched paths into Phase 7 categories:
+        - pre_existing_code
+        - pre_existing_test_surface
+        - worker_staged_production_code
+        - worker_staged_test_files
+        - worker_staged_shared_test_surface
+        - engine_generated
+        - protected_verifier_command
+        """
+        if staged_paths is None:
+            staged_paths = list(self.worker_staged_paths)
+            if not staged_paths:
+                diff_str = self.get_staged_diff()
+                staged_paths = list(self._extract_files_from_diff(diff_str))
+
+        res: Dict[str, List[str]] = {
+            "pre_existing_code": [],
+            "pre_existing_test_surface": [],
+            "worker_staged_production_code": [],
+            "worker_staged_test_files": [],
+            "worker_staged_shared_test_surface": [],
+            "engine_generated": sorted(list(self.engine_touched_paths)),
+            "protected_verifier_command": [],
+        }
+
+        for raw_p in staged_paths:
+            posix_p = Path(raw_p).as_posix()
+            if is_protected_path(posix_p):
+                res["protected_verifier_command"].append(posix_p)
+            elif is_shared_test_surface(posix_p, self._get_base_content(posix_p, base_commit), self._get_candidate_content(posix_p)):
+                res["worker_staged_shared_test_surface"].append(posix_p)
+            elif is_test_file(posix_p):
+                base_content = self._get_base_content(posix_p, base_commit)
+                if base_content is not None:
+                    res["pre_existing_test_surface"].append(posix_p)
+                else:
+                    res["worker_staged_test_files"].append(posix_p)
+            else:
+                base_content = self._get_base_content(posix_p, base_commit)
+                if base_content is not None:
+                    res["pre_existing_code"].append(posix_p)
+                else:
+                    res["worker_staged_production_code"].append(posix_p)
+
+        for k in res:
+            res[k] = sorted(list(set(res[k])))
+
+        return res
 
     def rollback_subgoal(self) -> None:
         self._run_git(["reset", "--hard", "HEAD"])
@@ -2268,14 +2421,68 @@ class Workspace:
                         if len(line) > 3:
                             staged_paths.append(line[3:].strip())
 
+        # Provenance deltas & collision check
+        self._compute_provenance_deltas()
+        collision_paths = set(self.collision_paths) | (set(staged_paths) & set(self.engine_touched_paths))
+        if collision_paths:
+            return MechanicalEvidence(
+                mech_status=MechStatus.UNMEASURED,
+                reason=MechReason.ENGINE_WORKER_PATH_COLLISION,
+                evidence_level=EvidenceLevel.NONE,
+                comparison=Comparison.NOT_COMPARED,
+                comparison_valid=False,
+                approval_valid=False,
+                mechanically_unverified=True,
+                unverified_kind="collision",
+                command_identity={"cmd": None, "source": resolved_cmd.source if resolved_cmd else "unknown", "profile_id": resolved_cmd.runner_profile_id if resolved_cmd else None},
+                target_scope={"kind": "targets" if test_targets else "full_suite", "paths": [str(x) for x in (test_targets or [])], "new_target": False},
+                target_rule="collision",
+                target_confidence=TargetConfidence.EXACT,
+                worker_staged_paths=staged_paths,
+                engine_touched_paths=list(self.engine_touched_paths),
+            )
+
+        # Path classifications (Phase 7)
+        classified = self.classify_touched_paths(staged_paths=staged_paths, base_commit=base_commit)
+        worker_shared_surface = classified["worker_staged_shared_test_surface"]
+        worker_authored_tests = classified["worker_staged_test_files"]
+        worker_edited_preexisting_tests = classified["pre_existing_test_surface"]
+
+        # verifier_mod: build/test command configuration modified
         verifier_mod = any(
             is_build_or_test_config(p, self._get_base_content(p, base_commit), self._get_candidate_content(p))
             for p in staged_paths
         )
-        test_surface_changed = any(is_shared_test_config_or_fixture(p) for p in staged_paths)
+        # verifier_modified flag: sets True if pre-existing test file edited OR build/test config edited
+        verifier_modified_flag = bool(verifier_mod or worker_edited_preexisting_tests)
+
+        # test_surface_changed: True ONLY when worker changed shared test surface
+        test_surface_changed = bool(worker_shared_surface)
         lockfile_changed = any(is_lockfile(p) for p in staged_paths)
         lockfile_only = bool(staged_paths) and all(is_lockfile(p) for p in staged_paths)
         has_shared_surface = any(is_shared_surface_path(p) for p in staged_paths)
+
+        # Worker-authored tests classification
+        is_worker_authored_only = False
+        if worker_authored_tests and not worker_edited_preexisting_tests:
+            if test_targets:
+                raw_target_paths = [str(t).partition("::")[0] for t in test_targets]
+                if all(any(auth_t in tp or tp in auth_t for auth_t in worker_authored_tests) for tp in raw_target_paths):
+                    is_worker_authored_only = True
+            else:
+                base_has_tests = False
+                base_ref_cand = base_commit or self.base_commit or self._get_head_commit() or "HEAD"
+                if base_ref_cand:
+                    diff_tree = self._run_git(["ls-tree", "-r", "--name-only", str(base_ref_cand)])
+                    if diff_tree.returncode == 0:
+                        for base_f in diff_tree.stdout.splitlines():
+                            if is_test_file(base_f.strip()):
+                                base_has_tests = True
+                                break
+                if not base_has_tests:
+                    is_worker_authored_only = True
+
+        test_authorship_val = "worker_authored_only" if is_worker_authored_only else ("worker_authored" if (worker_authored_tests or worker_edited_preexisting_tests) else None)
 
         # Target selection, hierarchy, widening, missing path check, and fallback
         from jev.runner_registry import load_registry, build_targeted_command
@@ -2579,6 +2786,9 @@ class Workspace:
             elif all_skipped:
                 # Rule: all-skipped never becomes counted/named PASS
                 ev_level = EvidenceLevel.EXIT_ONLY
+            elif is_worker_authored_only:
+                # Rule: Worker-authored tests alone never produce counted or named evidence
+                ev_level = EvidenceLevel.EXIT_ONLY
             elif target_confidence == TargetConfidence.HEURISTIC or (test_targets and not widened_due_to_shared):
                 # Rule: Heuristic pass or targeted run stays exit_only
                 ev_level = EvidenceLevel.EXIT_ONLY
@@ -2588,21 +2798,32 @@ class Workspace:
                 ev_level = EvidenceLevel.EXIT_ONLY
 
             is_exit_only = (ev_level == EvidenceLevel.EXIT_ONLY)
-            # Rule: A targeted run is never labeled full-suite
-            # MechanicalEvidence invariant: exit_only or none forces full_suite_verified=False
-            full_suite_clean_flag = False if (is_exit_only or (test_targets and not widened_due_to_shared)) else True
+            if verifier_modified_flag or test_surface_changed or lockfile_changed or is_worker_authored_only:
+                ev_level = EvidenceLevel.EXIT_ONLY
+                is_exit_only = True
 
-            if verifier_mod or test_surface_changed or lockfile_changed:
+            # Rule: A targeted run or worker-authored-only run is never labeled full-suite
+            # MechanicalEvidence invariant: exit_only or none forces full_suite_verified=False
+            full_suite_clean_flag = False if (is_exit_only or is_worker_authored_only or (test_targets and not widened_due_to_shared)) else True
+
+            unverified_kind_val = "worker_authored_only" if is_worker_authored_only else (
+                "verifier_modified" if (verifier_modified_flag or lockfile_changed) else (
+                    "test_surface_changed" if test_surface_changed else "exit_only"
+                )
+            )
+
+            if verifier_modified_flag or test_surface_changed or lockfile_changed or is_worker_authored_only:
                 return MechanicalEvidence(
                     mech_status=MechStatus.PASS,
                     evidence_level=EvidenceLevel.EXIT_ONLY,
                     mechanically_unverified=True,
-                    unverified_kind="verifier_modified",
-                    attribution_note="verifier_modified",
-                    verifier_modified=True if verifier_mod else False,
+                    unverified_kind=unverified_kind_val,
+                    test_authorship=test_authorship_val,
+                    attribution_note=unverified_kind_val,
+                    verifier_modified=True if verifier_modified_flag else False,
                     test_surface_changed=True if test_surface_changed else False,
                     lockfile_changed=True if lockfile_changed else False,
-                    comparison_valid=False,
+                    comparison_valid=False if (verifier_mod or test_surface_changed or lockfile_changed) else True,
                     approval_valid=True,
                     base_status=None,
                     comparison=Comparison.NOT_COMPARED,
@@ -2619,6 +2840,7 @@ class Workspace:
                     evidence_level=ev_level,
                     mechanically_unverified=True if is_exit_only else False,
                     unverified_kind="exit_only" if is_exit_only else None,
+                    test_authorship=test_authorship_val,
                     verifier_modified=False,
                     test_surface_changed=False,
                     lockfile_changed=False,
@@ -2648,30 +2870,10 @@ class Workspace:
                 comparison_valid=False,
                 approval_valid=True,
                 verifier_modified=True,
-                test_surface_changed=True if test_surface_changed else False,
-                lockfile_changed=True if lockfile_changed else False,
+                test_surface_changed=bool(test_surface_changed),
+                lockfile_changed=bool(lockfile_changed),
                 mechanically_unverified=True,
                 unverified_kind="verifier_modified",
-                command_identity={**cmd_identity, "cmd": last_run.get("argv")},
-                target_scope=target_scope_dict,
-                target_rule=target_rule,
-                target_confidence=target_confidence,
-                worker_staged_paths=staged_paths,
-            )
-
-        if test_surface_changed:
-            return MechanicalEvidence(
-                mech_status=MechStatus.UNMEASURED,
-                reason=MechReason.TEST_SURFACE_CHANGED,
-                evidence_level=EvidenceLevel.NONE,
-                comparison=Comparison.INCONCLUSIVE,
-                comparison_valid=False,
-                approval_valid=True,
-                verifier_modified=False,
-                test_surface_changed=True,
-                lockfile_changed=True if lockfile_changed else False,
-                mechanically_unverified=True,
-                unverified_kind="test_surface_changed",
                 command_identity={**cmd_identity, "cmd": last_run.get("argv")},
                 target_scope=target_scope_dict,
                 target_rule=target_rule,
@@ -2692,6 +2894,26 @@ class Workspace:
                 lockfile_changed=True,
                 mechanically_unverified=True,
                 unverified_kind="lockfile_changed",
+                command_identity={**cmd_identity, "cmd": last_run.get("argv")},
+                target_scope=target_scope_dict,
+                target_rule=target_rule,
+                target_confidence=target_confidence,
+                worker_staged_paths=staged_paths,
+            )
+
+        if test_surface_changed:
+            return MechanicalEvidence(
+                mech_status=MechStatus.UNMEASURED,
+                reason=MechReason.TEST_SURFACE_CHANGED,
+                evidence_level=EvidenceLevel.NONE,
+                comparison=Comparison.INCONCLUSIVE,
+                comparison_valid=False,
+                approval_valid=True,
+                verifier_modified=bool(verifier_modified_flag),
+                test_surface_changed=True,
+                lockfile_changed=bool(lockfile_changed),
+                mechanically_unverified=True,
+                unverified_kind="test_surface_changed",
                 command_identity={**cmd_identity, "cmd": last_run.get("argv")},
                 target_scope=target_scope_dict,
                 target_rule=target_rule,
@@ -2824,6 +3046,10 @@ class Workspace:
                         attribution_note=note,
                         command_identity={**cmd_identity, "cmd": last_run.get("argv")},
                         target_scope=target_scope_dict,
+                        verifier_modified=verifier_modified_flag,
+                        test_surface_changed=test_surface_changed,
+                        worker_staged_paths=staged_paths,
+                        test_authorship=test_authorship_val,
                     )
                 else:
                     return MechanicalEvidence(
@@ -2837,6 +3063,10 @@ class Workspace:
                         attribution_note=note,
                         command_identity={**cmd_identity, "cmd": last_run.get("argv")},
                         target_scope=target_scope_dict,
+                        verifier_modified=verifier_modified_flag,
+                        test_surface_changed=test_surface_changed,
+                        worker_staged_paths=staged_paths,
+                        test_authorship=test_authorship_val,
                     )
 
         test_cmd = last_run.get("argv") or []
@@ -2908,6 +3138,10 @@ class Workspace:
                 target_scope=target_scope_dict,
                 target_rule=target_rule,
                 target_confidence=target_confidence,
+                verifier_modified=verifier_modified_flag,
+                test_surface_changed=test_surface_changed,
+                worker_staged_paths=staged_paths,
+                test_authorship=test_authorship_val,
             )
 
         if base_status == BaseStatus.FAIL:
@@ -2926,6 +3160,10 @@ class Workspace:
                         target_scope=target_scope_dict,
                         target_rule=target_rule,
                         target_confidence=target_confidence,
+                        verifier_modified=verifier_modified_flag,
+                        test_surface_changed=test_surface_changed,
+                        worker_staged_paths=staged_paths,
+                        test_authorship=test_authorship_val,
                     )
                 else:
                     return MechanicalEvidence(
@@ -2933,11 +3171,16 @@ class Workspace:
                         base_status=BaseStatus.FAIL,
                         comparison=Comparison.SAME,
                         evidence_level=EvidenceLevel.NAMED,
-                        mechanically_unverified=False,
+                        mechanically_unverified=True if (verifier_modified_flag or test_surface_changed or is_worker_authored_only) else False,
+                        unverified_kind="verifier_modified" if verifier_modified_flag else ("test_surface_changed" if test_surface_changed else ("worker_authored_only" if is_worker_authored_only else None)),
                         command_identity={**cmd_identity, "cmd": test_cmd},
                         target_scope=target_scope_dict,
                         target_rule=target_rule,
                         target_confidence=target_confidence,
+                        verifier_modified=verifier_modified_flag,
+                        test_surface_changed=test_surface_changed,
+                        worker_staged_paths=staged_paths,
+                        test_authorship=test_authorship_val,
                     )
             else:
                 return MechanicalEvidence(
@@ -2950,6 +3193,10 @@ class Workspace:
                     target_scope=target_scope_dict,
                     target_rule=target_rule,
                     target_confidence=target_confidence,
+                    verifier_modified=verifier_modified_flag,
+                    test_surface_changed=test_surface_changed,
+                    worker_staged_paths=staged_paths,
+                    test_authorship=test_authorship_val,
                 )
 
         return MechanicalEvidence(
@@ -2962,6 +3209,10 @@ class Workspace:
             target_scope=target_scope_dict,
             target_rule=target_rule,
             target_confidence=target_confidence,
+            verifier_modified=verifier_modified_flag,
+            test_surface_changed=test_surface_changed,
+            worker_staged_paths=staged_paths,
+            test_authorship=test_authorship_val,
         )
 
 

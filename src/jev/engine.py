@@ -4203,6 +4203,12 @@ def node_gate(
         )
         if m_ev_level == "exit_only":
             standard_block += "\n- note: not a full-suite verification"
+        if getattr(mech_ev, "verifier_modified", False):
+            standard_block += "\n- verifier_modified: true"
+        if getattr(mech_ev, "test_surface_changed", False):
+            standard_block += "\n- test_surface_changed: true"
+        if getattr(mech_ev, "test_authorship", None):
+            standard_block += f"\n- test_authorship: {mech_ev.test_authorship}"
 
         if classification == "REGRESSION_FREE_WITH_BASELINE_FAILURES":
             base_desc = f"Regression-free with baseline failures (baseline_failures={baseline_failures}, new_failures=0)."
