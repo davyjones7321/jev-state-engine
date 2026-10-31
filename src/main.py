@@ -6,11 +6,17 @@ from typing import List, Optional
 
 from dotenv import dotenv_values
 
+_src_dir = str(Path(__file__).resolve().parent)
+if _src_dir not in sys.path:
+    sys.path.insert(0, _src_dir)
+
 from jev.dependency_delta import format_dependency_summary
 from jev.engine import JevEngine
 from jev.evidence import format_evidence_summary
 from jev.gatekeeper import Gatekeeper
 from jev.ledger import NullRecorder, SqliteLedger
+from jev.laya import LayaConfig, LayaGatekeeper, LayaShadowJudge
+from jev.qwen_postmortem import QwenClient, QwenConfig
 from jev.workspace import Workspace
 
 
@@ -126,6 +132,54 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Worker LLM model name (defaults to JEV_WORKER_MODEL or gemini-3.5-flash-lite).",
     )
+    parser.add_argument(
+        "--gatekeeper",
+        choices=["jev", "laya"],
+        default=None,
+        help="Primary semantic gatekeeper: 'jev' (TypeSafe AI System One, requires JEV_API_KEY) or 'laya' (local Laya decision model). Defaults to jev if configured, else auto-falls back to laya.",
+    )
+    parser.add_argument(
+        "--laya",
+        choices=["on", "off"],
+        default=None,
+        help="Enable Laya secondary shadow judge (on, off; defaults to JEV_LAYA or off).",
+    )
+    parser.add_argument(
+        "--qwen-postmortem",
+        choices=["on", "off"],
+        default=None,
+        help="Enable Qwen advisory post-mortem on strikes (on, off; defaults to JEV_QWEN_POSTMORTEM or off).",
+    )
+    parser.add_argument(
+        "--qwen-url",
+        type=str,
+        default=None,
+        help="llama-server URL (defaults to JEV_QWEN_URL or http://127.0.0.1:8080).",
+    )
+    parser.add_argument(
+        "--qwen-model",
+        type=str,
+        default=None,
+        help="Model name sent in request (defaults to JEV_QWEN_MODEL or whatever server reports).",
+    )
+    parser.add_argument(
+        "--qwen-timeout",
+        type=positive_int,
+        default=None,
+        help="Timeout in seconds for Qwen calls (defaults to JEV_QWEN_TIMEOUT or 120).",
+    )
+    parser.add_argument(
+        "--qwen-max-diff-chars",
+        type=positive_int,
+        default=None,
+        help="Max diff chars sent to Qwen (defaults to JEV_QWEN_MAX_DIFF_CHARS or 24000).",
+    )
+    parser.add_argument(
+        "--qwen-feedback",
+        choices=["on", "off"],
+        default=None,
+        help="Feed Qwen advice back into worker retry prompt (on, off; defaults to JEV_QWEN_FEEDBACK or off).",
+    )
     return parser
 
 
@@ -147,7 +201,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not engine_env.exists():
         engine_env = Path(__file__).resolve().parent.parent / ".env"
     env_file = engine_env if engine_env.exists() else ((repo_dir / ".env") if (repo_dir / ".env").exists() else None)
-    gatekeeper = Gatekeeper(env_file=env_file)
+    gatekeeper = None
+    laya_client = None
+    if getattr(args, "gatekeeper", None) == "laya":
+        laya_judge = LayaShadowJudge(config=LayaConfig(enabled=True))
+        gatekeeper = LayaGatekeeper(laya_judge=laya_judge)
+        laya_client = None
+    else:
+        try:
+            gatekeeper = Gatekeeper(env_file=env_file)
+            laya_config = LayaConfig.from_env_and_args(cli_laya=args.laya)
+            laya_client = LayaShadowJudge(config=laya_config)
+        except ValueError as e:
+            if "JEV_API_KEY" in str(e) or "JEV_API_URL" in str(e):
+                laya_judge = LayaShadowJudge(config=LayaConfig(enabled=True))
+                gatekeeper = LayaGatekeeper(laya_judge=laya_judge)
+                laya_client = None
+            else:
+                raise
 
     if args.no_ledger:
         recorder = NullRecorder()
@@ -157,6 +228,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         except Exception as e:
             print(f"ledger disabled: {e}", file=sys.stderr, flush=True)
             recorder = NullRecorder()
+
+    # Wire Qwen advisory post-mortem client
+    qwen_config = QwenConfig.from_env_and_args(
+        cli_postmortem=args.qwen_postmortem,
+        cli_url=args.qwen_url,
+        cli_model=args.qwen_model,
+        cli_timeout=args.qwen_timeout,
+        cli_max_diff_chars=args.qwen_max_diff_chars,
+        cli_feedback=args.qwen_feedback,
+    )
+    qwen_client = QwenClient(config=qwen_config)
+    if qwen_client.enabled:
+        qwen_client.check_health()
 
     # Wire Gemini LLM via langchain-google-genai
     google_api_key = os.environ.get("GOOGLE_API_KEY")
@@ -188,6 +272,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         retry_intel=args.retry_intel,
         repo_profile=args.repo_profile,
         dep_delta_jev=args.dep_delta_jev,
+        qwen_client=qwen_client,
+        laya_client=laya_client,
     )
 
 
