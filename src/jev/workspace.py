@@ -903,12 +903,20 @@ class Workspace:
         worktree_dir: Optional[Union[str, Path]] = None,
         test_timeout: Optional[int] = None,
         strict_provenance: bool = False,
+        process_cleanup_grace_period: float = 2.0,
+        candidate_rerun_mode: str = "same_worktree",
     ):
         self.repo_dir = Path(repo_dir).resolve() if repo_dir else Path.cwd().resolve()
         self.worktree_dir = (
             Path(worktree_dir).resolve() if worktree_dir else self.repo_dir
         )
         self.strict_provenance = strict_provenance
+        self.process_cleanup_grace_period = float(process_cleanup_grace_period)
+        self.candidate_rerun_mode = str(candidate_rerun_mode)
+        self.ticket_start_time: Optional[float] = None
+        self.ticket_timeout: int = 2700
+        self.subgoal_start_time: Optional[float] = None
+        self.subgoal_timeout: int = 600
         self.base_commit: Optional[str] = self._get_head_commit()
         self.last_test_run: Optional[dict] = None
         self.last_compile_run: Optional[dict] = None
@@ -2350,6 +2358,8 @@ class Workspace:
                     "valid_cache": True,
                     "disagreed": res_data.get("disagreed", False),
                 }
+                if attempt == 0 and status == BaseStatus.FAIL:
+                    continue
                 break
             except Exception:
                 continue
@@ -2363,6 +2373,91 @@ class Workspace:
 
         return res_data
 
+    def _run_fresh_worktree_candidate_tests(
+        self,
+        test_cmd: Optional[List[str]],
+        targets: Optional[Sequence[Union[str, Path]]],
+        base_commit_ref: str,
+    ) -> Tuple[TestOutcome, Dict[str, Any]]:
+        """Runs candidate tests in a fresh clean detached worktree with candidate changes applied."""
+        worktree_base = self.repo_dir / ".jev-worktrees"
+        worktree_base.mkdir(parents=True, exist_ok=True)
+        cand_wt_path = (worktree_base / f"cand-rerun-{uuid.uuid4().hex[:8]}").resolve()
+
+        stash_sha = None
+        try:
+            res = self._run_repo_git(["stash", "create"])
+            if res.returncode == 0 and res.stdout.strip():
+                stash_sha = res.stdout.strip()
+        except Exception:
+            pass
+
+        start_ref = stash_sha if stash_sha else (base_commit_ref or "HEAD")
+        add_res = self._run_repo_git(["worktree", "add", "--detach", str(cand_wt_path), start_ref])
+        if add_res.returncode != 0:
+            raise RuntimeError(f"Failed to add fresh worktree: {add_res.stderr or add_res.stdout}")
+
+        try:
+            if not stash_sha:
+                staged_files = list(self.worker_staged_paths) if self.worker_staged_paths else []
+                if not staged_files:
+                    diff_res = self._run_git(["diff", "--name-only", str(base_commit_ref)])
+                    if diff_res.returncode == 0 and diff_res.stdout.strip():
+                        staged_files = [p.strip() for p in diff_res.stdout.splitlines() if p.strip()]
+                for sf in staged_files:
+                    src_file = self.worktree_dir / sf
+                    dst_file = cand_wt_path / sf
+                    if src_file.exists() and src_file.is_file():
+                        dst_file.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(src_file, dst_file)
+
+            self._link_node_modules(self.repo_dir, cand_wt_path)
+
+            if not test_cmd:
+                resolved = self.resolve_test_command(targets=targets)
+                test_cmd = resolved.argv if resolved else None
+            if not test_cmd:
+                raise RuntimeError("No test command available for rerun")
+
+            proc = self._run_test_subprocess(test_cmd, cwd=cand_wt_path, timeout=self.test_timeout)
+            exit_code = proc.returncode if hasattr(proc, "returncode") else 0
+            stdout_str = proc.stdout if isinstance(proc.stdout, str) else (proc.stdout.decode("utf-8", errors="replace") if proc.stdout else "")
+            stderr_str = proc.stderr if isinstance(proc.stderr, str) else (proc.stderr.decode("utf-8", errors="replace") if proc.stderr else "")
+            out = stdout_str + "\n" + stderr_str
+            failing_ids = parse_failing_test_ids(out, exit_code=exit_code)
+            outcome = TestOutcome.PASSED if exit_code == 0 else TestOutcome.FAILED
+            timed_out = getattr(proc, "timed_out", False)
+            launch_failed = getattr(proc, "launch_failed", False)
+            if timed_out:
+                outcome = TestOutcome.TIMEOUT
+            elif launch_failed:
+                outcome = TestOutcome.NO_COMMAND
+
+            rerun_details = {
+                "ran": True,
+                "outcome": outcome.value if hasattr(outcome, "value") else str(outcome),
+                "exit_code": exit_code,
+                "stdout": stdout_str,
+                "stderr": stderr_str,
+                "stdout_tail": stdout_str[-2000:] if stdout_str else "",
+                "stderr_tail": stderr_str[-2000:] if stderr_str else "",
+                "timed_out": timed_out,
+                "launch_failed": launch_failed,
+                "tool_path": getattr(proc, "tool_path", (test_cmd[0] if test_cmd else None)),
+                "argv": test_cmd,
+                "failing_test_ids": list(failing_ids) if failing_ids else None,
+                "rerun_mode": "fresh_worktree",
+                "rerun_context": "fresh_worktree",
+            }
+            return outcome, rerun_details
+        finally:
+            if cand_wt_path.exists():
+                self._unlink_node_modules(cand_wt_path)
+                self._run_repo_git(["worktree", "remove", "--force", str(cand_wt_path)])
+                if cand_wt_path.exists():
+                    self._force_rmtree(cand_wt_path)
+                self._run_repo_git(["worktree", "prune"])
+
     def evaluate_tests(
         self,
         subgoal: Subgoal,
@@ -2371,6 +2466,7 @@ class Workspace:
         test_targets: Optional[Sequence[Union[str, Path]]] = None,
         compile_res: Optional[Dict[str, Any]] = None,
         attempt: int = 1,
+        rerun_mode: Optional[str] = None,
     ) -> Optional[MechanicalEvidence]:
         """Evaluates tests using same-command comparison between base and candidate."""
         if test_policy == "never":
@@ -2945,9 +3041,34 @@ class Workspace:
                 target_confidence=target_confidence,
             )
         self._candidate_run_counts[attempt_key] = self._candidate_run_counts.get(attempt_key, 0) + 1
-        rerun_outcome = self.run_tests(targets=effective_targets)
-        rerun_details = self.last_test_run or {}
-        rerun_details["rerun_context"] = "same_worktree_cleaned"
+
+        actual_rerun_mode = "same_worktree"
+        effective_rerun_mode = rerun_mode or getattr(self, "candidate_rerun_mode", "same_worktree")
+        rerun_details = {}
+        rerun_outcome = None
+
+        if effective_rerun_mode == "fresh_worktree":
+            try:
+                base_ref = str(base_commit).strip() if base_commit else (self.base_commit or self._get_head_commit() or "HEAD")
+                rerun_outcome, rerun_details = self._run_fresh_worktree_candidate_tests(
+                    test_cmd=last_run.get("argv"),
+                    targets=effective_targets,
+                    base_commit_ref=base_ref,
+                )
+                actual_rerun_mode = "fresh_worktree"
+            except Exception as exc:
+                logger.warning("Fresh worktree candidate rerun fell back to same worktree: %s", exc)
+                rerun_outcome = self.run_tests(targets=effective_targets)
+                rerun_details = self.last_test_run or {}
+                actual_rerun_mode = "same_worktree"
+        else:
+            rerun_outcome = self.run_tests(targets=effective_targets)
+            rerun_details = self.last_test_run or {}
+            actual_rerun_mode = "same_worktree"
+
+        rerun_details["rerun_mode"] = actual_rerun_mode
+        rerun_details["rerun_context"] = actual_rerun_mode if actual_rerun_mode == "fresh_worktree" else "same_worktree_cleaned"
+        self.last_test_run = rerun_details
 
         if rerun_details.get("timed_out"):
             return MechanicalEvidence(
@@ -2958,6 +3079,7 @@ class Workspace:
                 target_scope=target_scope_dict,
                 target_rule=target_rule,
                 target_confidence=target_confidence,
+                attribution_note=f"timeout; rerun_mode:{actual_rerun_mode}",
             )
         if rerun_details.get("launch_failed"):
             return MechanicalEvidence(
@@ -2968,6 +3090,7 @@ class Workspace:
                 target_scope=target_scope_dict,
                 target_rule=target_rule,
                 target_confidence=target_confidence,
+                attribution_note=f"launch_failed; rerun_mode:{actual_rerun_mode}",
             )
 
         rerun_exit = rerun_details.get("exit_code")
@@ -2988,6 +3111,7 @@ class Workspace:
                     target_rule=target_rule,
                     target_confidence=target_confidence,
                     worker_staged_paths=staged_paths,
+                    attribution_note=f"zero_test_marker; rerun_mode:{actual_rerun_mode}",
                 )
 
         if rerun_exit == 0 or rerun_outcome == TestOutcome.PASSED:
@@ -2999,16 +3123,23 @@ class Workspace:
                 target_scope=target_scope_dict,
                 target_rule=target_rule,
                 target_confidence=target_confidence,
+                attribution_note=f"flaky_rerun_passed; rerun_mode:{actual_rerun_mode}",
             )
 
-        fp1 = compute_failure_fingerprint(
-            (last_run.get("stdout") or "") + "\n" + (last_run.get("stderr") or ""),
-            self.worktree_dir
-        )
-        fp2 = compute_failure_fingerprint(
-            (rerun_details.get("stdout") or "") + "\n" + (rerun_details.get("stderr") or ""),
-            self.worktree_dir
-        )
+        cand_out_1 = (last_run.get("stdout") or "") + "\n" + (last_run.get("stderr") or "")
+        if not cand_out_1.strip():
+            cand_out_1 = (last_run.get("stdout_tail") or "") + "\n" + (last_run.get("stderr_tail") or "")
+        if not cand_out_1.strip():
+            cand_out_1 = last_run.get("output_tail") or ""
+
+        cand_out_2 = (rerun_details.get("stdout") or "") + "\n" + (rerun_details.get("stderr") or "")
+        if not cand_out_2.strip():
+            cand_out_2 = (rerun_details.get("stdout_tail") or "") + "\n" + (rerun_details.get("stderr_tail") or "")
+        if not cand_out_2.strip():
+            cand_out_2 = rerun_details.get("output_tail") or ""
+
+        fp1 = compute_failure_fingerprint(cand_out_1, self.worktree_dir)
+        fp2 = compute_failure_fingerprint(cand_out_2, self.worktree_dir)
         if fp1 != fp2:
             return MechanicalEvidence(
                 mech_status=MechStatus.UNMEASURED,
@@ -3018,7 +3149,13 @@ class Workspace:
                 target_scope=target_scope_dict,
                 target_rule=target_rule,
                 target_confidence=target_confidence,
+                attribution_note=f"flaky_fingerprint_mismatch; rerun_mode:{actual_rerun_mode}",
             )
+
+        # Repeated stable fingerprints recorded for diagnosis only
+        rerun_details["stable_fingerprint"] = fp1
+        rerun_details["fingerprint"] = fp1
+        stable_fp_note = f"stable_fingerprint:{fp1}; rerun_mode:{actual_rerun_mode}"
 
         # 2e. Base run
         base_commit_ref = str(base_commit).strip() if base_commit else (self.base_commit or self._get_head_commit() or "HEAD")
@@ -3036,6 +3173,7 @@ class Workspace:
                 note = "all targets absent at base (not_applicable)" if present_at_base == 0 else f"some targets absent at base ({present_at_base}/{total_targets} present) (not_applicable)"
                 rule_for_evidence = "provisional" if present_at_base == 0 else target_rule
                 if compile_passed and launcher_healthy and output_non_empty:
+                    note_combined = f"{note}; {stable_fp_note}" if note else stable_fp_note
                     return MechanicalEvidence(
                         mech_status=MechStatus.FAIL,
                         evidence_level=EvidenceLevel.EXIT_ONLY,
@@ -3043,7 +3181,7 @@ class Workspace:
                         comparison=Comparison.CANDIDATE_ONLY,
                         target_rule=rule_for_evidence,
                         target_confidence=target_confidence,
-                        attribution_note=note,
+                        attribution_note=note_combined,
                         command_identity={**cmd_identity, "cmd": last_run.get("argv")},
                         target_scope=target_scope_dict,
                         verifier_modified=verifier_modified_flag,
@@ -3052,6 +3190,7 @@ class Workspace:
                         test_authorship=test_authorship_val,
                     )
                 else:
+                    note_combined = f"{note}; {stable_fp_note}" if note else stable_fp_note
                     return MechanicalEvidence(
                         mech_status=MechStatus.UNMEASURED,
                         reason=MechReason.TOOLING_ERROR,
@@ -3060,7 +3199,7 @@ class Workspace:
                         mechanically_unverified=True,
                         target_rule=target_rule,
                         target_confidence=target_confidence,
-                        attribution_note=note,
+                        attribution_note=note_combined,
                         command_identity={**cmd_identity, "cmd": last_run.get("argv")},
                         target_scope=target_scope_dict,
                         verifier_modified=verifier_modified_flag,
@@ -3138,6 +3277,7 @@ class Workspace:
                 target_scope=target_scope_dict,
                 target_rule=target_rule,
                 target_confidence=target_confidence,
+                attribution_note=stable_fp_note,
                 verifier_modified=verifier_modified_flag,
                 test_surface_changed=test_surface_changed,
                 worker_staged_paths=staged_paths,
@@ -3160,18 +3300,20 @@ class Workspace:
                         target_scope=target_scope_dict,
                         target_rule=target_rule,
                         target_confidence=target_confidence,
+                        attribution_note=stable_fp_note,
                         verifier_modified=verifier_modified_flag,
                         test_surface_changed=test_surface_changed,
                         worker_staged_paths=staged_paths,
                         test_authorship=test_authorship_val,
                     )
                 else:
+                    is_unv_pass = bool(verifier_modified_flag or test_surface_changed or is_worker_authored_only)
                     return MechanicalEvidence(
                         mech_status=MechStatus.PASS,
                         base_status=BaseStatus.FAIL,
                         comparison=Comparison.SAME,
-                        evidence_level=EvidenceLevel.NAMED,
-                        mechanically_unverified=True if (verifier_modified_flag or test_surface_changed or is_worker_authored_only) else False,
+                        evidence_level=EvidenceLevel.EXIT_ONLY if is_unv_pass else EvidenceLevel.NAMED,
+                        mechanically_unverified=is_unv_pass,
                         unverified_kind="verifier_modified" if verifier_modified_flag else ("test_surface_changed" if test_surface_changed else ("worker_authored_only" if is_worker_authored_only else None)),
                         command_identity={**cmd_identity, "cmd": test_cmd},
                         target_scope=target_scope_dict,
@@ -3209,6 +3351,7 @@ class Workspace:
             target_scope=target_scope_dict,
             target_rule=target_rule,
             target_confidence=target_confidence,
+            attribution_note=stable_fp_note,
             verifier_modified=verifier_modified_flag,
             test_surface_changed=test_surface_changed,
             worker_staged_paths=staged_paths,

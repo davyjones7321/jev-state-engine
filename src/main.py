@@ -173,6 +173,24 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Path to an explicit environment file containing engine credentials.",
     )
+    parser.add_argument(
+        "--subgoal-timeout",
+        type=int,
+        default=600,
+        help="Wall-clock timeout in seconds per subgoal (positive int, defaults to 600).",
+    )
+    parser.add_argument(
+        "--ticket-timeout",
+        type=int,
+        default=2700,
+        help="Wall-clock timeout in seconds per ticket (positive int, defaults to 2700).",
+    )
+    parser.add_argument(
+        "--process-cleanup-grace-period",
+        type=float,
+        default=2.0,
+        help="Process cleanup grace period in seconds (positive float, defaults to 2.0).",
+    )
     return parser
 
 
@@ -289,6 +307,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         advisory_policy=args.advisory_policy,
         replan_enabled=replan_enabled,
         memory=memory,
+        subgoal_timeout=args.subgoal_timeout,
+        ticket_timeout=args.ticket_timeout,
+        process_cleanup_grace_period=args.process_cleanup_grace_period,
     )
 
     final_state = engine.execute(ticket=args.ticket, thread_id=args.thread_id)

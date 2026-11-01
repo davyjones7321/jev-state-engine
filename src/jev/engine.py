@@ -2472,6 +2472,11 @@ def node_implement(
             state["current_subgoal"] = current_subgoal
             state["gate_status"] = None
             state["failed_attempts"] = []
+            if workspace is not None:
+                workspace.subgoal_start_time = time.time()
+
+    if workspace is not None and getattr(workspace, "subgoal_start_time", None) is None:
+        workspace.subgoal_start_time = time.time()
 
     subgoal: Optional[Subgoal] = None
     if isinstance(current_subgoal, dict):
@@ -3499,6 +3504,68 @@ def node_gate(
         diff = ""
     diff_sha = hashlib.sha256(diff.encode("utf-8")).hexdigest()
 
+    # Phase 9: Wall-clock caps (subgoal and ticket)
+    now = time.time()
+    ticket_start_time = state.get("ticket_start_time")
+    if not isinstance(ticket_start_time, (int, float)) and workspace is not None:
+        val = getattr(workspace, "ticket_start_time", None)
+        ticket_start_time = val if isinstance(val, (int, float)) else None
+
+    ticket_timeout = state.get("ticket_timeout")
+    if not isinstance(ticket_timeout, (int, float)) and workspace is not None:
+        val = getattr(workspace, "ticket_timeout", None)
+        ticket_timeout = val if isinstance(val, (int, float)) else 2700
+    if not isinstance(ticket_timeout, (int, float)):
+        ticket_timeout = 2700
+
+    subgoal_start_time = state.get("subgoal_start_time")
+    if not isinstance(subgoal_start_time, (int, float)) and workspace is not None:
+        val = getattr(workspace, "subgoal_start_time", None)
+        subgoal_start_time = val if isinstance(val, (int, float)) else None
+
+    subgoal_timeout = state.get("subgoal_timeout")
+    if not isinstance(subgoal_timeout, (int, float)) and workspace is not None:
+        val = getattr(workspace, "subgoal_timeout", None)
+        subgoal_timeout = val if isinstance(val, (int, float)) else 600
+    if not isinstance(subgoal_timeout, (int, float)):
+        subgoal_timeout = 600
+
+    ticket_timed_out = (isinstance(ticket_start_time, (int, float)) and (now - ticket_start_time) > ticket_timeout)
+    subgoal_timed_out = (isinstance(subgoal_start_time, (int, float)) and (now - subgoal_start_time) > subgoal_timeout)
+
+    if ticket_timed_out or subgoal_timed_out:
+        timeout_kind = "ticket" if ticket_timed_out else "subgoal"
+        timeout_val = ticket_timeout if ticket_timed_out else subgoal_timeout
+        state["status"] = "escalated"
+        state["gate_status"] = "verification_inconclusive"
+        subgoal.status = "failed"
+        state["current_subgoal"] = subgoal
+        if safe_rec:
+            safe_rec.record_subgoal_status(run_id, subgoal_id, "failed")
+        state["last_feedback"] = f"Verification inconclusive: {timeout_kind} wall-clock budget exceeded ({timeout_val}s cap)."
+        _teardown_worktree(state, workspace)
+        state["trajectory"].append({
+            "node": "gate",
+            "subgoal": subgoal.model_dump() if hasattr(subgoal, "model_dump") else dict(subgoal),
+            "gate_status": "verification_inconclusive",
+            "status": "escalated",
+            "timeout_kind": timeout_kind,
+            "timeout_val": timeout_val,
+        })
+        _safe_escalate_deadlock(
+            gatekeeper,
+            trajectory=state.get("trajectory", []),
+            triggering_tier="verification",
+            integration_branch=state.get("integration_branch"),
+            thread_id=state.get("thread_id"),
+        )
+        _safe_record_memory(
+            memory, state, outcome="verification_inconclusive",
+            failure_class=f"{timeout_kind}_timeout", summary=state["last_feedback"],
+            diff=diff, subgoal=subgoal,
+        )
+        return state
+
     # Duplicate-diff guard (Phase 3 Item C)
     retry_intel = state.get("retry_intel")
     if retry_intel is None:
@@ -4405,6 +4472,8 @@ def node_gate(
             state["failed_attempts"] = []
         state["gate_status"] = "passed"
         state["last_feedback"] = ""
+        if workspace is not None:
+            workspace.subgoal_start_time = None
         subgoal.status = "committed"
         state["current_subgoal"] = subgoal
         state["committed_subgoals"] = list(state.get("committed_subgoals", [])) + [subgoal.model_copy(deep=True)]
@@ -5142,7 +5211,21 @@ class JevEngine:
         replan_enabled: bool = False,
         replan_planner: Optional[Any] = None,
         replan_validator: Optional[Any] = None,
+        subgoal_timeout: int = 600,
+        ticket_timeout: int = 2700,
+        process_cleanup_grace_period: float = 2.0,
     ):
+        if subgoal_timeout <= 0:
+            raise ValueError(f"subgoal_timeout must be a positive integer, got {subgoal_timeout}")
+        if ticket_timeout <= 0:
+            raise ValueError(f"ticket_timeout must be a positive integer, got {ticket_timeout}")
+        if process_cleanup_grace_period <= 0:
+            raise ValueError(f"process_cleanup_grace_period must be a positive float, got {process_cleanup_grace_period}")
+        self.subgoal_timeout = int(subgoal_timeout)
+        self.ticket_timeout = int(ticket_timeout)
+        self.process_cleanup_grace_period = float(process_cleanup_grace_period)
+        if workspace is not None and hasattr(workspace, "process_cleanup_grace_period"):
+            workspace.process_cleanup_grace_period = self.process_cleanup_grace_period
         self.workspace = workspace
         self.gatekeeper = gatekeeper
         self.llm = llm
@@ -5344,6 +5427,12 @@ class JevEngine:
             dep_delta_jev=self.dep_delta_jev,
             provenance=json.dumps(self.role_provenance, sort_keys=True),
         )
+
+        if self.workspace is not None:
+            self.workspace.ticket_start_time = time.time()
+            self.workspace.subgoal_start_time = None
+            self.workspace.subgoal_timeout = self.subgoal_timeout
+            self.workspace.ticket_timeout = self.ticket_timeout
 
         initial_state: State = {
             "ticket": ticket,
