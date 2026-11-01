@@ -500,11 +500,17 @@ def _is_junction_or_symlink(path: Path) -> bool:
 
 
 ALL_SOURCE_EXTENSIONS = {
-    ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
+    ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts",
     ".go",
     ".rs",
-    ".java", ".kt",
+    ".java", ".kt", ".kts",
     ".py",
+    ".cs", ".fs", ".vb",
+    ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hxx",
+    ".swift",
+    ".ex", ".exs",
+    ".rb",
+    ".php",
 }
 
 SUPPRESSION_DIRECTIVES: Dict[str, List[str]] = {
@@ -611,7 +617,9 @@ class JsTsCompileHandler(BaseCompileHandler):
     def prepare_and_get_command(
         self, wt: Path, repo_dir: Path, touched_files: List[str]
     ) -> tuple[Optional[List[str]], Optional[CompileOutcome], str]:
-        if (wt / "yarn.lock").exists() or (repo_dir / "yarn.lock").exists():
+        if (wt / "bunfig.toml").exists() or (repo_dir / "bunfig.toml").exists() or (wt / "bun.lockb").exists() or (repo_dir / "bun.lockb").exists() or (wt / "bun.lock").exists() or (repo_dir / "bun.lock").exists():
+            pm = "bun"
+        elif (wt / "yarn.lock").exists() or (repo_dir / "yarn.lock").exists():
             pm = "yarn"
         elif (wt / "pnpm-lock.yaml").exists() or (repo_dir / "pnpm-lock.yaml").exists():
             pm = "pnpm"
@@ -645,6 +653,7 @@ class JsTsCompileHandler(BaseCompileHandler):
             or (repo_dir / "node_modules").exists()
             or _is_junction_or_symlink(wt / "node_modules")
             or _is_junction_or_symlink(repo_dir / "node_modules")
+            or (pm == "bun" and bool(shutil.which("bun")))
         )
         if not has_nm:
             return None, CompileOutcome.ENV_NOT_READY, "Environment not ready: node_modules is missing in repository root. Please install dependencies before running."
@@ -653,6 +662,8 @@ class JsTsCompileHandler(BaseCompileHandler):
             return [pm, "run", "typecheck"], None, ""
 
         if has_tsconfig:
+            if pm == "bun" and shutil.which("bun"):
+                return ["bun", "x", "tsc", "--noEmit"], None, ""
             tsc_bin = None
             for candidate in [
                 wt / "node_modules" / ".bin" / ("tsc.cmd" if sys.platform == "win32" else "tsc"),
@@ -816,12 +827,132 @@ class PythonCompileHandler(BaseCompileHandler):
         return 0, "", ""
 
 
+class DotnetCompileHandler(BaseCompileHandler):
+    name = "dotnet"
+    source_extensions = {".cs", ".fs", ".vb"}
+
+    def matches(self, touched_files: set[str], wt: Path, repo_dir: Path) -> bool:
+        has_ext = any(Path(f).suffix.lower() in self.source_extensions for f in touched_files)
+        has_proj = any(
+            list(wt.glob("*.csproj")) + list(wt.glob("*.fsproj")) + list(wt.glob("*.sln")) +
+            list(repo_dir.glob("*.csproj")) + list(repo_dir.glob("*.fsproj")) + list(repo_dir.glob("*.sln"))
+        )
+        return has_ext and has_proj
+
+    def prepare_and_get_command(
+        self, wt: Path, repo_dir: Path, touched_files: List[str]
+    ) -> tuple[Optional[List[str]], Optional[CompileOutcome], str]:
+        dotnet_bin = shutil.which("dotnet")
+        if not dotnet_bin:
+            return None, CompileOutcome.ENV_NOT_READY, "Environment not ready: dotnet SDK executable not found in PATH."
+        return ["dotnet", "build"], None, ""
+
+
+class CMakeCompileHandler(BaseCompileHandler):
+    name = "cmake"
+    source_extensions = {".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hxx"}
+
+    def matches(self, touched_files: set[str], wt: Path, repo_dir: Path) -> bool:
+        has_ext = any(Path(f).suffix.lower() in self.source_extensions for f in touched_files)
+        has_cmake = (wt / "CMakeLists.txt").exists() or (repo_dir / "CMakeLists.txt").exists()
+        return has_ext and has_cmake
+
+    def prepare_and_get_command(
+        self, wt: Path, repo_dir: Path, touched_files: List[str]
+    ) -> tuple[Optional[List[str]], Optional[CompileOutcome], str]:
+        cmake_bin = shutil.which("cmake")
+        if not cmake_bin:
+            return None, CompileOutcome.ENV_NOT_READY, "Environment not ready: cmake executable not found in PATH."
+        build_dir = wt / "build"
+        if not build_dir.exists():
+            return ["cmake", "-B", "build"], None, ""
+        return ["cmake", "--build", "build"], None, ""
+
+
+class SwiftPMCompileHandler(BaseCompileHandler):
+    name = "swiftpm"
+    source_extensions = {".swift"}
+
+    def matches(self, touched_files: set[str], wt: Path, repo_dir: Path) -> bool:
+        has_ext = any(Path(f).suffix.lower() in self.source_extensions for f in touched_files)
+        has_pkg = (wt / "Package.swift").exists() or (repo_dir / "Package.swift").exists()
+        return has_ext and has_pkg
+
+    def prepare_and_get_command(
+        self, wt: Path, repo_dir: Path, touched_files: List[str]
+    ) -> tuple[Optional[List[str]], Optional[CompileOutcome], str]:
+        swift_bin = shutil.which("swift")
+        if not swift_bin:
+            return None, CompileOutcome.ENV_NOT_READY, "Environment not ready: swift toolchain executable not found in PATH."
+        return ["swift", "build"], None, ""
+
+
+class ElixirCompileHandler(BaseCompileHandler):
+    name = "elixir"
+    source_extensions = {".ex", ".exs"}
+
+    def matches(self, touched_files: set[str], wt: Path, repo_dir: Path) -> bool:
+        has_ext = any(Path(f).suffix.lower() in self.source_extensions for f in touched_files)
+        has_mix = (wt / "mix.exs").exists() or (repo_dir / "mix.exs").exists()
+        return has_ext and has_mix
+
+    def prepare_and_get_command(
+        self, wt: Path, repo_dir: Path, touched_files: List[str]
+    ) -> tuple[Optional[List[str]], Optional[CompileOutcome], str]:
+        mix_bin = shutil.which("mix")
+        if not mix_bin:
+            return None, CompileOutcome.ENV_NOT_READY, "Environment not ready: mix executable not found in PATH."
+        return ["mix", "compile"], None, ""
+
+
+class RubyCompileHandler(BaseCompileHandler):
+    name = "ruby"
+    source_extensions = {".rb"}
+
+    def matches(self, touched_files: set[str], wt: Path, repo_dir: Path) -> bool:
+        has_ext = any(Path(f).suffix.lower() in self.source_extensions for f in touched_files)
+        has_manifest = (
+            (wt / "Rakefile").exists() or (repo_dir / "Rakefile").exists() or
+            (wt / "Gemfile").exists() or (repo_dir / "Gemfile").exists()
+        )
+        return has_ext and has_manifest
+
+    def prepare_and_get_command(
+        self, wt: Path, repo_dir: Path, touched_files: List[str]
+    ) -> tuple[Optional[List[str]], Optional[CompileOutcome], str]:
+        return None, CompileOutcome.NO_COMPILE_COMMAND, "Profile 'ruby-rake' has no build or typecheck command configured; validation skipped."
+
+
+class PhpCompileHandler(BaseCompileHandler):
+    name = "php"
+    source_extensions = {".php"}
+
+    def matches(self, touched_files: set[str], wt: Path, repo_dir: Path) -> bool:
+        has_ext = any(Path(f).suffix.lower() in self.source_extensions for f in touched_files)
+        has_manifest = (
+            (wt / "composer.json").exists() or (repo_dir / "composer.json").exists() or
+            (wt / "phpunit.xml").exists() or (repo_dir / "phpunit.xml").exists()
+        )
+        return has_ext and has_manifest
+
+    def prepare_and_get_command(
+        self, wt: Path, repo_dir: Path, touched_files: List[str]
+    ) -> tuple[Optional[List[str]], Optional[CompileOutcome], str]:
+        return None, CompileOutcome.NO_COMPILE_COMMAND, "Profile 'phpunit' has no build or typecheck command configured; validation skipped."
+
+
 ECOSYSTEM_COMPILE_HANDLERS = [
     JsTsCompileHandler(),
     GoCompileHandler(),
     RustCompileHandler(),
     MavenCompileHandler(),
     GradleCompileHandler(),
+    DotnetCompileHandler(),
+    CMakeCompileHandler(),
+    SwiftPMCompileHandler(),
+    ElixirCompileHandler(),
+    RubyCompileHandler(),
+    PhpCompileHandler(),
     JavaKotlinFallbackHandler(),
     PythonCompileHandler(),
 ]
@@ -4274,6 +4405,24 @@ class Workspace:
                 break
 
         if handler is None:
+            from jev.runner_registry import resolve_build_command
+            res_build = resolve_build_command(self.worktree_dir)
+            if res_build.runner_profile_id and res_build.command is None:
+                record = {
+                    "ecosystem": res_build.ecosystem,
+                    "command": None,
+                    "exit_code": None,
+                    "stdout_tail": "",
+                    "stderr_tail": "",
+                    "output_tail": "",
+                    "new_errors": [],
+                    "base_errors": [],
+                    "outcome": CompileOutcome.NO_COMPILE_COMMAND.value,
+                    "detail": res_build.reason or "No build or typecheck command configured; validation skipped.",
+                }
+                self.last_compile_run = record
+                return record
+
             record = {
                 "ecosystem": None,
                 "command": None,
@@ -4310,6 +4459,9 @@ class Workspace:
             return record
 
         # 5. Run compile in worktree_dir
+        pre_existing_files = {p for p in self.worktree_dir.rglob("*") if p.is_file()}
+        staged_paths = set(self.worker_staged_paths) if hasattr(self, "worker_staged_paths") and self.worker_staged_paths else set()
+
         try:
             exit_code, stdout, stderr = handler.run_command(
                 cmd, self.worktree_dir, touched_source_files, is_base=False
@@ -4344,6 +4496,28 @@ class Workspace:
             }
             self.last_compile_run = record
             return record
+        finally:
+            # Discard generated compiler artifacts, leaving workspace clean while preserving staged files intact
+            for p in list(self.worktree_dir.rglob("*")):
+                if not p.is_file():
+                    continue
+                if p in pre_existing_files:
+                    continue
+                rel = p.relative_to(self.worktree_dir).as_posix()
+                if rel in staged_paths:
+                    continue
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+            for p in sorted(list(self.worktree_dir.rglob("*")), key=lambda x: len(x.parts), reverse=True):
+                if p.is_dir() and not any(p.iterdir()):
+                    try:
+                        p.rmdir()
+                    except Exception:
+                        pass
+            if hasattr(self, "_discard_engine_touched"):
+                self._discard_engine_touched()
 
         stdout_tail = stdout[-1000:] if stdout else ""
         stderr_tail = stderr[-1000:] if stderr else ""
@@ -4506,6 +4680,75 @@ class Workspace:
         }
         self.last_compile_run = record
         return record
+
+    def validate_changes(
+        self,
+        paths: Optional[List[str]] = None,
+        base_commit: Optional[str] = None,
+        timeout: Optional[int] = 30,
+    ) -> Dict[str, Any]:
+        """Advisory validation across profiles using central runner and registry commands.
+
+        Accepts only engine-selected commands (no arbitrary shell).
+        Discards generated artifacts, preserves staged files intact,
+        and returns bounded diagnostics with evidence level as advisory feedback only.
+        """
+        if paths:
+            candidates = list(paths)
+        else:
+            diff = self.get_staged_diff() if hasattr(self, "get_staged_diff") else ""
+            candidates = sorted(self._extract_files_from_diff(str(diff or "")))
+            if not candidates and hasattr(self, "worker_staged_paths") and self.worker_staged_paths:
+                candidates = sorted(list(self.worker_staged_paths))
+
+        commit_ref = base_commit or getattr(self, "base_commit", None)
+        compile_res = self.check_compile(scope=candidates, base_commit=commit_ref)
+        c_outcome = compile_res.get("outcome")
+        detail = compile_res.get("detail", "")
+        new_errors = compile_res.get("new_errors") or []
+        command = compile_res.get("command")
+        ecosystem = compile_res.get("ecosystem") or "unknown"
+
+        hints = []
+        combined_tail = compile_res.get("output_tail") or f"{compile_res.get('stdout_tail', '')}\n{compile_res.get('stderr_tail', '')}".strip()
+        if combined_tail:
+            diag_errs = self.parse_diagnostics(combined_tail, self.worktree_dir)
+            for de in diag_errs:
+                if de.file and de.line:
+                    col_part = f":{de.column}" if de.column else ""
+                    code_part = f" [{de.code}]" if de.code else ""
+                    hints.append(f"{de.file}:{de.line}{col_part}:{code_part} {de.message}")
+
+        if c_outcome == CompileOutcome.PASSED.value:
+            ev_level = "exit_only"
+            outcome = "passed"
+        elif c_outcome == CompileOutcome.FAILED.value:
+            ev_level = "named" if (new_errors or hints) else "exit_only"
+            outcome = "failed"
+        else:
+            ev_level = "none"
+            outcome = "skipped"
+
+        staged_intact = True
+        if hasattr(self, "worker_staged_paths") and self.worker_staged_paths:
+            for sp in self.worker_staged_paths:
+                fpath = self.worktree_dir / sp
+                if not fpath.exists():
+                    staged_intact = False
+                    break
+
+        return {
+            "outcome": outcome,
+            "compile_outcome": c_outcome,
+            "evidence_level": ev_level,
+            "command": command,
+            "ecosystem": ecosystem,
+            "detail": detail,
+            "new_errors": new_errors,
+            "hints": hints,
+            "output_tail": compile_res.get("output_tail", ""),
+            "staged_preserved": staged_intact,
+        }
 
     def _finalize_mechanical_result(self, res: MechanicalCheckResult) -> MechanicalCheckResult:
         self._compute_provenance_deltas()

@@ -2575,11 +2575,21 @@ def node_implement(
             self_check_calls += 1
             if self_check_calls > 4:
                 self_check_outcomes.append("skipped (limit reached)")
-                return "Self-check: skipped (limit reached)"
+                return _cap_self_check_output(
+                    "Self-check: skipped (limit reached)\n"
+                    "[evidence: NONE]\n"
+                    "Reason: validation call budget exceeded (max 4 calls per subgoal attempt).\n"
+                    "(advisory feedback only; authoritative Tier 0 gating runs in node_gate)"
+                )
 
             if implementation_root is None:
                 self_check_outcomes.append("failed")
-                return "Self-check: failed\nReason: implementation worktree is unavailable."
+                return _cap_self_check_output(
+                    "Self-check: failed\n"
+                    "[evidence: NONE]\n"
+                    "Reason: implementation worktree is unavailable.\n"
+                    "(advisory feedback only; authoritative Tier 0 gating runs in node_gate)"
+                )
 
             scope_paths = {
                 Path(scope_path).as_posix().lstrip("./")
@@ -2603,7 +2613,7 @@ def node_implement(
                 if scope_paths and not _path_in_declared_scope(normalized):
                     self_check_outcomes.append("failed")
                     return _cap_self_check_output(
-                        f"Self-check: failed\nReason: path '{raw_path}' is outside declared scope."
+                        f"Self-check: failed\n[evidence: NONE]\nReason: path '{raw_path}' is outside declared scope.\n(advisory feedback only; authoritative Tier 0 gating runs in node_gate)"
                     )
                 target = (implementation_root / normalized).resolve()
                 try:
@@ -2611,7 +2621,7 @@ def node_implement(
                 except ValueError:
                     self_check_outcomes.append("failed")
                     return _cap_self_check_output(
-                        f"Self-check: failed\nReason: path '{raw_path}' escapes the implementation worktree."
+                        f"Self-check: failed\n[evidence: NONE]\nReason: path '{raw_path}' escapes the implementation worktree.\n(advisory feedback only; authoritative Tier 0 gating runs in node_gate)"
                     )
 
             safe_python_files = sorted(set(
@@ -2657,18 +2667,22 @@ def node_implement(
                         if is_new_error:
                             output = "\n".join(part for part in (completed.stdout, completed.stderr) if part).strip()
                             python_syntax_error = (
-                                f"Self-check: failed\nCheck: Python syntax\nFiles: {', '.join(safe_python_files)}"
+                                f"Self-check: failed\n[evidence: NAMED]\nCheck: Python syntax\nFiles: {', '.join(safe_python_files)}"
                                 + (f"\nDiagnostics:\n{output}" if output else "")
+                                + "\n(advisory feedback only; authoritative Tier 0 gating runs in node_gate)"
                             )
                 except subprocess.TimeoutExpired:
                     self_check_outcomes.append("timeout")
                     return _cap_self_check_output(
-                        f"Self-check: timeout after 120 seconds\n"
-                        f"Check: Python syntax ({', '.join(safe_python_files)})"
+                        f"Self-check: timeout after 120 seconds\n[evidence: NONE]\n"
+                        f"Check: Python syntax ({', '.join(safe_python_files)})\n"
+                        "(advisory feedback only; authoritative Tier 0 gating runs in node_gate)"
                     )
                 except Exception as exc:
                     self_check_outcomes.append("failed")
-                    return _cap_self_check_output(f"Self-check: failed\nReason: {type(exc).__name__}")
+                    return _cap_self_check_output(
+                        f"Self-check: failed\n[evidence: NONE]\nReason: {type(exc).__name__}\n(advisory feedback only; authoritative Tier 0 gating runs in node_gate)"
+                    )
 
             if python_syntax_error is not None:
                 self_check_outcomes.append("failed")
@@ -2692,15 +2706,17 @@ def node_implement(
                 if safe_python_files:
                     self_check_outcomes.append("passed")
                     return _cap_self_check_output(
-                        f"Self-check: passed\nCheck: Python syntax\nFiles: {', '.join(safe_python_files)}"
+                        f"Self-check: passed\n[evidence: EXIT_ONLY]\nCheck: Python syntax\nFiles: {', '.join(safe_python_files)}\n(advisory feedback only; authoritative Tier 0 gating runs in node_gate)"
                     )
                 self_check_outcomes.append("skipped")
-                return "Self-check: skipped\nReason: no changed files require a compile or syntax check."
+                return _cap_self_check_output(
+                    "Self-check: skipped\n[evidence: NONE]\nReason: no changed files require a compile or syntax check.\n(advisory feedback only; authoritative Tier 0 gating runs in node_gate)"
+                )
 
             if matched_handler.name == "python" and safe_python_files:
                 self_check_outcomes.append("passed")
                 return _cap_self_check_output(
-                    f"Self-check: passed\nCheck: Python syntax\nFiles: {', '.join(safe_python_files)}"
+                    f"Self-check: passed\n[evidence: EXIT_ONLY]\nCheck: Python syntax\nFiles: {', '.join(safe_python_files)}\n(advisory feedback only; authoritative Tier 0 gating runs in node_gate)"
                 )
 
             # Call workspace.check_compile
@@ -2708,7 +2724,9 @@ def node_implement(
                 compile_res = workspace.check_compile(scope=candidates, base_commit=commit_ref)
             except Exception as exc:
                 self_check_outcomes.append("skipped")
-                return f"Self-check: skipped\nReason: {exc}"
+                return _cap_self_check_output(
+                    f"Self-check: skipped\n[evidence: NONE]\nReason: {exc}\n(advisory feedback only; authoritative Tier 0 gating runs in node_gate)"
+                )
             finally:
                 if hasattr(workspace, "discard_engine_touched"):
                     workspace.discard_engine_touched()
@@ -2723,24 +2741,44 @@ def node_implement(
             new_errors = compile_res.get("new_errors") or []
             ecosystem = compile_res.get("ecosystem") or matched_handler.name
 
+            hints = []
+            diag_text = f"{compile_res.get('output_tail', '')}\n{compile_res.get('stdout_tail', '')}\n{compile_res.get('stderr_tail', '')}".strip()
+            if diag_text and hasattr(Workspace, "parse_diagnostics"):
+                diag_errs = Workspace.parse_diagnostics(diag_text, implementation_root)
+                for de in diag_errs:
+                    if de.file and de.line:
+                        col_part = f":{de.column}" if de.column else ""
+                        code_part = f" [{de.code}]" if de.code else ""
+                        hints.append(f"{de.file}:{de.line}{col_part}:{code_part} {de.message}")
+
             if c_outcome == CompileOutcome.PASSED.value:
                 self_check_outcomes.append("passed")
-                return _cap_self_check_output(f"Self-check: passed\nCheck: {ecosystem} compile\nDetail: {detail}")
+                return _cap_self_check_output(
+                    f"Self-check: passed\n[evidence: EXIT_ONLY]\nCheck: {ecosystem} compile\nDetail: {detail}\n(advisory feedback only; authoritative Tier 0 gating runs in node_gate)"
+                )
             elif c_outcome == CompileOutcome.FAILED.value:
                 self_check_outcomes.append("failed")
-                err_lines = [f"Self-check: failed\nCheck: {ecosystem} compile\nDetail: {detail}"]
+                ev_level = "NAMED" if (new_errors or hints) else "EXIT_ONLY"
+                err_lines = [f"Self-check: failed\n[evidence: {ev_level}]\nCheck: {ecosystem} compile\nDetail: {detail}"]
                 if new_errors:
                     err_lines.append("Errors:\n" + "\n".join(new_errors))
                 elif compile_res.get("output_tail"):
                     err_lines.append(f"Diagnostics:\n{compile_res.get('output_tail')}")
+                if hints:
+                    err_lines.append("Source location hints (non-authoritative):\n" + "\n".join(f"  {h}" for h in hints[:10]))
+                err_lines.append("(advisory feedback only; authoritative Tier 0 gating runs in node_gate)")
                 return _cap_self_check_output("\n".join(err_lines))
             elif c_outcome in (CompileOutcome.EXEMPT.value, CompileOutcome.NO_COMPILE_COMMAND.value, CompileOutcome.ENV_NOT_READY.value):
                 self_check_outcomes.append("skipped")
                 reason = detail or "compile check not applicable"
-                return _cap_self_check_output(f"Self-check: skipped\nReason: {reason}")
+                return _cap_self_check_output(
+                    f"Self-check: skipped\n[evidence: NONE]\nReason: {reason}\n(advisory feedback only; authoritative Tier 0 gating runs in node_gate)"
+                )
             else:
                 self_check_outcomes.append("skipped")
-                return _cap_self_check_output(f"Self-check: skipped\nReason: {detail}")
+                return _cap_self_check_output(
+                    f"Self-check: skipped\n[evidence: NONE]\nReason: {detail}\n(advisory feedback only; authoritative Tier 0 gating runs in node_gate)"
+                )
 
         @tool
         def validate_changes(paths: Optional[List[str]] = None) -> str:

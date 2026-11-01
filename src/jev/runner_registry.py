@@ -416,6 +416,72 @@ def resolve_from_registry(
     return _build_cmd(profile.runner, list(profile.test_argv_template), source_marker)
 
 
+def resolve_build_command(
+    wt: Union[str, Path],
+    registry: Optional[RunnerRegistry] = None,
+) -> ResolvedCommand:
+    """Pure manifest and marker detection to resolve an engine-selected build/typecheck command.
+
+    Accepts only engine-selected registry or config commands (no shell).
+    For profiles without a build/typecheck command, returns command=None with a clear skipped reason.
+    Runs NO subprocess.
+    """
+    wt = Path(wt)
+    if registry is None:
+        registry = load_registry()
+    reg_ver = registry.registry_version
+
+    resolved = resolve_from_registry(wt, registry)
+    pid = resolved.runner_profile_id
+    if not pid:
+        if (wt / "bunfig.toml").exists() or (wt / "bun.lockb").exists() or (wt / "bun.lock").exists():
+            pid = "bun-test"
+        elif (wt / "tsconfig.json").exists():
+            pid = "vitest"
+
+    if not pid:
+        return ResolvedCommand(
+            ecosystem=None,
+            command=None,
+            source="none",
+            reason="No runner profile detected; validation skipped.",
+            runner_profile_id=None,
+            registry_version=reg_ver,
+        )
+
+    profile = registry.get_profile(pid)
+    if profile and profile.build_argv_template:
+        return ResolvedCommand(
+            ecosystem=profile.language,
+            command=list(profile.build_argv_template),
+            source=profile.profile_id,
+            reason="Profile build command template",
+            runner_profile_id=profile.profile_id,
+            registry_version=reg_ver,
+        )
+
+    if pid == "bun-test" or (profile and profile.language == "typescript"):
+        if (wt / "tsconfig.json").exists() or (wt / "package.json").exists():
+            cmd = ["bun", "x", "tsc", "--noEmit"] if pid == "bun-test" else ["tsc", "--noEmit"]
+            return ResolvedCommand(
+                ecosystem="typescript",
+                command=cmd,
+                source=pid,
+                reason="TypeScript typecheck command template",
+                runner_profile_id=pid,
+                registry_version=reg_ver,
+            )
+
+    return ResolvedCommand(
+        ecosystem=profile.language if profile else None,
+        command=None,
+        source=pid,
+        reason=f"Profile '{pid}' has no build or typecheck command configured; validation skipped.",
+        runner_profile_id=pid,
+        registry_version=reg_ver,
+    )
+
+
 def build_targeted_command(
     profile: Optional[RunnerProfile],
     base_command: List[str],
