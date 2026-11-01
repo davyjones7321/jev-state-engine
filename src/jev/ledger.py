@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import subprocess
 from datetime import datetime, timedelta, timezone
@@ -31,11 +32,36 @@ def _compute_rates(measured: int, eligible: int, total: int) -> Tuple[Optional[f
     return rate_all, rate_eligible
 
 
+REASONING_KEYS = {"cot", "chain_of_thought", "reasoning_trace", "hidden_reasoning"}
+THINK_TAG_PATTERN = re.compile(r"(?s)<think>.*?(?:</think>|\Z)", re.IGNORECASE)
+
+
+def strip_raw_reasoning(text: str) -> str:
+    """Strip <think> blocks and reasoning trace markers from text."""
+    if not text:
+        return text
+    return THINK_TAG_PATTERN.sub("", text).strip()
+
+
+def exclude_raw_reasoning_data(data: Any) -> Any:
+    """Recursively exclude raw reasoning keys and strip <think> content from data structures."""
+    if isinstance(data, dict):
+        return {k: exclude_raw_reasoning_data(v) for k, v in data.items() if str(k).lower() not in REASONING_KEYS}
+    elif isinstance(data, (list, tuple)):
+        return [exclude_raw_reasoning_data(item) for item in data]
+    elif isinstance(data, str):
+        return strip_raw_reasoning(data)
+    return data
+
+
 def _bounded_text(value: Any, limit: int = MAX_EVIDENCE_CHARS) -> Optional[str]:
-    """Serialize evidence without allowing one diagnostic to consume the ledger."""
+    """Serialize evidence without allowing one diagnostic to consume the ledger, redacting secrets and excluding raw reasoning."""
     if value is None:
         return None
-    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+    from jev.proposals import redact_secrets_in_text
+    clean_val = exclude_raw_reasoning_data(value)
+    text = clean_val if isinstance(clean_val, str) else json.dumps(clean_val, ensure_ascii=False, default=str)
+    text = redact_secrets_in_text(strip_raw_reasoning(text))
     return text if len(text) <= limit else text[:limit] + "\n[truncated]"
 
 
@@ -565,6 +591,8 @@ class SqliteLedger:
         self_check_evidence: Optional[Any] = None,
         hypothesis_change: Optional[Any] = None,
     ) -> None:
+        from jev.proposals import redact_secrets_in_text
+        ticket = redact_secrets_in_text(strip_raw_reasoning(ticket))
         start_time = started_at or datetime.now(timezone.utc).isoformat()
         if not isinstance(dep_delta_jev, str):
             dep_delta_jev = "off"
@@ -781,6 +809,12 @@ class SqliteLedger:
         mech_evidence: Optional[MechanicalEvidence] = None,
         unverified_kind: Optional[str] = None,
     ) -> None:
+        from jev.proposals import redact_secrets_in_text
+        diff = redact_secrets_in_text(strip_raw_reasoning(diff))
+        if feedback_sent:
+            feedback_sent = redact_secrets_in_text(strip_raw_reasoning(feedback_sent))
+        if jev_raw:
+            jev_raw = redact_secrets_in_text(strip_raw_reasoning(jev_raw))
         now_ts = created_at or datetime.now(timezone.utc).isoformat()
         if not isinstance(jev_state_keys, str):
             jev_state_keys = None

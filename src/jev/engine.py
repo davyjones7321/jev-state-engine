@@ -35,7 +35,8 @@ from jev.dependency_delta import compute_dependency_delta
 from jev.advisory import AdvisoryErrorCode, AdvisoryRequest, AdvisoryResult, RepairBrief
 from jev.evidence import evidence_level
 from jev.ledger import NullRecorder, Recorder
-from jev.retrieval import AstWorkspaceRetriever, RetrievalLimits
+from jev.retrieval import AstWorkspaceRetriever, RetrievalLimits, is_secret_path
+from jev.proposals import redact_secrets_in_text, redact_data_structure
 from jev.replanning import replan_remaining_queue
 from jev.mech_evidence import (
     BaseStatus,
@@ -72,17 +73,26 @@ MAX_IMPLEMENT_RETRIEVAL_FILES = 100
 MAX_IMPLEMENT_RETRIEVAL_ITEMS = 200
 SELF_CHECK_TIMEOUT_SECONDS = 5
 
-def is_secret_path(p: Union[str, Path]) -> bool:
-    path_obj = Path(p)
-    name = path_obj.name.lower()
-    parts = [part.lower() for part in path_obj.parts]
-    if any(part in (".aws", ".kube", ".ssh") for part in parts):
-        return True
-    if name.startswith(".env") or name in ("credentials.json", "secrets.json", "id_rsa", "id_dsa", "id_ed25519"):
-        return True
-    if name.endswith((".pem", ".key", ".pfx", ".p12", ".pkcs12")):
-        return True
-    return False
+REASONING_KEYS = {"cot", "chain_of_thought", "reasoning_trace", "hidden_reasoning"}
+THINK_TAG_PATTERN = re.compile(r"(?s)<think>.*?(?:</think>|\Z)", re.IGNORECASE)
+
+
+def strip_raw_reasoning(text: str) -> str:
+    """Strip <think> blocks and reasoning trace markers from text."""
+    if not text:
+        return text
+    return THINK_TAG_PATTERN.sub("", text).strip()
+
+
+def exclude_raw_reasoning_data(data: Any) -> Any:
+    """Recursively exclude raw reasoning keys and strip <think> content from data structures."""
+    if isinstance(data, dict):
+        return {k: exclude_raw_reasoning_data(v) for k, v in data.items() if str(k).lower() not in REASONING_KEYS}
+    elif isinstance(data, (list, tuple)):
+        return [exclude_raw_reasoning_data(item) for item in data]
+    elif isinstance(data, str):
+        return strip_raw_reasoning(data)
+    return data
 
 MAX_SELF_CHECK_OUTPUT_CHARS = 4_000
 
@@ -621,8 +631,9 @@ def _invoke_advisory(advisory: Optional[Any], evidence: Dict[str, Any]) -> Dict[
     if getattr(advisory, "enabled", True) is False:
         return {"status": "disabled", "result": None}
 
-    packet = {key: value for key, value in evidence.items() if key != "output_excerpt"}
-    packet["output_excerpt"] = _cap_self_check_output(str(evidence.get("output_excerpt", "")))
+    clean_evidence = redact_data_structure(exclude_raw_reasoning_data(evidence))
+    packet = {key: value for key, value in clean_evidence.items() if key != "output_excerpt"}
+    packet["output_excerpt"] = _cap_self_check_output(str(clean_evidence.get("output_excerpt", "")))
     try:
         serialized_packet = json.dumps(packet, sort_keys=True)
         request = AdvisoryRequest(
@@ -1436,6 +1447,8 @@ def node_investigate(
         Args:
             path: Directory path to list, defaults to "." (repository root).
         """
+        if is_secret_path(path):
+            return f"Error: Access denied to protected secret path: {path}"
         if hasattr(workspace, "list_dir"):
             try:
                 return str(workspace.list_dir(path))
@@ -1458,7 +1471,7 @@ def node_investigate(
         ignore_names = {".git", "__pycache__", ".pytest_cache", ".venv", "venv", ".mypy_cache"}
         entries = []
         for child in sorted(target.iterdir()):
-            if child.name in ignore_names:
+            if child.name in ignore_names or is_secret_path(child):
                 continue
             entries.append(f"{child.name}/" if child.is_dir() else child.name)
         return "\n".join(entries) if entries else "(empty directory)"
@@ -1480,6 +1493,8 @@ def node_investigate(
         search_target = base
 
         if path:
+            if is_secret_path(path):
+                return f"Error: Access denied to protected secret path: {path}"
             target = (base / path).resolve() if not Path(path).is_absolute() else Path(path).resolve()
             try:
                 safe_rel_path = target.relative_to(base).as_posix()
@@ -1517,7 +1532,7 @@ def node_investigate(
         ignore_dirs = {".git", "__pycache__", ".pytest_cache", ".venv", "venv", ".mypy_cache"}
         target_files = [search_target] if search_target.is_file() else [
             p for p in search_target.rglob("*")
-            if p.is_file() and not any(part in ignore_dirs for part in p.parts)
+            if p.is_file() and not any(part in ignore_dirs for part in p.parts) and not is_secret_path(p)
         ]
         matches = []
         for f in target_files:
@@ -1555,6 +1570,8 @@ def node_investigate(
                 target.relative_to(base)
             except ValueError:
                 return f"Error: Access denied for path outside workspace: {path}"
+            if is_secret_path(target):
+                return f"Error: Access denied to protected secret file: {path}"
 
         if workspace is not None and hasattr(workspace, "run_read_tool"):
             try:
@@ -2526,12 +2543,16 @@ def node_implement(
                 return None, "Workspace unavailable; read tools require a worktree."
             if not path:
                 path = "."
+            if is_secret_path(path):
+                return None, f"Error: Access denied to protected secret file: {path}"
             candidate = Path(path)
             target = (implementation_root / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
             try:
                 target.relative_to(implementation_root)
             except ValueError:
                 return None, f"Error: Access denied for path outside workspace: {path}"
+            if is_secret_path(target):
+                return None, f"Error: Access denied to protected secret file: {path}"
             if not target.exists():
                 return None, f"Path not found: {path}"
             if expect_directory is True and not target.is_dir():
@@ -2794,6 +2815,8 @@ def node_implement(
             budget_error = _consume_implementation_read_budget("list_dir")
             if budget_error:
                 return budget_error
+            if is_secret_path(path):
+                return f"Error: Access denied to protected secret file: {path}"
             target, error = _resolve_implementation_read_path(path, expect_directory=True)
             if target is None:
                 return error
@@ -2802,7 +2825,7 @@ def node_implement(
                 entries = [
                     f"{child.name}/" if child.is_dir() else child.name
                     for child in sorted(target.iterdir())
-                    if child.name not in ignored
+                    if child.name not in ignored and not is_secret_path(child)
                 ]
                 return _cap_implementation_output("\n".join(entries) if entries else "(empty directory)")
             except OSError as exc:
@@ -2842,7 +2865,7 @@ def node_implement(
             ignored = {".git", "__pycache__", ".pytest_cache", ".venv", "venv", ".mypy_cache"}
             files = [target] if target.is_file() else [
                 item for item in target.rglob("*")
-                if item.is_file() and not any(part in ignored for part in item.relative_to(implementation_root).parts)
+                if item.is_file() and not any(part in ignored for part in item.relative_to(implementation_root).parts) and not is_secret_path(item)
             ]
             matches: List[str] = []
             for item in files:
@@ -2877,6 +2900,8 @@ def node_implement(
             if budget_error:
                 return budget_error
             requested_path = path or "."
+            if is_secret_path(requested_path):
+                return f"Error: Access denied to protected secret file: {requested_path}"
             target, error = _resolve_implementation_read_path(requested_path)
             if target is None:
                 return error
@@ -3110,7 +3135,7 @@ def node_implement(
             "6. Call `validate_changes` to type-check and validate your staged files before calling `submit_subgoal`. It provides bounded, read-only diagnostics on your changes (advisory only; it never replaces authoritative Tier 0).\n"
             "7. When all changes are staged and you are done, call the `submit_subgoal` tool to submit your work for gate verification."
         )
-        prompt_text = "\n\n".join(prompt_lines)
+        prompt_text = strip_raw_reasoning(redact_secrets_in_text("\n\n".join(prompt_lines)))
 
         messages: List[Any] = [HumanMessage(content=prompt_text)]
         bound_llm = llm.bind_tools(tools)

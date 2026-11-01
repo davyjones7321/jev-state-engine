@@ -95,6 +95,19 @@ jobs:
           cat verify_report_${{ matrix.os }}.txt
         shell: bash
 
+      - name: Clean Environment Check (fresh venv, install requirements, pytest --collect-only)
+        run: |
+          python -m venv clean_env
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            source clean_env/Scripts/activate
+          else
+            source clean_env/bin/activate
+          fi
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pytest --collect-only
+        shell: bash
+
       - name: Upload Verification Report Artifact
         uses: actions/upload-artifact@v4
         with:

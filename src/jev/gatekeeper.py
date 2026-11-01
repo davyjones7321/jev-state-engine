@@ -9,6 +9,7 @@ import httpx
 from dotenv import dotenv_values
 
 from jev.models import Subgoal, ValidationVerdict
+from jev.proposals import redact_data_structure
 
 logger = logging.getLogger(__name__)
 
@@ -25,9 +26,9 @@ class Gatekeeper:
         backoff_factor: float = 0.5,
         timeout: float = 30.0,
     ):
-        self.env_file = Path(env_file) if env_file is not None else Path(".env")
+        self.env_file = Path(env_file) if env_file is not None else None
         env_dict: Dict[str, str] = {}
-        if self.env_file.exists():
+        if self.env_file is not None and self.env_file.exists():
             parsed = dotenv_values(self.env_file)
             env_dict = {k: v for k, v in parsed.items() if v is not None}
 
@@ -65,9 +66,10 @@ class Gatekeeper:
         last_exception = None
         for attempt in range(self.max_retries):
             try:
+                redacted_payload = redact_data_structure(payload)
                 response = self.client.post(
                     self.api_url,
-                    json=payload,
+                    json=redacted_payload,
                     headers=headers,
                 )
             except httpx.TransportError as exc:
@@ -480,17 +482,18 @@ class Gatekeeper:
         if thread_id:
             content["thread_id"] = thread_id
 
+        redacted_content = redact_data_structure(content)
         # Write to $JEV_HOME/runs/<thread_id>/escalation.json
         jev_home_dir = Path(os.environ.get("JEV_HOME", Path.home() / ".jev")).expanduser().resolve()
         if thread_id:
             run_dir = jev_home_dir / "runs" / thread_id
             run_dir.mkdir(parents=True, exist_ok=True)
             run_file = run_dir / "escalation.json"
-            run_file.write_text(json.dumps(content, indent=2, default=str), encoding="utf-8")
+            run_file.write_text(json.dumps(redacted_content, indent=2, default=str), encoding="utf-8")
 
         # Also write to local log_path (e.g. escalation.log) for backwards compatibility
         log_file = Path(log_path)
         try:
-            log_file.write_text(json.dumps(content, indent=2, default=str), encoding="utf-8")
+            log_file.write_text(json.dumps(redacted_content, indent=2, default=str), encoding="utf-8")
         except Exception:
             pass

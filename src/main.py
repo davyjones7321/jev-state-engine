@@ -12,7 +12,7 @@ from jev.evidence import format_evidence_summary
 from jev.gatekeeper import Gatekeeper
 from jev.ledger import NullRecorder, SqliteLedger
 from jev.advisory import AdvisoryService
-from jev.providers import OpenAICompatibleProvider
+from jev.providers import OpenAICompatibleProvider, validate_advisory_timeout
 from jev.workspace import Workspace
 
 

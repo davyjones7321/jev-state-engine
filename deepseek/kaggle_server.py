@@ -1,19 +1,27 @@
 # ==============================================================================
 # All-In-One Kaggle Setup: DeepSeek-R1-Distill-Qwen-7B + FastAPI + Cloudflare
 # ==============================================================================
+import json
 import os
 import re
 import subprocess
 import sys
 import time
+from typing import Any, Dict, List, Optional, Union
 
 print(">>> [1/5] Installing dependencies & cloudflared...")
 # Ensure clean PyTorch/CUDA environment
-subprocess.run(["pip", "install", "-q", "fastapi", "uvicorn", "bitsandbytes", "accelerate", "transformers", "pydantic"], check=True)
+subprocess.run(
+    ["pip", "install", "-q", "fastapi", "uvicorn", "bitsandbytes", "accelerate", "transformers", "pydantic"],
+    check=True,
+)
 
 # Download cloudflared binary if not present
 if not os.path.exists("cloudflared"):
-    subprocess.run(["wget", "-q", "-nc", "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64", "-O", "cloudflared"], check=True)
+    subprocess.run(
+        ["wget", "-q", "-nc", "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64", "-O", "cloudflared"],
+        check=True,
+    )
     subprocess.run(["chmod", "+x", "cloudflared"], check=True)
 
 print(">>> [2/5] Loading DeepSeek-R1-Distill-Qwen-7B (4-bit NF4 on Tesla T4)...")
@@ -38,117 +46,123 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 
 print(">>> [3/5] Setting up FastAPI Server...")
-from fastapi import FastAPI
-from pydantic import BaseModel
-from typing import Optional, List, Union
-import json
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
 
-app = FastAPI(title="DeepSeek-R1 Gatekeeper Server")
+app = FastAPI(title="DeepSeek-R1 OpenAI-Compatible Advisory Server")
 
-class ValidationRequest(BaseModel):
-    ticket: Optional[str] = None
-    subgoal: Optional[str] = None
-    scope: Optional[Union[str, List[str]]] = None
-    diff: str = ""
-    mechanical_detail: Optional[str] = ""
-    investigation_notes: Optional[str] = ""
-    is_final_verification: bool = False
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class ChatCompletionRequest(BaseModel):
+    model: str = MODEL_ID
+    messages: List[ChatMessage]
+    temperature: Optional[float] = 0.6
+    max_tokens: Optional[int] = None
+    response_format: Optional[Dict[str, Any]] = None
+
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "model": MODEL_ID, "gpu": torch.cuda.get_device_name(0)}
+    return {
+        "status": "healthy",
+        "model": MODEL_ID,
+        "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
+    }
 
-@app.post("/validate")
-def validate(req: ValidationRequest):
+
+@app.post("/chat/completions")
+def chat_completions(req: ChatCompletionRequest):
     t0 = time.time()
-    target_desc = req.ticket if req.is_final_verification else req.subgoal
-    target_type = "Final Ticket Verification" if req.is_final_verification else "Subgoal Validation"
-    scope_str = ", ".join(req.scope) if isinstance(req.scope, list) else (req.scope or "Not specified")
-    
-    prompt = (
-        "You are an authoritative code gatekeeper and semantic diff validator.\n"
-        "Evaluate whether the code changes (git diff) satisfy the target task without violating quality or safety constraints.\n\n"
-        f"Target ({target_type}): {target_desc}\n"
-        f"Scope: {req.scope or 'Not specified'}\n"
-        f"Mechanical/Test Output: {req.mechanical_detail or 'None'}\n"
-        f"Investigation Notes: {req.investigation_notes or 'None'}\n\n"
-        "Git Diff:\n"
-        "```diff\n"
-        f"{req.diff}\n"
-        "```\n\n"
-        "Instructions:\n"
-        "1. Reason step-by-step inside <think> tags. Check if the diff actually implements the required behavior, has syntax errors, misses imports, or is completely empty.\n"
-        "2. At the end of your response, provide your verdict in a JSON code block with the exact keys:\n"
-        "```json\n"
-        "{\n"
-        '  "valid": true or false,\n'
-        '  "probability": float between 0.0 and 1.0,\n'
-        '  "violations": ["list of strings if any"],\n'
-        '  "reason": "concise explanation"\n'
-        "}\n"
-        "```"
-    )
 
-    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+    # Format messages into conversation prompt
+    if hasattr(tokenizer, "apply_chat_template"):
+        formatted_messages = [{"role": m.role, "content": m.content} for m in req.messages]
+        try:
+            prompt = tokenizer.apply_chat_template(
+                formatted_messages, tokenize=False, add_generation_prompt=True
+            )
+        except Exception:
+            prompt = "\n\n".join(f"{m.role.upper()}:\n{m.content}" for m in req.messages) + "\n\nASSISTANT:\n"
+    else:
+        prompt = "\n\n".join(f"{m.role.upper()}:\n{m.content}" for m in req.messages) + "\n\nASSISTANT:\n"
+
+    inputs = tokenizer(prompt, return_tensors="pt")
+    if torch.cuda.is_available():
+        inputs = inputs.to("cuda")
+
     with torch.no_grad():
         output_ids = model.generate(
             **inputs,
-            max_new_tokens=1024,
-            temperature=0.6,
+            max_new_tokens=800,
+            temperature=req.temperature if req.temperature is not None else 0.6,
             top_p=0.95,
             do_sample=True,
         )
-    
-    raw_response = tokenizer.decode(output_ids[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
-    duration_ms = (time.time() - t0) * 1000
 
-    # Extract CoT thinking
-    cot = ""
-    if "<think>" in raw_response and "</think>" in raw_response:
-        cot = raw_response.split("<think>")[1].split("</think>")[0].strip()
-    elif "</think>" in raw_response:
-        cot = raw_response.split("</think>")[0].strip()
+    raw_response = tokenizer.decode(
+        output_ids[0][inputs.input_ids.shape[1]:], skip_special_tokens=True
+    )
 
-    # Extract JSON verdict
-    valid = False
-    prob = 0.5
-    violations = []
-    reason = "Failed to parse model verdict"
-    
-    match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw_response, re.DOTALL)
-    if match:
+    # Strip unclosed or closed <think> blocks
+    clean_content = re.sub(r"(?s)<think>.*?(?:</think>|\Z)", "", raw_response).strip()
+
+    # If response format requested JSON, validate strictly and raise HTTP 502 on failure
+    is_json_mode = False
+    if req.response_format:
+        fmt_type = req.response_format.get("type")
+        if fmt_type in ("json_object", "json_schema"):
+            is_json_mode = True
+
+    if is_json_mode or "```json" in clean_content or clean_content.startswith("{"):
+        candidate_json = clean_content
+        if candidate_json.startswith("```"):
+            candidate_json = re.sub(
+                r"^```(?:json)?\s*|\s*```$", "", candidate_json, flags=re.IGNORECASE
+            ).strip()
         try:
-            parsed = json.loads(match.group(1))
-            valid = bool(parsed.get("valid", False))
-            prob = float(parsed.get("probability", 0.7))
-            violations = list(parsed.get("violations", []))
-            reason = str(parsed.get("reason", ""))
-        except Exception:
-            pass
-    else:
-        # Fallback check
-        if '"valid": true' in raw_response.lower():
-            valid = True
-            prob = 0.8
-            reason = "Model approved change"
-        else:
-            reason = raw_response[-200:].strip()
+            json.loads(candidate_json)
+            clean_content = candidate_json
+        except Exception as exc:
+            if is_json_mode:
+                raise HTTPException(
+                    status_code=502, detail=f"Invalid JSON generated by model: {exc}"
+                ) from exc
 
     return {
-        "valid": valid,
-        "probability": prob,
-        "reason": reason,
-        "violations": violations,
-        "cot": cot,
-        "duration_ms": duration_ms
+        "id": f"chatcmpl-{int(time.time() * 1000)}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": req.model or MODEL_ID,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": clean_content,
+                },
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": len(inputs.input_ids[0]),
+            "completion_tokens": len(output_ids[0]) - len(inputs.input_ids[0]),
+            "total_tokens": len(output_ids[0]),
+        },
     }
 
+
 print(">>> [4/5] Launching FastAPI in background...")
-import uvicorn
 import threading
+import uvicorn
+
 
 def run_api():
     uvicorn.run(app, host="127.0.0.1", port=8000, log_level="warning")
+
 
 server_thread = threading.Thread(target=run_api, daemon=True)
 server_thread.start()
@@ -159,7 +173,7 @@ cf_proc = subprocess.Popen(
     ["./cloudflared", "tunnel", "--url", "http://127.0.0.1:8000"],
     stdout=subprocess.PIPE,
     stderr=subprocess.STDOUT,
-    text=True
+    text=True,
 )
 
 public_url = None
@@ -173,10 +187,10 @@ while time.time() - start_time < 30:
         public_url = m.group(0)
         break
 
-print("\n" + "="*70)
+print("\n" + "=" * 70)
 if public_url:
     print(f"🚀 YOUR LIVE DEEPSEEK-R1 ENDPOINT IS:\n\n   {public_url}\n")
-    print("="*70)
+    print("=" * 70)
 else:
     print("❌ Tunnel timed out. Check Kaggle internet connection.")
 

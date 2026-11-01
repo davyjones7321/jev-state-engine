@@ -98,15 +98,51 @@ class StructureRetriever(Protocol):
 ReadText = Callable[[Path], str]
 
 
+SECRET_DENYLIST_PARTS = {".aws", ".kube", ".ssh"}
+SECRET_DENYLIST_NAMES = {"credentials.json", "secrets.json", "id_rsa", "id_dsa", "id_ed25519"}
+SECRET_DENYLIST_EXTENSIONS = (".pem", ".key", ".pfx", ".p12", ".pkcs12")
+
+
 def is_secret_path(path: str | Path) -> bool:
-    name = Path(path).name.lower()
-    parts = [part.lower() for part in Path(path).parts]
-    if any(part in (".aws", ".kube", ".ssh") for part in parts):
+    """Enforce the secret denylist (.env*, *.pem, *.key, id_rsa, credentials.json, secrets.json, .aws/, .kube/, .ssh/)."""
+    if not path:
+        return False
+    raw = str(path).replace("\\", "/").strip()
+    path_obj = Path(path)
+    name = path_obj.name.lower()
+
+    # Path parts from Path and from posix normalized split
+    parts = {part.lower() for part in path_obj.parts if part}
+    posix_parts = {part.lower() for part in raw.split("/") if part}
+    all_parts = parts | posix_parts
+
+    # Directory patterns: .aws/, .kube/, .ssh/
+    if any(secret_dir in all_parts for secret_dir in SECRET_DENYLIST_PARTS):
         return True
-    if name.startswith(".env") or name in ("credentials.json", "secrets.json", "id_rsa", "id_dsa", "id_ed25519"):
+    for secret_dir in SECRET_DENYLIST_PARTS:
+        if f"/{secret_dir}/" in f"/{raw}/" or raw.startswith(f"{secret_dir}/") or raw == secret_dir:
+            return True
+
+    # .env* (name starts with .env or any path component starts with .env)
+    if name.startswith(".env") or any(part.startswith(".env") for part in all_parts):
         return True
-    if name.endswith((".pem", ".key", ".pfx", ".p12", ".pkcs12")):
+
+    # Exact names: credentials.json, secrets.json, id_rsa, id_dsa, id_ed25519
+    if name in SECRET_DENYLIST_NAMES or any(part in SECRET_DENYLIST_NAMES for part in all_parts):
         return True
+
+    # id_rsa* variants (e.g. id_rsa.pub, id_rsa_backup)
+    if name.startswith(("id_rsa", "id_dsa", "id_ed25519")) or any(
+        part.startswith(("id_rsa", "id_dsa", "id_ed25519")) for part in all_parts
+    ):
+        return True
+
+    # Extensions: *.pem, *.key (and .pfx, .p12, .pkcs12)
+    if name.endswith(SECRET_DENYLIST_EXTENSIONS) or any(
+        part.endswith(SECRET_DENYLIST_EXTENSIONS) for part in all_parts
+    ):
+        return True
+
     return False
 
 
@@ -166,10 +202,14 @@ class AstWorkspaceRetriever:
         files: list[Path] = []
         for base in roots:
             for directory, dir_names, names in os.walk(base, followlinks=False):
-                dir_names[:] = [name for name in dir_names if not (Path(directory) / name).is_symlink()]
+                dir_names[:] = [
+                    name for name in dir_names
+                    if not (Path(directory) / name).is_symlink()
+                    and not is_secret_path(Path(directory) / name)
+                ]
                 for name in names:
                     file_path = Path(directory) / name
-                    if file_path.suffix == ".py" and not file_path.is_symlink():
+                    if file_path.suffix == ".py" and not file_path.is_symlink() and not is_secret_path(file_path):
                         try:
                             if file_path.stat().st_size <= self._limits.max_file_bytes:
                                 relative = file_path.relative_to(self._root)
@@ -182,12 +222,13 @@ class AstWorkspaceRetriever:
         raw = str(path).replace("\\", "/")
         if Path(path).is_absolute() or re.match(r"^[A-Za-z]:", raw) or ".." in raw.split("/"):
             raise ValueError(f"path is outside worktree: {path}")
-        candidate = (self._root / raw.lstrip("./")).resolve()
+        clean_raw = raw[2:] if raw.startswith("./") else (raw[1:] if raw.startswith("/") else raw)
+        candidate = (self._root / clean_raw).resolve()
         try:
             candidate.relative_to(self._root)
         except ValueError as exc:
             raise PermissionError("path resolves outside worktree") from exc
-        if Path(self._root / raw.lstrip("./")).is_symlink():
+        if Path(self._root / clean_raw).is_symlink():
             raise PermissionError("symlink paths are not allowed")
         if is_secret_path(candidate):
             raise PermissionError("access to protected secret files is denied")
@@ -266,5 +307,5 @@ def _item_text(item: object) -> str:
     return f"{item.name} {item.caller or ''} {item.path}"
 
 
-__all__ = ["AstWorkspaceRetriever", "Definition", "Import", "Reference", "RetrievalIssue",
+__all__ = ["AstWorkspaceRetriever", "is_secret_path", "Definition", "Import", "Reference", "RetrievalIssue",
            "RetrievalLimits", "RetrievalResult", "StructureRetriever", "Symbol", "retrieve_workspace"]

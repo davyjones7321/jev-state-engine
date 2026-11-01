@@ -8,17 +8,39 @@ from jev.advisory import (AdvisoryErrorCode, AdvisoryRequest, AdvisoryResult,
                           AdvisoryProvider, _safe_message, parse_repair_brief)
 
 
+import os
+
+
+def validate_advisory_timeout(timeout: Any) -> float:
+    """Validate advisory timeout contract: default 20s, positive number up to 60s max."""
+    if timeout is None:
+        return 20.0
+    try:
+        val = float(timeout)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"ADVISORY_TIMEOUT must be a positive number, got: {timeout}") from exc
+    if val <= 0:
+        raise ValueError(f"ADVISORY_TIMEOUT must be a positive number, got: {val}")
+    if val > 60.0:
+        raise ValueError(f"ADVISORY_TIMEOUT cannot exceed 60.0 seconds, got: {val}")
+    return val
+
+
 class OpenAICompatibleProvider:
     """A minimal adapter for local or remote ``/chat/completions`` endpoints."""
 
     def __init__(self, base_url: str, model: str, *, api_key: Optional[str] = None,
-                 timeout: float = 20.0, client: Optional[httpx.Client] = None):
+                 timeout: Optional[float] = None, client: Optional[httpx.Client] = None):
         if not base_url or not model:
             raise ValueError("base_url and model are required")
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
-        self.timeout = timeout
+        if timeout is None:
+            env_timeout = os.environ.get("ADVISORY_TIMEOUT")
+            self.timeout = validate_advisory_timeout(env_timeout) if env_timeout is not None else 20.0
+        else:
+            self.timeout = validate_advisory_timeout(timeout)
         self._client = client
 
     def advise(self, request: AdvisoryRequest) -> AdvisoryResult:
@@ -72,4 +94,4 @@ class OpenAICompatibleProvider:
                 client.close()
 
 
-__all__ = ["OpenAICompatibleProvider", "AdvisoryProvider"]
+__all__ = ["OpenAICompatibleProvider", "AdvisoryProvider", "validate_advisory_timeout"]

@@ -45,9 +45,12 @@ SECRET_KEY_PATTERNS = re.compile(
 SECRET_VALUE_PATTERNS = [
     re.compile(r"gh[pousr]_[A-Za-z0-9_]{16,}"),  # GitHub personal access tokens
     re.compile(r"sk-[A-Za-z0-9_\-]{20,}"),        # OpenAI / Anthropic API keys
+    re.compile(r"(?i)\b(?:sk|pk)_[a-z0-9_\-]{12,}\b"),  # Stripe / other API keys
     re.compile(r"(?i)bearer\s+([A-Za-z0-9_\-\.]{16,})"),  # Bearer tokens
     re.compile(r"AKIA[0-9A-Z]{16}"),              # AWS Access Key ID
     re.compile(r"https?://([^:]+):([^@]+)@"),     # Embedded basic-auth credentials
+    re.compile(r"""(?i)\b(?:bearer|token|password|passwd|secret|api[-_ ]?key)\s*[:=]\s*[^\s,;"'\}]+"""),
+    re.compile(r"-----BEGIN (?:[A-Z]+ )?PRIVATE KEY-----[\s\S]+?-----END (?:[A-Z]+ )?PRIVATE KEY-----"),
 ]
 
 

@@ -41,6 +41,9 @@ from jev.repo_config import (
     validate_trust,
 )
 
+from jev.retrieval import is_secret_path
+from jev.proposals import redact_secrets_in_text
+
 PROTECTED_PATHS = (".git/", ".jev/")
 
 
@@ -1114,8 +1117,8 @@ class Workspace:
         registry_version: Optional[str] = None,
         script_text: Optional[str] = None,
     ) -> TestOutcome:
-        stdout_tail = stdout[-1000:] if stdout else ""
-        stderr_tail = stderr[-1000:] if stderr else ""
+        stdout_tail = redact_secrets_in_text(stdout[-1000:] if stdout else "")
+        stderr_tail = redact_secrets_in_text(stderr[-1000:] if stderr else "")
         output_tail = stdout_tail
         if stderr_tail:
             output_tail = f"{output_tail}\n[stderr]\n{stderr_tail}".strip() if output_tail else stderr_tail
@@ -1282,14 +1285,20 @@ class Workspace:
         """Resolves path for reading in run_read_tool only.
 
         Enforces strict worktree containment by default via resolve_in_worktree(),
+        blocks all paths matching the secret denylist,
         but allows reads that resolve strictly inside <repo_dir>/node_modules.
         Traversal using '..' (e.g. node_modules/../../x) is strictly blocked.
         """
         import posixpath
+        if is_secret_path(path):
+            raise PermissionError(f"Access denied to protected secret path: {path}")
         raw_str = str(path).strip()
         norm_posix = raw_str.replace("\\", "/")
         try:
-            return self.resolve_in_worktree(path)
+            target = self.resolve_in_worktree(path)
+            if is_secret_path(target):
+                raise PermissionError(f"Access denied to protected secret path: {path}")
+            return target
         except (ValueError, PermissionError) as original_err:
             # A subgoal worktree may expose repository node_modules through a
             # symlink. Keep that read-only exception, but not for absolute or
@@ -1320,6 +1329,9 @@ class Workspace:
     def run_read_tool(self, cmd: str, args: Optional[List[str]] = None) -> str:
         """Executes read-only CLI commands in worktree_dir and returns stdout or stderr."""
         args_list = args or []
+        for arg in args_list:
+            if not arg.startswith("-") and is_secret_path(arg):
+                return f"{cmd}: {arg}: Access denied to protected secret file: {arg}"
         full_cmd = [cmd] + args_list
 
         resolved_target: Optional[Path] = None
@@ -1332,6 +1344,8 @@ class Workspace:
                         resolved_target = self._resolve_for_read(arg)
                         resolved_args.append(str(resolved_target))
                     except (ValueError, PermissionError) as e:
+                        if is_secret_path(arg):
+                            return f"cat: {arg}: Access denied to protected secret file: {arg}"
                         return f"cat: {arg}: Access denied outside workspace: {e}"
                 else:
                     resolved_args.append(arg)
@@ -1395,6 +1409,8 @@ class Workspace:
         if norm_str == "node_modules" or norm_str.startswith("node_modules/"):
             raise PermissionError(f"Modifying files in node_modules is blocked: '{path}'.")
 
+        if is_secret_path(norm_str) or is_secret_path(path):
+            raise PermissionError(f"Modifying protected secret path is blocked: '{path}'.")
         if is_protected_path(norm_str) or is_protected_path(path):
             raise PermissionError(f"Modifying protected path is blocked: '{path}'.")
 
@@ -1413,6 +1429,8 @@ class Workspace:
         if rel_posix == "node_modules" or rel_posix.startswith("node_modules/"):
             raise PermissionError(f"Modifying files in node_modules is blocked: '{path}'.")
 
+        if is_secret_path(rel_posix) or is_secret_path(target_path):
+            raise PermissionError(f"Modifying protected secret path is blocked: '{path}'.")
         if is_protected_path(rel_posix):
             raise PermissionError(f"Modifying protected path is blocked: '{path}'.")
 
@@ -1428,13 +1446,13 @@ class Workspace:
             res = self._run_git(["diff", "HEAD", "--"] + list(self.worker_staged_paths))
             if res.returncode != 0:
                 res = self._run_git(["diff", "--cached", "--"] + list(self.worker_staged_paths))
-            return res.stdout
+            return redact_secrets_in_text(res.stdout)
         if self.strict_provenance:
             return ""
         res = self._run_git(["diff", "HEAD"])
         if res.returncode != 0:
             res = self._run_git(["diff", "--cached"])
-        return res.stdout
+        return redact_secrets_in_text(res.stdout)
 
     def get_cumulative_diff(self, base_ref: Optional[str] = None) -> str:
         """Returns the full cumulative diff since workspace initialization or base_ref (both committed and uncommitted)."""
@@ -1443,14 +1461,14 @@ class Workspace:
             if ref:
                 res = self._run_git(["diff", ref, "--"] + list(self.worker_staged_paths))
                 if res.returncode == 0 and res.stdout.strip():
-                    return res.stdout
+                    return redact_secrets_in_text(res.stdout)
             return self.get_staged_diff()
         if self.strict_provenance:
             return ""
         if ref:
             res = self._run_git(["diff", ref])
             if res.returncode == 0 and res.stdout.strip():
-                return res.stdout
+                return redact_secrets_in_text(res.stdout)
         return self.get_staged_diff()
 
     def get_manifest_changes(
