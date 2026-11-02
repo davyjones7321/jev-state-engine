@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import importlib
 import json
 import logging
 import os
@@ -23,11 +24,15 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
+yaml = importlib.import_module("yaml")
+
 from jev.repo_config import (
+    EXACT_MAKEFILE_TARGETS,
     RepoConfig,
     TrustRecord,
     compute_command_hash,
     compute_repo_id,
+    extract_makefile_target_and_recipe,
     get_trust_file_path,
     load_repo_config,
     normalize_command_argv,
@@ -125,9 +130,10 @@ def compute_proposal_identity_hash(
     env: Optional[Dict[str, str]] = None,
     timeout: int = 600,
     target_rule: Optional[str] = "full_suite",
+    recipe_text: Optional[str] = None,
 ) -> str:
     """Computes a deterministic SHA-256 identity hash for a command proposal."""
-    payload = {
+    payload: Dict[str, Any] = {
         "cwd": str(cwd or "."),
         "env": sorted((env or {}).items()),
         "exact_argv": list(exact_argv),
@@ -136,6 +142,8 @@ def compute_proposal_identity_hash(
         "target_rule": str(target_rule or "full_suite"),
         "timeout": int(timeout),
     }
+    if recipe_text:
+        payload["recipe_text"] = str(recipe_text)
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -159,6 +167,8 @@ class Proposal(BaseModel):
     network_assumptions: Optional[str] = "offline"
     timeout: int = 600
     generated_paths: List[str] = Field(default_factory=list)
+    recipe_lines: List[str] = Field(default_factory=list)
+    recipe_text: Optional[str] = None
     identity_hash: str
     created_at: str
     status: str = "pending"  # "pending", "approved", "rejected"
@@ -175,6 +185,7 @@ class Proposal(BaseModel):
             env=self.environment_variables,
             timeout=self.timeout,
             target_rule=self.target_rule,
+            recipe_text=self.recipe_text,
         )
         if self.identity_hash != expected_hash:
             return False, f"identity_hash mismatch: expected {expected_hash}, got {self.identity_hash}"
@@ -231,6 +242,7 @@ def save_proposal(
         env=proposal.environment_variables,
         timeout=proposal.timeout,
         target_rule=proposal.target_rule,
+        recipe_text=proposal.recipe_text,
     )
 
     pdir = get_proposals_dir(repo_dir)
@@ -277,9 +289,35 @@ def inspect_executable(cmd: Sequence[str]) -> Tuple[Optional[str], Optional[str]
         return None, None
     exe_name = cmd[0]
     exe_path = shutil.which(exe_name)
+    if not exe_path and sys.platform == "win32" and exe_name.lower() in ("make", "make.exe"):
+        exe_path = shutil.which("mingw32-make")
     if not exe_path:
         return None, None
     return exe_path, None
+
+
+INSTALL_STEP_PREFIXES = (
+    "pip install",
+    "python -m pip install",
+    "npm install",
+    "npm i",
+    "npm ci",
+    "yarn install",
+    "yarn add",
+    "pnpm install",
+    "pnpm i",
+    "cargo install",
+    "poetry install",
+    "poetry add",
+    "bundle install",
+    "composer install",
+)
+
+
+def is_install_command_line(cmd_line: str) -> bool:
+    """Returns True if command line is an installation or setup command."""
+    clean = cmd_line.strip()
+    return any(clean.startswith(pfx) for pfx in INSTALL_STEP_PREFIXES)
 
 
 def build_proposal_from_repo(repo_dir: Union[str, Path]) -> Optional[Proposal]:
@@ -293,6 +331,8 @@ def build_proposal_from_repo(repo_dir: Union[str, Path]) -> Optional[Proposal]:
     argv: Optional[List[str]] = None
     source_evidence: Optional[str] = None
     expanded_script: Optional[str] = None
+    recipe_lines: List[str] = []
+    recipe_text: Optional[str] = None
 
     # 1. Makefile / GNUmakefile
     for mf_name in ("Makefile", "GNUmakefile", "makefile"):
@@ -300,12 +340,12 @@ def build_proposal_from_repo(repo_dir: Union[str, Path]) -> Optional[Proposal]:
         if mf_path.exists():
             try:
                 content = mf_path.read_text(encoding="utf-8", errors="replace")
-                # Look for test targets
-                m = re.search(r"^([a-zA-Z0-9_\-]*test[a-zA-Z0-9_\-]*|check)\s*:", content, re.MULTILINE)
-                if m:
-                    target = m.group(1)
+                target, r_lines = extract_makefile_target_and_recipe(content)
+                if target:
                     argv = ["make", target]
                     source_evidence = f"{mf_name} target '{target}'"
+                    recipe_lines = r_lines
+                    recipe_text = "\n".join(r_lines) if r_lines else None
                     break
             except Exception:
                 pass
@@ -317,15 +357,45 @@ def build_proposal_from_repo(repo_dir: Union[str, Path]) -> Optional[Proposal]:
             for wf in sorted(wf_dir.glob("*.y*ml")):
                 try:
                     wf_text = wf.read_text(encoding="utf-8", errors="replace")
-                    # Look for test run commands
-                    m = re.search(r"run:\s*(.+test.+|.+pytest.+|.+check.+)", wf_text)
-                    if m:
-                        step_cmd = m.group(1).strip()
-                        split_cmd = shlex.split(step_cmd, posix=(sys.platform != "win32"))
-                        if split_cmd:
-                            argv = split_cmd
-                            source_evidence = f"CI workflow '{wf.name}' step: '{step_cmd}'"
+                    parsed_wf = yaml.safe_load(wf_text)
+                    if not isinstance(parsed_wf, dict):
+                        continue
+                    jobs = parsed_wf.get("jobs", {})
+                    if not isinstance(jobs, dict):
+                        continue
+                    for job_name, job_data in jobs.items():
+                        if not isinstance(job_data, dict):
+                            continue
+                        steps = job_data.get("steps", [])
+                        if not isinstance(steps, list):
+                            continue
+                        for step in steps:
+                            if not isinstance(step, dict):
+                                continue
+                            run_block = step.get("run")
+                            if not run_block or not isinstance(run_block, str):
+                                continue
+                            block_lines = [
+                                ln.strip()
+                                for ln in run_block.splitlines()
+                                if ln.strip() and not ln.strip().startswith("#")
+                            ]
+                            for line in block_lines:
+                                if is_install_command_line(line):
+                                    continue
+                                line_lower = line.lower()
+                                if any(kw in line_lower for kw in ("test", "pytest", "check", "run-tests")):
+                                    split_cmd = shlex.split(line, posix=(sys.platform != "win32"))
+                                    if split_cmd:
+                                        argv = split_cmd
+                                        source_evidence = f"CI workflow '{wf.name}' step: '{line}'"
+                                        break
+                            if argv:
+                                break
+                        if argv:
                             break
+                    if argv:
+                        break
                 except Exception:
                     pass
 
@@ -371,6 +441,7 @@ def build_proposal_from_repo(repo_dir: Union[str, Path]) -> Optional[Proposal]:
         env={},
         timeout=600,
         target_rule="full_suite",
+        recipe_text=recipe_text,
     )
     prop_id = f"prop-{identity_hash[:12]}"
     now_utc = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -391,6 +462,8 @@ def build_proposal_from_repo(repo_dir: Union[str, Path]) -> Optional[Proposal]:
         network_assumptions="offline",
         timeout=600,
         generated_paths=[],
+        recipe_lines=recipe_lines,
+        recipe_text=recipe_text,
         identity_hash=identity_hash,
         created_at=now_utc,
         status="pending",
@@ -420,6 +493,10 @@ def approve_proposal(
     if not is_valid:
         raise ValueError(f"Cannot approve proposal: {err}")
 
+    recipe_h = None
+    if proposal.recipe_text:
+        recipe_h = hashlib.sha256(proposal.recipe_text.encode("utf-8")).hexdigest()
+
     # Build repo config declaration
     cfg = RepoConfig(
         runner_profile_id="custom",
@@ -427,6 +504,7 @@ def approve_proposal(
         cwd=proposal.cwd or ".",
         target_rule=proposal.target_rule,
         generated_paths=proposal.generated_paths,
+        recipe_hash=recipe_h,
     )
     save_repo_config(cfg, repo)
 
@@ -438,6 +516,7 @@ def approve_proposal(
         executable_path=proposal.tool_path,
         executable_version=proposal.tool_version,
         platform=proposal.platform,
+        recipe_hash=recipe_h,
     )
 
     # Mark proposal as approved
@@ -467,12 +546,21 @@ def format_proposal_screen(proposal: Proposal) -> str:
 
     # Tool path and version
     tool_info = f"{proposal.tool_path or '(not found on PATH)'}"
+    if proposal.tool_path and sys.platform == "win32" and proposal.exact_argv and proposal.exact_argv[0].lower() in ("make", "make.exe"):
+        if "mingw32-make" in proposal.tool_path.lower():
+            tool_info += " (resolved mingw32-make for make on Windows)"
     if proposal.tool_version:
         tool_info += f" [{proposal.tool_version}]"
     lines.append(f"Tool Path/Version:  {tool_info}")
 
     lines.append(f"Target Rule:        {proposal.target_rule}")
     lines.append(f"Scope:              {proposal.scope if proposal.scope else '(entire repository)'}")
+
+    # Makefile Recipe Lines
+    if proposal.recipe_lines:
+        lines.append("\nMakefile Recipe Lines:")
+        for r_line in proposal.recipe_lines:
+            lines.append(f"  {r_line}")
 
     # Environment variables
     env_vars = redact_data_structure(proposal.environment_variables)
@@ -487,6 +575,17 @@ def format_proposal_screen(proposal: Proposal) -> str:
     lines.append(f"Timeout:             {proposal.timeout}s")
     lines.append(f"Generated Paths:     {proposal.generated_paths if proposal.generated_paths else '[]'}")
     lines.append(f"Identity Hash:       {proposal.identity_hash}")
+
+    # Notice for unexpanded CI expressions
+    has_unexpanded = False
+    for arg in proposal.exact_argv:
+        if "${{" in arg:
+            has_unexpanded = True
+            break
+    if not has_unexpanded and proposal.source_evidence and "${{" in proposal.source_evidence:
+        has_unexpanded = True
+    if has_unexpanded:
+        lines.append("\nNOTICE: CI workflow expressions (${{ ... }}) left unexpanded.")
 
     # Exact argv (one argument per line)
     lines.append("\nExact Argv (one argument per line):")

@@ -203,3 +203,70 @@ Single-letter flags `-i`, `-w`, and `-d` have conflicting meanings across tools:
 ### 5. Open Problems
 
 - None. Full offline test suite passed (1029 passed, 24 skipped, 0 failed in 1274.17s).
+
+## Fix 6 (Phase 3b): Show and Bind the Recipe (proposals.py, repo_config.py, process_runner.py)
+
+### 1. What Changed (Files and Lines)
+
+- `requirements.txt`:
+  - Added `pyyaml==6.0.3`.
+- `src/jev/repo_config.py`:
+  - Line 8: Imported `re`.
+  - Lines 303–346: Defined `EXACT_MAKEFILE_TARGETS = ("test", "tests", "check", "run-tests", "test-all")` and implemented `extract_makefile_target_and_recipe(content: str) -> Tuple[Optional[str], List[str]]` which matches only exact target names (so `latest:` is never matched) and extracts indented recipe lines without executing anything.
+  - Lines 362, 383: Added `recipe_hash: Optional[str] = None` to `TrustRecord` and `RepoConfig`.
+  - Lines 411–413: Updated `compute_command_hash` to include `recipe_hash` in its deterministic payload when present.
+  - Lines 450, 481: Updated `record_trust` to accept and record `recipe_hash`.
+  - Lines 540–563: In `validate_trust`, if a recipe hash was bound at approval, extract the current recipe from the repository's Makefile. If the recipe changed or is missing, remove the trust record file under `JEV_HOME` and return `(False, "Makefile recipe changed: approval invalidated")`.
+- `src/jev/proposals.py`:
+  - Lines 24, 32: Imported `yaml` and `extract_makefile_target_and_recipe` / `EXACT_MAKEFILE_TARGETS`.
+  - Lines 131, 143–144: Updated `compute_proposal_identity_hash` to accept optional `recipe_text` and include it in the identity payload.
+  - Lines 168–169: Added `recipe_lines: List[str]` and `recipe_text: Optional[str]` to `Proposal`.
+  - Line 186: Updated `Proposal.verify_identity` to pass `recipe_text=self.recipe_text` to `compute_proposal_identity_hash`.
+  - Line 243: Updated `save_proposal` to recompute identity hash with `recipe_text=proposal.recipe_text`.
+  - Lines 289–292: Updated `inspect_executable` so that on Windows, if `cmd[0]` is `make` and not found on `PATH`, it resolves `mingw32-make`.
+  - Lines 297–319: Defined `INSTALL_STEP_PREFIXES` and `is_install_command_line` to ignore install and setup commands (`pip install`, `npm install`, `npm ci`, `cargo install`, `poetry install`, etc.).
+  - Lines 340–350: Updated Makefile detection in `build_proposal_from_repo` to use `extract_makefile_target_and_recipe`.
+  - Lines 355–404: Updated CI workflow detection in `build_proposal_from_repo` to parse workflows using `yaml.safe_load`, support scalar and `run: |` multi-line blocks, ignore install commands, and leave `${{ ... }}` expressions unexpanded.
+  - Lines 494–517: Updated `approve_proposal` to compute `recipe_hash = sha256(recipe_text)` and record it in `RepoConfig` and `TrustRecord`.
+  - Lines 546–550: In `format_proposal_screen`, show when `mingw32-make` is resolved for `make` on Windows.
+  - Lines 557–562: In `format_proposal_screen`, print extracted Makefile recipe lines under `Makefile Recipe Lines:`.
+  - Lines 577–587: In `format_proposal_screen`, print a notice when CI workflow expressions `${{ ... }}` are left unexpanded.
+- `src/jev/process_runner.py`:
+  - Lines 170–174: In `run_command`, on Windows when `argv_list[0]` is `make` and not on `PATH`, resolve and invoke `mingw32-make`.
+- `tests/test_proposals.py`:
+  - Lines 607–745: Added unit tests:
+    - `test_makefile_latest_before_test_proposes_make_test`: Makefile with `latest:` before `test:` proposes `make test` (never `latest:`).
+    - `test_makefile_recipe_shown_on_approval_screen`: Displays extracted recipe lines on proposal review screen.
+    - `test_editing_recipe_after_approval_invalidates_trust`: Editing Makefile recipe invalidates trust and removes trust file under `JEV_HOME`.
+    - `test_ci_install_line_before_pytest_proposes_pytest`: CI workflow with `pip install` before `pytest` ignores install and proposes `pytest`.
+    - `test_ci_multiline_run_block_extracts_test_command`: CI workflow with multi-line `run: |` block extracts test command and skips install lines.
+    - `test_ci_workflow_expression_left_unexpanded_and_shown_on_screen`: Leaves `${{ ... }}` expressions unexpanded and flags notice on screen.
+    - `test_windows_make_lookup_resolves_mingw32_make`: On Windows, resolves `mingw32-make` when `make` is not on `PATH`.
+
+### 2. How It Works
+
+1. **Makefile Detection & Recipe Extraction**: `extract_makefile_target_and_recipe` only matches exact target names in `("test", "tests", "check", "run-tests", "test-all")`. Targets that happen to contain the word "test" as a substring (such as `latest:`) are ignored. It extracts indented recipe lines without executing them, stores them in `proposal.recipe_lines` and `proposal.recipe_text`, and presents them to the repository owner on the approval screen so they see exactly what commands will be executed.
+2. **Cryptographic Binding & Trust Invalidation**: `compute_proposal_identity_hash` binds `recipe_text` into the proposal's SHA-256 identity hash. Upon owner approval, `recipe_hash` is recorded in `.jev/config.json` and in the external `TrustRecord`. If the Makefile is subsequently tampered with or edited, `validate_trust` detects that the current Makefile recipe hash does not match `rec.recipe_hash`, deletes the external trust record file so trust goes completely stale, and rejects execution with `"Makefile recipe changed: approval invalidated"`.
+3. **CI Workflow Detection with `yaml.safe_load`**: CI workflows in `.github/workflows/*.yml` are parsed securely using `yaml.safe_load`. Both scalar `run:` and multi-line `run: |` blocks are supported. Setup and dependency installation steps (`pip install`, `npm install`, `cargo install`, etc.) are skipped, and test commands (`pytest`, `check`, `test`) are identified. Any workflow expressions like `${{ matrix.python-version }}` are left unexpanded in `exact_argv`, and a disclaimer notice is printed on the review screen.
+4. **Windows Make Resolution**: On Windows systems where GNU `make` is installed as `mingw32-make`, both `inspect_executable` and `process_runner.run_command` fall back to `mingw32-make` when `make` is not directly on `PATH`, and the approval screen notes the resolved binary.
+
+### 3. Rule Enforcement: Enforced by Test vs Only by Prompt
+
+| Rule / Requirement | Enforced By Test | Enforced Only By Prompt | Test Name(s) |
+|---|:---:|:---:|---|
+| Makefile detection matches exact target names (`latest:` before `test:` proposes `make test`) | Yes | No | `test_makefile_latest_before_test_proposes_make_test` |
+| Makefile recipe lines extracted and displayed on approval screen | Yes | No | `test_makefile_recipe_shown_on_approval_screen` |
+| Editing Makefile recipe after approval invalidates trust and removes trust record | Yes | No | `test_editing_recipe_after_approval_invalidates_trust` |
+| CI install steps ignored when proposing test command | Yes | No | `test_ci_install_line_before_pytest_proposes_pytest` |
+| CI multi-line `run: \|` blocks parsed with test command extracted | Yes | No | `test_ci_multiline_run_block_extracts_test_command` |
+| CI `${{ ... }}` expressions left unexpanded and flagged on screen | Yes | No | `test_ci_workflow_expression_left_unexpanded_and_shown_on_screen` |
+| Windows `make` lookup falls back to `mingw32-make` | Yes | No | `test_windows_make_lookup_resolves_mingw32_make` |
+| All existing proposal and repo config tests remain green | Yes | No | `tests/test_proposals.py`, `tests/test_repo_config.py` |
+
+### 4. Unrequested Changes
+
+- None.
+
+### 5. Open Problems
+
+- None. Full offline test suite passed (1036 passed, 24 skipped, 2 deselected, 0 failed in 1135.80s).

@@ -602,3 +602,175 @@ def test_save_proposal_redacts_stored_fields_and_env_vars(tmp_path):
     assert loaded.environment_variables["SAFE_ENV_VAR"] == "safe_value"
 
 
+# ==============================================================================
+# 9. Fix 6: Show and Bind Recipe, Makefile Exact Targets, CI Parsing, Win Make
+# ==============================================================================
+
+def test_makefile_latest_before_test_proposes_make_test(tmp_path):
+    """Makefile with latest: before test: proposes make test, never make latest."""
+    repo = _create_git_repo(tmp_path / "repo_latest_makefile")
+    mf_content = (
+        "latest:\n"
+        "\techo 'building latest'\n\n"
+        "test:\n"
+        "\tpytest -v\n\tflake8 src/\n\n"
+        "all: test\n"
+    )
+    (repo / "Makefile").write_text(mf_content, encoding="utf-8")
+    prop = build_proposal_from_repo(repo)
+    assert prop is not None
+    assert prop.exact_argv == ["make", "test"]
+    assert "test" in prop.source_evidence
+    assert prop.recipe_lines == ["\tpytest -v", "\tflake8 src/"]
+    assert prop.recipe_text == "\tpytest -v\n\tflake8 src/"
+
+
+def test_makefile_recipe_shown_on_approval_screen(tmp_path):
+    """Approval screen displays the extracted recipe lines under the chosen target."""
+    repo = _create_git_repo(tmp_path / "repo_recipe_screen")
+    mf_content = (
+        "test:\n"
+        "\tpytest --verbose tests/\n"
+        "\tpython -m coverage report\n"
+    )
+    (repo / "Makefile").write_text(mf_content, encoding="utf-8")
+    prop = build_proposal_from_repo(repo)
+    assert prop is not None
+    screen = format_proposal_screen(prop)
+    assert "Makefile Recipe Lines:" in screen
+    assert "pytest --verbose tests/" in screen
+    assert "python -m coverage report" in screen
+
+
+def test_editing_recipe_after_approval_invalidates_trust(tmp_path, monkeypatch):
+    """Editing the Makefile recipe after approval makes the trusted config go stale and removes trust."""
+    monkeypatch.setenv("JEV_HOME", str(tmp_path / ".jev_home"))
+    repo = _create_git_repo(tmp_path / "repo_recipe_stale")
+    mf_path = repo / "Makefile"
+    mf_path.write_text("test:\n\tpytest -v\n", encoding="utf-8")
+
+    prop = build_proposal_from_repo(repo)
+    assert prop is not None
+    cfg, trust_rec = approve_proposal(prop, repo)
+
+    # Trust is valid before edit
+    is_valid, err = validate_trust(cfg, repo)
+    assert is_valid is True
+    assert err is None
+
+    # Tamper with recipe in Makefile
+    mf_path.write_text("test:\n\tpytest -v --different-flag\n", encoding="utf-8")
+
+    # validate_trust detects recipe change and invalidates trust (deleting trust file)
+    is_valid, err = validate_trust(cfg, repo)
+    assert is_valid is False
+    assert "Makefile recipe changed: approval invalidated" in err
+
+    # Trust file is now removed (stale)
+    trust_file = get_trust_file_path(compute_repo_id(repo))
+    assert not trust_file.exists()
+
+
+def test_ci_install_line_before_pytest_proposes_pytest(tmp_path):
+    """CI workflow with pip install before pytest ignores install and proposes pytest."""
+    repo = _create_git_repo(tmp_path / "repo_ci_install")
+    wf_dir = repo / ".github" / "workflows"
+    wf_dir.mkdir(parents=True, exist_ok=True)
+    wf_yaml = (
+        "name: CI Test\n"
+        "on: [push]\n"
+        "jobs:\n"
+        "  build-and-test:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - uses: actions/checkout@v4\n"
+        "      - run: pip install pytest-cov\n"
+        "      - run: pytest -v\n"
+    )
+    (wf_dir / "ci.yml").write_text(wf_yaml, encoding="utf-8")
+
+    prop = build_proposal_from_repo(repo)
+    assert prop is not None
+    assert prop.exact_argv == ["pytest", "-v"]
+    assert "pytest" in prop.source_evidence
+
+
+def test_ci_multiline_run_block_extracts_test_command(tmp_path):
+    """CI workflow with multi-line run: | block extracts test command and ignores installs."""
+    repo = _create_git_repo(tmp_path / "repo_ci_multiline")
+    wf_dir = repo / ".github" / "workflows"
+    wf_dir.mkdir(parents=True, exist_ok=True)
+    wf_yaml = (
+        "name: MultiLine CI\n"
+        "on: [pull_request]\n"
+        "jobs:\n"
+        "  test:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: |\n"
+        "          pip install -r requirements.txt\n"
+        "          pip install pytest-cov\n"
+        "          pytest tests/ --cov=src\n"
+    )
+    (wf_dir / "test.yaml").write_text(wf_yaml, encoding="utf-8")
+
+    prop = build_proposal_from_repo(repo)
+    assert prop is not None
+    assert prop.exact_argv == ["pytest", "tests/", "--cov=src"]
+
+
+def test_ci_workflow_expression_left_unexpanded_and_shown_on_screen(tmp_path):
+    """CI ${{ ... }} expressions are left unexpanded in proposal and flagged on screen."""
+    repo = _create_git_repo(tmp_path / "repo_ci_expr")
+    wf_dir = repo / ".github" / "workflows"
+    wf_dir.mkdir(parents=True, exist_ok=True)
+    wf_yaml = (
+        "name: Matrix CI\n"
+        "on: [push]\n"
+        "jobs:\n"
+        "  test:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: pytest --python-version ${{ matrix.python-version }}\n"
+    )
+    (wf_dir / "matrix.yml").write_text(wf_yaml, encoding="utf-8")
+
+    prop = build_proposal_from_repo(repo)
+    assert prop is not None
+    assert "${{" in " ".join(prop.exact_argv)
+    screen = format_proposal_screen(prop)
+    assert "NOTICE: CI workflow expressions (${{ ... }}) left unexpanded." in screen
+
+
+def test_windows_make_lookup_resolves_mingw32_make(tmp_path, monkeypatch):
+    """On Windows, when make is not on PATH, inspect_executable falls back to mingw32-make."""
+    def fake_which(cmd):
+        if cmd in ("make", "make.exe"):
+            return None
+        if cmd == "mingw32-make":
+            return r"C:\msys64\mingw64\bin\mingw32-make.exe"
+        return None
+
+    monkeypatch.setattr(shutil, "which", fake_which)
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    exe_path, exe_ver = inspect_executable(["make", "test"])
+    assert exe_path == r"C:\msys64\mingw64\bin\mingw32-make.exe"
+    assert exe_ver is None
+
+    prop = Proposal(
+        id="prop-win-make",
+        repo_id="repo-1",
+        exact_argv=["make", "test"],
+        cwd=".",
+        source_evidence="Makefile target 'test'",
+        tool_path=exe_path,
+        platform="win32",
+        identity_hash="dummyhash",
+        created_at="2026-11-02T00:00:00Z",
+    )
+    screen = format_proposal_screen(prop)
+    assert "resolved mingw32-make for make on Windows" in screen
+
+
+

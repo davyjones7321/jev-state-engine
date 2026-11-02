@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import posixpath
+import re
 import shlex
 import subprocess
 import sys
@@ -299,6 +300,52 @@ def compute_repo_id(repo_dir: Union[str, Path]) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+EXACT_MAKEFILE_TARGETS = ("test", "tests", "check", "run-tests", "test-all")
+
+
+def extract_makefile_target_and_recipe(
+    content: str,
+) -> Tuple[Optional[str], List[str]]:
+    """Finds exact test target in Makefile and extracts its indented recipe lines without executing."""
+    lines = content.splitlines()
+    target_found: Optional[str] = None
+    target_idx = -1
+
+    target_pattern = re.compile(r"^([a-zA-Z0-9_\-]+)\s*:(?![:=])")
+
+    for i, line in enumerate(lines):
+        m = target_pattern.match(line)
+        if m:
+            candidate = m.group(1).strip()
+            if candidate in EXACT_MAKEFILE_TARGETS:
+                target_found = candidate
+                target_idx = i
+                break
+
+    if not target_found or target_idx == -1:
+        return None, []
+
+    recipe_lines: List[str] = []
+    for line in lines[target_idx + 1:]:
+        stripped = line.strip()
+        if line and not line.startswith(("\t", " ")) and not stripped.startswith("#"):
+            if ":" in line or "=" in line:
+                break
+        if line.startswith(("\t", "    ", "  ")):
+            recipe_lines.append(line.rstrip())
+        elif stripped.startswith("#") and (line.startswith("\t") or line.startswith(" ")):
+            recipe_lines.append(line.rstrip())
+        elif not stripped:
+            recipe_lines.append("")
+        else:
+            break
+
+    while recipe_lines and not recipe_lines[-1].strip():
+        recipe_lines.pop()
+
+    return target_found, recipe_lines
+
+
 class TrustRecord(BaseModel):
     """Schema for a repository trust record stored outside the repo under <JEV_HOME>/trust/<repo_id>.json."""
     repo_id: str
@@ -312,6 +359,7 @@ class TrustRecord(BaseModel):
     executable_version: Optional[str] = None
     approved_at: str
     approved_by: str = "owner"
+    recipe_hash: Optional[str] = None
 
 
 TrustBinding = TrustRecord
@@ -332,6 +380,7 @@ class RepoConfig(BaseModel):
     generated_paths: List[str] = Field(default_factory=list)
     expected_tests_policy: Optional[str] = None
     ignored_embedded_trust: bool = False
+    recipe_hash: Optional[str] = None
 
     @property
     def runner_profile(self) -> Optional[str]:
@@ -353,12 +402,14 @@ def compute_command_hash(config: RepoConfig) -> str:
     """Computes SHA-256 of the declared command fields."""
     test_argv = normalize_command_argv(config.test_command) if config.test_command else []
     build_argv = normalize_command_argv(config.build_command) if config.build_command else []
-    payload = {
+    payload: Dict[str, Any] = {
         "build_command": build_argv,
         "cwd": str(config.cwd or "."),
         "profile_id": str(config.runner_profile_id or ""),
         "test_command": test_argv,
     }
+    if config.recipe_hash:
+        payload["recipe_hash"] = str(config.recipe_hash)
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -396,6 +447,7 @@ def record_trust(
     executable_version: Optional[str] = None,
     registry_version: Optional[str] = None,
     platform: Optional[str] = None,
+    recipe_hash: Optional[str] = None,
 ) -> TrustRecord:
     """Writes owner trust record outside the repository to <JEV_HOME>/trust/<repo_id>.json."""
     repo_id = compute_repo_id(repo_dir)
@@ -426,6 +478,7 @@ def record_trust(
         executable_version=executable_version,
         approved_at=now_utc,
         approved_by=approved_by,
+        recipe_hash=recipe_hash or config.recipe_hash,
     )
 
     trust_path = get_trust_file_path(repo_id)
@@ -483,6 +536,29 @@ def validate_trust(
 
     if executable_version and rec.executable_version and rec.executable_version != executable_version:
         return False, f"executable version mismatch: {rec.executable_version} != {executable_version}"
+
+    # Verify recipe hash if bound (e.g. for Makefile targets)
+    expected_recipe_hash = rec.recipe_hash or config.recipe_hash
+    if expected_recipe_hash:
+        curr_recipe_hash = None
+        for mf_name in ("Makefile", "GNUmakefile", "makefile"):
+            mf_path = Path(repo_dir).resolve() / mf_name
+            if mf_path.is_file():
+                try:
+                    content = mf_path.read_text(encoding="utf-8", errors="replace")
+                    target, lines = extract_makefile_target_and_recipe(content)
+                    if target and lines:
+                        recipe_text = "\n".join(lines)
+                        curr_recipe_hash = hashlib.sha256(recipe_text.encode("utf-8")).hexdigest()
+                except Exception:
+                    pass
+                break
+        if curr_recipe_hash is None or curr_recipe_hash != expected_recipe_hash:
+            try:
+                trust_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return False, "Makefile recipe changed: approval invalidated"
 
     return True, None
 

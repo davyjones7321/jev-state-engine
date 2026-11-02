@@ -167,6 +167,11 @@ def run_command(
     tool_path = None
     if not is_shell and argv_list:
         tool_path = shutil.which(argv_list[0])
+        if not tool_path and sys.platform == 'win32' and argv_list[0].lower() in ('make', 'make.exe'):
+            mingw = shutil.which('mingw32-make')
+            if mingw:
+                tool_path = mingw
+                cmd_to_spawn[0] = mingw
 
     start_time = time.perf_counter()
     hJob = None
