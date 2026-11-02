@@ -45,7 +45,9 @@ from jev.repo_config import (
 APPROVAL_DISCLAIMER = "approval authorizes execution, not a mechanical pass"
 
 SECRET_KEY_PATTERNS = re.compile(
-    r"(?i)(key|token|secret|password|passwd|auth|credential|bearer|api[_-]?key|private[_-]?key)"
+    r"(?i)(?<![A-Za-z0-9_])(?:[A-Za-z0-9]+[_-])*"
+    r"(?:api[_-]?key|password|passwd|secret|token(?!s)|auth|credential|bearer|private[_-]?key)"
+    r"(?![_-]?count\b)(?:[_-][A-Za-z0-9]+)*(?![A-Za-z0-9_])"
 )
 
 SECRET_VALUE_PATTERNS = [
@@ -54,8 +56,15 @@ SECRET_VALUE_PATTERNS = [
     re.compile(r"(?i)\b(?:sk|pk)_[a-z0-9_\-]{12,}\b"),  # Stripe / other API keys
     re.compile(r"(?i)bearer\s+([A-Za-z0-9_\-\.]{16,})"),  # Bearer tokens
     re.compile(r"AKIA[0-9A-Z]{16}"),              # AWS Access Key ID
-    re.compile(r"https?://([^:]+):([^@]+)@"),     # Embedded basic-auth credentials
-    re.compile(r"""(?i)\b(?:bearer|token|password|passwd|secret|api[-_ ]?key)\s*[:=]\s*[^\s,;"'\}]+"""),
+    re.compile(r"AIza[A-Za-z0-9_-]{35}\b"),       # Bare Google API keys
+    re.compile(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"),  # JWTs
+    re.compile(r"(?i)[a-z][a-z0-9+.-]*://[^/\s:@]+:[^@\s/]+@"),  # Any URL scheme credentials
+    re.compile(
+        r"(?i)(?<![A-Za-z0-9_])(?:[A-Za-z0-9]+[_-])*"
+        r"(?:api[_-]?key|password|passwd|secret|token(?!s)|auth|credential|bearer|private[_-]?key)"
+        r"(?![_-]?count\b)(?:[_-][A-Za-z0-9]+)*(?![A-Za-z0-9_])"
+        r"\s*[:=]\s*(?!\d+(?:\b|$))[^\s,;\"'\}]{3,}"
+    ),
     re.compile(r"-----BEGIN (?:[A-Z]+ )?PRIVATE KEY-----[\s\S]+?-----END (?:[A-Z]+ )?PRIVATE KEY-----"),
 ]
 
@@ -626,4 +635,3 @@ def format_proposal_screen(proposal: Proposal) -> str:
     lines.append(f"NOTICE: {APPROVAL_DISCLAIMER}")
     lines.append("-----------------------------------------------------------------")
     return "\n".join(lines)
-
