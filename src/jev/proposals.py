@@ -204,21 +204,14 @@ def list_proposals(repo_dir: Union[str, Path]) -> List[Proposal]:
 
 
 def inspect_executable(cmd: Sequence[str]) -> Tuple[Optional[str], Optional[str]]:
-    """Inspects executable path and version on the host platform."""
+    """Resolves executable path on the host platform using shutil.which without executing any subprocess."""
     if not cmd:
         return None, None
     exe_name = cmd[0]
     exe_path = shutil.which(exe_name)
     if not exe_path:
         return None, None
-    exe_ver = None
-    try:
-        res = subprocess.run([exe_path, "--version"], capture_output=True, text=True, timeout=5)
-        if res.returncode == 0 and res.stdout.strip():
-            exe_ver = res.stdout.strip().splitlines()[0][:80]
-    except Exception:
-        pass
-    return exe_path, exe_ver
+    return exe_path, None
 
 
 def build_proposal_from_repo(repo_dir: Union[str, Path]) -> Optional[Proposal]:

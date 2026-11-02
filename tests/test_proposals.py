@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -33,6 +34,7 @@ from jev.proposals import (
     compute_proposal_identity_hash,
     format_proposal_screen,
     get_proposals_dir,
+    inspect_executable,
     list_proposals,
     load_proposal,
     redact_data_structure,
@@ -464,3 +466,34 @@ def test_cli_approve_script_interactive_and_yes(tmp_path, monkeypatch):
         env=test_env,
     )
     assert "already approved" in res_repeat.stdout
+
+
+def test_proposal_creation_never_starts_subprocess(tmp_path):
+    """Building a proposal from a repo whose CI names a program never starts any subprocess."""
+    repo = _create_git_repo(tmp_path / "ci_no_subprocess_repo")
+    wf_dir = repo / ".github" / "workflows"
+    wf_dir.mkdir(parents=True, exist_ok=True)
+    (wf_dir / "ci.yml").write_text(
+        "name: CI\non: [push]\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: python -m pytest tests/\n",
+        encoding="utf-8",
+    )
+
+    with patch("subprocess.run") as mock_run, patch("subprocess.Popen") as mock_popen:
+        mock_run.return_value.returncode = 0
+        mock_run.return_value.stdout = "abc123rootcommit\n"
+        prop = build_proposal_from_repo(repo)
+        assert prop is not None
+        assert prop.exact_argv == ["python", "-m", "pytest", "tests/"]
+        assert prop.tool_version is None
+        # Assert that the proposed tool was never executed to inspect its version
+        for call_args in mock_run.call_args_list:
+            args = call_args[0][0]
+            assert "--version" not in args
+            assert "python" not in args
+        mock_popen.assert_not_called()
+
+    # And verify inspect_executable never starts any subprocess
+    with patch("subprocess.run") as mock_run:
+        inspect_executable(["python", "-m", "pytest"])
+        mock_run.assert_not_called()
+
