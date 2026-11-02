@@ -153,3 +153,53 @@ Single-letter flags `-i`, `-w`, and `-d` have conflicting meanings across tools:
 ### 5. Open Problems
 
 - None. Full offline test suite passed (1024 passed, 24 skipped, 0 failed in 943.18s).
+
+## Fix 5: Never dead-end a repo (compile gate)
+
+### 1. Files and Lines Changed
+
+- `src/jev/workspace.py`:
+  - Lines 692–696: In `JsTsCompileHandler.prepare_and_get_command`, when no tsconfig, typecheck, or build script exists, check whether any touched files are TypeScript (`.ts`, `.tsx`). If not, return `CompileOutcome.EXEMPT` rather than `NO_COMPILE_COMMAND`.
+  - Lines 969–973: In `RubyCompileHandler.prepare_and_get_command`, return `CompileOutcome.EXEMPT` instead of `NO_COMPILE_COMMAND`.
+  - Lines 988–992: In `PhpCompileHandler.prepare_and_get_command`, return `CompileOutcome.EXEMPT` instead of `NO_COMPILE_COMMAND`.
+  - Lines 1074–1101: Added `resolve_compile_command` function providing direct manifest-based compile command resolution returning `CompileOutcome.EXEMPT` for optional compilation languages.
+  - Lines 4501–4515: In `check_compile`, fallback for optional languages (`ruby`, `php`, `javascript`, `python`) without build commands returns `CompileOutcome.EXEMPT`.
+  - Lines 4992–5015: In `run_mechanical_checks`, when compile outcome is `CompileOutcome.ENV_NOT_READY`, attach structured `MechanicalEvidence(mech_status=MechStatus.UNMEASURED, reason=MechReason.MISSING_TOOL)`.
+- `src/jev/engine.py`:
+  - Lines 3971–3983: In `node_gate`, when compile halts as `env_not_ready` with a missing tool, attach `MechanicalEvidence(mech_status=MechStatus.UNMEASURED, reason=MechReason.MISSING_TOOL)` to `mech_ev`.
+  - Lines 4767–4875: In `node_verify`, handle compile check outcomes:
+    - `FAILED`: fails verification and escalates deadlock.
+    - `ENV_NOT_READY`: records `UNMEASURED(reason=MISSING_TOOL)` (or `ENVIRONMENT_UNAVAILABLE`) in ledger, fails verification and escalates deadlock.
+    - `NO_COMPILE_COMMAND`: degrades to UNMEASURED (`MechReason.NO_COMMAND`, zero strikes) and continues to tests and Jev rather than escalating immediately.
+- `tests/test_compile_gate.py`:
+  - Lines 1088–1298: Added regression tests:
+    - `test_plain_js_repo_compile_exempt`: Plain JS project with no tsconfig/typecheck/build returns `EXEMPT` and completes gate without escalation.
+    - `test_ruby_repo_compile_exempt`: Ruby project returns `EXEMPT` and completes gate without escalation.
+    - `test_php_repo_compile_exempt`: PHP project returns `EXEMPT` and completes gate without escalation.
+    - `test_missing_compiler_produces_unmeasured_missing_tool_in_ledger`: Missing compiler creates `UNMEASURED(reason=MISSING_TOOL)` record in attempt ledger.
+    - `test_real_compile_failure_still_strikes`: Real compile failure (Python syntax error) still strikes `mechanical_failure` (strike count 1) without unexpected escalation.
+
+### 2. How It Works
+
+- Languages where compilation is optional (plain JS without tsconfig/build, Ruby, PHP) no longer return `NO_COMPILE_COMMAND`. Their handlers now return `CompileOutcome.EXEMPT`, allowing tickets on these repositories to proceed directly to testing and semantic validation without dead-ending.
+- In `node_verify`, if a repo produces `NO_COMPILE_COMMAND`, it does not immediately escalate; it records an UNMEASURED attempt with reason `NO_COMMAND` (zero strikes) and continues to the test execution step and Jev evaluation.
+- When compilation halts with `ENV_NOT_READY` due to a missing tool or executable, `run_mechanical_checks`, `node_gate`, and `node_verify` capture structured `MechanicalEvidence` with `mech_status=UNMEASURED` and `reason=MISSING_TOOL`, ensuring a clear diagnosis record is committed to the attempt ledger rather than a silent fall-through.
+
+### 3. Rule Enforcement Table
+
+| Rule | Mechanically Enforced | Prompt-Only | Test Name |
+| :--- | :--- | :--- | :--- |
+| Plain JS repos without tsconfig/build return `EXEMPT` and complete compile gate | Yes | No | `tests/test_compile_gate.py::test_plain_js_repo_compile_exempt` |
+| Ruby repos return `EXEMPT` and complete compile gate | Yes | No | `tests/test_compile_gate.py::test_ruby_repo_compile_exempt` |
+| PHP repos return `EXEMPT` and complete compile gate | Yes | No | `tests/test_compile_gate.py::test_php_repo_compile_exempt` |
+| Missing compiler during compile step produces `UNMEASURED(reason=MISSING_TOOL)` ledger record | Yes | No | `tests/test_compile_gate.py::test_missing_compiler_produces_unmeasured_missing_tool_in_ledger` |
+| Real compile failure still strikes | Yes | No | `tests/test_compile_gate.py::test_real_compile_failure_still_strikes` |
+| Verify stage degrades `NO_COMPILE_COMMAND` to UNMEASURED without early deadlock escalation | Yes | No | `tests/test_compile_gate.py::test_verify_stage_compile_failure` |
+
+### 4. Unrequested Changes
+
+- None.
+
+### 5. Open Problems
+
+- None. Full offline test suite passed (1029 passed, 24 skipped, 0 failed in 1274.17s).

@@ -691,6 +691,9 @@ class JsTsCompileHandler(BaseCompileHandler):
 
         # Can a compile command be determined?
         if not has_typecheck and not has_tsconfig and not has_build:
+            has_ts = any(Path(f).suffix.lower() in {".ts", ".tsx"} for f in touched_files)
+            if not has_ts:
+                return None, CompileOutcome.EXEMPT, "Plain JavaScript project with no build, typecheck script, or tsconfig.json: compile gate exempt."
             return None, CompileOutcome.NO_COMPILE_COMMAND, "No compile command found: package.json has no 'typecheck' or 'build' script, and no tsconfig.json exists."
 
         # A compile command can be determined! Check if dependencies are ready:
@@ -966,7 +969,7 @@ class RubyCompileHandler(BaseCompileHandler):
     def prepare_and_get_command(
         self, wt: Path, repo_dir: Path, touched_files: List[str]
     ) -> tuple[Optional[List[str]], Optional[CompileOutcome], str]:
-        return None, CompileOutcome.NO_COMPILE_COMMAND, "Profile 'ruby-rake' has no build or typecheck command configured; validation skipped."
+        return None, CompileOutcome.EXEMPT, "Profile 'ruby-rake' has no build or typecheck command configured; validation skipped."
 
 
 class PhpCompileHandler(BaseCompileHandler):
@@ -984,7 +987,7 @@ class PhpCompileHandler(BaseCompileHandler):
     def prepare_and_get_command(
         self, wt: Path, repo_dir: Path, touched_files: List[str]
     ) -> tuple[Optional[List[str]], Optional[CompileOutcome], str]:
-        return None, CompileOutcome.NO_COMPILE_COMMAND, "Profile 'phpunit' has no build or typecheck command configured; validation skipped."
+        return None, CompileOutcome.EXEMPT, "Profile 'phpunit' has no build or typecheck command configured; validation skipped."
 
 
 ECOSYSTEM_COMPILE_HANDLERS = [
@@ -1068,6 +1071,33 @@ def resolve_test_command(wt: Union[str, Path]) -> ResolvedTestCommand:
         also_matched=res.also_matched,
         ambiguity_resolved_by=res.ambiguity_resolved_by,
     )
+
+
+def resolve_compile_command(
+    wt: Union[str, Path],
+    touched_files: Optional[Sequence[Union[str, Path]]] = None,
+    repo_dir: Optional[Union[str, Path]] = None,
+) -> tuple[Optional[List[str]], CompileOutcome, str]:
+    """Resolves compile command for workspace and touched files without running subprocesses."""
+    wt_path = Path(wt)
+    r_dir = Path(repo_dir) if repo_dir else wt_path
+    tf = [Path(f).as_posix() for f in (touched_files or [])]
+    touched_sources = [f for f in tf if Path(f).suffix.lower() in ALL_SOURCE_EXTENSIONS] if tf else []
+
+    for h in ECOSYSTEM_COMPILE_HANDLERS:
+        if h.matches(set(touched_sources or tf), wt_path, r_dir):
+            cmd, outcome, detail = h.prepare_and_get_command(wt_path, r_dir, touched_sources or tf)
+            if outcome is not None:
+                return cmd, outcome, detail
+            return cmd, CompileOutcome.PASSED, detail
+
+    from jev.runner_registry import resolve_build_command
+    res_build = resolve_build_command(wt_path)
+    if res_build.runner_profile_id and res_build.command is None:
+        if res_build.ecosystem in ("ruby", "php", "javascript", "python"):
+            return None, CompileOutcome.EXEMPT, res_build.reason or "No build or typecheck command configured; compile gate exempt."
+        return None, CompileOutcome.NO_COMPILE_COMMAND, res_build.reason or "No build or typecheck command configured; validation skipped."
+    return None, CompileOutcome.EXEMPT, "No compiled source files detected: compile gate exempt."
 
 
 class Workspace:
@@ -4469,6 +4499,7 @@ class Workspace:
             from jev.runner_registry import resolve_build_command
             res_build = resolve_build_command(self.worktree_dir)
             if res_build.runner_profile_id and res_build.command is None:
+                is_opt_lang = res_build.ecosystem in ("ruby", "php", "javascript", "python")
                 record = {
                     "ecosystem": res_build.ecosystem,
                     "command": None,
@@ -4478,8 +4509,8 @@ class Workspace:
                     "output_tail": "",
                     "new_errors": [],
                     "base_errors": [],
-                    "outcome": CompileOutcome.NO_COMPILE_COMMAND.value,
-                    "detail": res_build.reason or "No build or typecheck command configured; validation skipped.",
+                    "outcome": CompileOutcome.EXEMPT.value if is_opt_lang else CompileOutcome.NO_COMPILE_COMMAND.value,
+                    "detail": res_build.reason or ("No build or typecheck command configured; compile gate exempt." if is_opt_lang else "No build or typecheck command configured; validation skipped."),
                 }
                 self.last_compile_run = record
                 return record
@@ -4932,21 +4963,31 @@ class Workspace:
                 test_runner_outcome=None,
             ))
         elif compile_outcome == CompileOutcome.ENV_NOT_READY.value:
+            detail_str = compile_res.get("detail", "Environment not ready.")
+            is_missing_tool = any(s in detail_str.lower() for s in ("not found", "filenotfound", "executable not found", "missing"))
+            compile_evidence = MechanicalEvidence(
+                mech_status=MechStatus.UNMEASURED,
+                reason=MechReason.MISSING_TOOL if is_missing_tool else MechReason.ENVIRONMENT_UNAVAILABLE,
+                mechanically_unverified=True,
+                command_identity={"cmd": compile_res.get("command")},
+                attribution_note=detail_str,
+            )
             return self._finalize_mechanical_result(MechanicalCheckResult(
                 passed=False,
                 failed_check="env_not_ready",
-                detail=compile_res.get("detail", "Environment not ready."),
+                detail=detail_str,
                 checks_run=["build", "suppression", "unresolved_import", "compile"],
                 checks={
                     "build": {"ran": True, "passed": True, "detail": ""},
                     "suppression": {"ran": True, "passed": True, "detail": ""},
                     "unresolved_import": {"ran": True, "passed": True, "detail": ""},
-                    "compile": {"ran": True, "passed": False, "detail": compile_res.get("detail", "")},
+                    "compile": {"ran": True, "passed": False, "detail": detail_str},
                     "tests": {"ran": False, "passed": None},
                     "scope": {"ran": False, "passed": None},
                 },
                 compile_outcome=compile_res,
                 test_runner_outcome=None,
+                mech_evidence=compile_evidence,
             ))
 
         # 5. tests

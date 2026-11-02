@@ -1086,3 +1086,213 @@ process.exit(0);
     assert ws_wt2.last_test_run is None
 
 
+def test_plain_js_repo_compile_exempt(tmp_path):
+    repo = tmp_path / "repo_plain_js"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Tester"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "tester@example.com"], cwd=repo, check=True, capture_output=True)
+
+    pkg_json = {"name": "plain-js-app", "scripts": {"lint": "eslint ."}}
+    (repo / "package.json").write_text(json.dumps(pkg_json), encoding="utf-8")
+    (repo / "node_modules").mkdir()
+    (repo / "index.js").write_text("console.log('init');\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+
+    ws = Workspace(repo_dir=repo)
+    (repo / "index.js").write_text("console.log('updated');\n", encoding="utf-8")
+    subprocess.run(["git", "add", "index.js"], cwd=repo, check=True, capture_output=True)
+
+    compile_res = ws.check_compile()
+    assert compile_res["outcome"] == CompileOutcome.EXEMPT.value
+
+    subgoal = Subgoal(description="Update index.js", scope=["index.js"], expects_tests=False)
+    gk = FakeGatekeeper()
+    state: State = {
+        "ticket": "Ticket JS",
+        "plan_queue": [],
+        "current_subgoal": subgoal,
+        "mechanical_strike_count": 0,
+        "semantic_strike_count": 0,
+        "trajectory": [],
+        "gate_status": None,
+        "last_feedback": None,
+        "status": None,
+        "investigation_notes": "Notes",
+        "current_worktree_path": None,
+        "current_worktree_branch": None,
+    }
+
+    out = node_gate(state, workspace=ws, gatekeeper=gk)
+    assert out["status"] != "escalated"
+    assert out["gate_status"] == "passed"
+
+
+def test_ruby_repo_compile_exempt(tmp_path):
+    repo = tmp_path / "repo_ruby"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Tester"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "tester@example.com"], cwd=repo, check=True, capture_output=True)
+
+    (repo / "Gemfile").write_text("source 'https://rubygems.org'\n", encoding="utf-8")
+    (repo / "app.rb").write_text("puts 'hello'\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+
+    ws = Workspace(repo_dir=repo)
+    (repo / "app.rb").write_text("puts 'hello world'\n", encoding="utf-8")
+    subprocess.run(["git", "add", "app.rb"], cwd=repo, check=True, capture_output=True)
+
+    compile_res = ws.check_compile()
+    assert compile_res["outcome"] == CompileOutcome.EXEMPT.value
+
+    subgoal = Subgoal(description="Update app.rb", scope=["app.rb"], expects_tests=False)
+    gk = FakeGatekeeper()
+    state: State = {
+        "ticket": "Ticket Ruby",
+        "plan_queue": [],
+        "current_subgoal": subgoal,
+        "mechanical_strike_count": 0,
+        "semantic_strike_count": 0,
+        "trajectory": [],
+        "gate_status": None,
+        "last_feedback": None,
+        "status": None,
+        "investigation_notes": "Notes",
+        "current_worktree_path": None,
+        "current_worktree_branch": None,
+    }
+
+    out = node_gate(state, workspace=ws, gatekeeper=gk)
+    assert out["status"] != "escalated"
+    assert out["gate_status"] == "passed"
+
+
+def test_php_repo_compile_exempt(tmp_path):
+    repo = tmp_path / "repo_php"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Tester"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "tester@example.com"], cwd=repo, check=True, capture_output=True)
+
+    (repo / "composer.json").write_text('{"name": "app/php"}', encoding="utf-8")
+    (repo / "app.php").write_text("<?php echo 'hello';\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+
+    ws = Workspace(repo_dir=repo)
+    (repo / "app.php").write_text("<?php echo 'hello world';\n", encoding="utf-8")
+    subprocess.run(["git", "add", "app.php"], cwd=repo, check=True, capture_output=True)
+
+    compile_res = ws.check_compile()
+    assert compile_res["outcome"] == CompileOutcome.EXEMPT.value
+
+    subgoal = Subgoal(description="Update app.php", scope=["app.php"], expects_tests=False)
+    gk = FakeGatekeeper()
+    state: State = {
+        "ticket": "Ticket PHP",
+        "plan_queue": [],
+        "current_subgoal": subgoal,
+        "mechanical_strike_count": 0,
+        "semantic_strike_count": 0,
+        "trajectory": [],
+        "gate_status": None,
+        "last_feedback": None,
+        "status": None,
+        "investigation_notes": "Notes",
+        "current_worktree_path": None,
+        "current_worktree_branch": None,
+    }
+
+    out = node_gate(state, workspace=ws, gatekeeper=gk)
+    assert out["status"] != "escalated"
+    assert out["gate_status"] == "passed"
+
+
+def test_missing_compiler_produces_unmeasured_missing_tool_in_ledger(tmp_path):
+    repo = tmp_path / "repo_missing_compiler"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Tester"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "tester@example.com"], cwd=repo, check=True, capture_output=True)
+
+    (repo / "App.csproj").write_text("<Project></Project>", encoding="utf-8")
+    (repo / "App.cs").write_text("public class App {}", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+
+    ws = Workspace(repo_dir=repo)
+    (repo / "App.cs").write_text("public class App { int x = 1; }", encoding="utf-8")
+    subprocess.run(["git", "add", "App.cs"], cwd=repo, check=True, capture_output=True)
+
+    recorder = MagicMock()
+    gk = FakeGatekeeper()
+    subgoal = Subgoal(description="Update App.cs", scope=["App.cs"], expects_tests=False)
+    state: State = {
+        "ticket": "Ticket Dotnet",
+        "plan_queue": [],
+        "current_subgoal": subgoal,
+        "mechanical_strike_count": 0,
+        "semantic_strike_count": 0,
+        "trajectory": [],
+        "gate_status": None,
+        "last_feedback": None,
+        "status": None,
+        "investigation_notes": "Notes",
+        "current_worktree_path": None,
+        "current_worktree_branch": None,
+    }
+
+    with patch("shutil.which", return_value=None):
+        out = node_gate(state, workspace=ws, gatekeeper=gk, recorder=recorder)
+        assert out["status"] == "escalated"
+        assert out["gate_status"] == "env_not_ready"
+        assert recorder.record_attempt.called
+        call_kwargs = recorder.record_attempt.call_args[1]
+        mech_ev = call_kwargs.get("mech_evidence")
+        assert mech_ev is not None
+        from jev.mech_evidence import MechStatus, MechReason
+        assert mech_ev.mech_status == MechStatus.UNMEASURED
+        assert mech_ev.reason == MechReason.MISSING_TOOL
+
+
+def test_real_compile_failure_still_strikes(tmp_path):
+    repo = tmp_path / "repo_real_fail"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Tester"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "tester@example.com"], cwd=repo, check=True, capture_output=True)
+
+    (repo / "main.py").write_text("def run():\n    return 42\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+
+    ws = Workspace(repo_dir=repo)
+    (repo / "main.py").write_text("def broken_syntax(:\n", encoding="utf-8")
+    subprocess.run(["git", "add", "main.py"], cwd=repo, check=True, capture_output=True)
+
+    subgoal = Subgoal(description="Break syntax", scope=["main.py"], expects_tests=False)
+    gk = FakeGatekeeper()
+    state: State = {
+        "ticket": "Ticket Syntax",
+        "plan_queue": [],
+        "current_subgoal": subgoal,
+        "mechanical_strike_count": 0,
+        "semantic_strike_count": 0,
+        "trajectory": [],
+        "gate_status": None,
+        "last_feedback": None,
+        "status": None,
+        "investigation_notes": "Notes",
+        "current_worktree_path": None,
+        "current_worktree_branch": None,
+    }
+
+    out = node_gate(state, workspace=ws, gatekeeper=gk)
+    assert out["gate_status"] == "mechanical_failure"
+    assert out["mechanical_strike_count"] == 1
+    assert out["status"] != "escalated"
+
+

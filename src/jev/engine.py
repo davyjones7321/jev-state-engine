@@ -3968,6 +3968,19 @@ def node_gate(
             reason=MechReason.TEST_SURFACE_CHANGED,
             test_surface_changed=True,
         )
+    elif mech_result.failed_check == "env_not_ready" and mech_ev is None:
+        detail_msg = getattr(mech_result, "detail", "") or ""
+        cmd_raw = compile_telemetry.get("command") if isinstance(compile_telemetry, dict) else None
+        cmd_val = [str(x) for x in cmd_raw] if isinstance(cmd_raw, (list, tuple)) else (str(cmd_raw) if isinstance(cmd_raw, str) else None)
+        is_missing_tool = any(s in str(detail_msg).lower() for s in ("not found", "filenotfound", "executable not found", "missing"))
+        reason_val = MechReason.MISSING_TOOL if is_missing_tool else MechReason.ENVIRONMENT_UNAVAILABLE
+        mech_ev = MechanicalEvidence(
+            mech_status=MechStatus.UNMEASURED,
+            reason=reason_val,
+            mechanically_unverified=True,
+            command_identity={"cmd": cmd_val} if cmd_val else None,
+            attribution_note=str(detail_msg),
+        )
     is_unmeasured = (
         mech_result.failed_check == "tests_unmeasured"
         or (
@@ -4752,44 +4765,115 @@ def node_verify(
         if workspace is not None and hasattr(workspace, "check_compile"):
             compile_info = workspace.check_compile(diff=final_diff, base_commit=base_commit)
 
-        if compile_info is not None and compile_info.get("outcome") in ("FAILED", "NO_COMPILE_COMMAND", "ENV_NOT_READY"):
-            state["gate_status"] = "verification_failed"
-            state["status"] = "escalated" if compile_info.get("outcome") in ("NO_COMPILE_COMMAND", "ENV_NOT_READY") else "verification_failed"
-            state["last_feedback"] = f"Final compile check failed: {compile_info.get('detail')}"
-            _snapshot_attempt(
-                safe_rec,
-                state,
-                subgoal_id="__verify__",
-                tier="mechanical",
-                outcome="mechanical_failure" if compile_info.get("outcome") == "FAILED" else compile_info.get("outcome", "").lower(),
-                failed_check=compile_info.get("outcome"),
-                diff=final_diff,
-                compile_info=compile_info,
-                tests_ran=False,
-                feedback_sent=state.get("last_feedback"),
-            )
-            verify_entry = {
-                "node": "verify",
-                "gate_status": "verification_failed",
-                "status": state["status"],
-                "compile": compile_info,
-                "test_runner": {"ran": False},
-                "jev_request": {
-                    "ticket": ticket,
-                    "diff_size": len(final_diff),
-                    "investigation_notes_included": bool(inv_notes),
-                },
-                "jev_verdict": None,
-            }
-            state["trajectory"].append(verify_entry)
-            _safe_escalate_deadlock(
-                gatekeeper,
-                trajectory=state.get("trajectory", []),
-                triggering_tier="mechanical",
-                integration_branch=integration_branch,
-                thread_id=state.get("thread_id"),
-            )
-            return state
+        if compile_info is not None:
+            c_outcome = compile_info.get("outcome")
+            if c_outcome == "FAILED":
+                state["gate_status"] = "verification_failed"
+                state["status"] = "verification_failed"
+                state["last_feedback"] = f"Final compile check failed: {compile_info.get('detail')}"
+                _snapshot_attempt(
+                    safe_rec,
+                    state,
+                    subgoal_id="__verify__",
+                    tier="mechanical",
+                    outcome="mechanical_failure",
+                    failed_check="compile",
+                    diff=final_diff,
+                    compile_info=compile_info,
+                    tests_ran=False,
+                    feedback_sent=state.get("last_feedback"),
+                )
+                verify_entry = {
+                    "node": "verify",
+                    "gate_status": "verification_failed",
+                    "status": state["status"],
+                    "compile": compile_info,
+                    "test_runner": {"ran": False},
+                    "jev_request": {
+                        "ticket": ticket,
+                        "diff_size": len(final_diff),
+                        "investigation_notes_included": bool(inv_notes),
+                    },
+                    "jev_verdict": None,
+                }
+                state["trajectory"].append(verify_entry)
+                _safe_escalate_deadlock(
+                    gatekeeper,
+                    trajectory=state.get("trajectory", []),
+                    triggering_tier="mechanical",
+                    integration_branch=integration_branch,
+                    thread_id=state.get("thread_id"),
+                )
+                return state
+            elif c_outcome == "ENV_NOT_READY":
+                detail_msg = compile_info.get("detail", "")
+                is_missing_tool = any(s in detail_msg.lower() for s in ("not found", "filenotfound", "executable not found", "missing"))
+                ev_reason = MechReason.MISSING_TOOL if is_missing_tool else MechReason.ENVIRONMENT_UNAVAILABLE
+                verify_ev = MechanicalEvidence(
+                    mech_status=MechStatus.UNMEASURED,
+                    reason=ev_reason,
+                    mechanically_unverified=True,
+                    command_identity={"cmd": compile_info.get("command")},
+                    attribution_note=detail_msg,
+                )
+                state["gate_status"] = "verification_failed"
+                state["status"] = "escalated"
+                state["last_feedback"] = f"Final compile check failed: Environment not ready: {detail_msg}"
+                _snapshot_attempt(
+                    safe_rec,
+                    state,
+                    subgoal_id="__verify__",
+                    tier="mechanical",
+                    outcome="env_not_ready",
+                    failed_check="env_not_ready",
+                    diff=final_diff,
+                    compile_info=compile_info,
+                    tests_ran=False,
+                    feedback_sent=state.get("last_feedback"),
+                    mech_evidence=verify_ev,
+                )
+                verify_entry = {
+                    "node": "verify",
+                    "gate_status": "verification_failed",
+                    "status": state["status"],
+                    "compile": compile_info,
+                    "test_runner": {"ran": False},
+                    "jev_request": {
+                        "ticket": ticket,
+                        "diff_size": len(final_diff),
+                        "investigation_notes_included": bool(inv_notes),
+                    },
+                    "jev_verdict": None,
+                }
+                state["trajectory"].append(verify_entry)
+                _safe_escalate_deadlock(
+                    gatekeeper,
+                    trajectory=state.get("trajectory", []),
+                    triggering_tier="mechanical",
+                    integration_branch=integration_branch,
+                    thread_id=state.get("thread_id"),
+                )
+                return state
+            elif c_outcome == "NO_COMPILE_COMMAND":
+                verify_ev = MechanicalEvidence(
+                    mech_status=MechStatus.UNMEASURED,
+                    reason=MechReason.NO_COMMAND,
+                    mechanically_unverified=True,
+                    command_identity={"cmd": None},
+                    attribution_note=compile_info.get("detail", "No compile command"),
+                )
+                _snapshot_attempt(
+                    safe_rec,
+                    state,
+                    subgoal_id="__verify__",
+                    tier="mechanical",
+                    outcome="unmeasured",
+                    failed_check=None,
+                    diff=final_diff,
+                    compile_info=compile_info,
+                    tests_ran=False,
+                    mech_evidence=verify_ev,
+                )
 
         # 2. Run unit tests
         test_output = ""
