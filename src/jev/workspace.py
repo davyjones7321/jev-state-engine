@@ -32,6 +32,7 @@ from jev.process_runner import CommandResult, run_command
 
 from jev.repo_config import (
     PROTECTED_FILES,
+    extract_makefile_target_and_recipe,
     is_build_or_test_config,
     is_lockfile,
     is_protected_path,
@@ -2729,6 +2730,7 @@ class Workspace:
         changed_test_files: Sequence[str],
         test_cmd: Optional[List[str]],
         base_commit_ref: str,
+        restore_paths: Optional[Sequence[str]] = None,
     ) -> Tuple[int, str, str, Optional[List[str]]]:
         """Runs the original base versions of modified or deleted test files in an isolated scratch copy against candidate code.
 
@@ -2752,7 +2754,8 @@ class Workspace:
         try:
             self._link_node_modules(self.repo_dir, scratch_path)
 
-            changed_set = {Path(p).as_posix() for p in changed_test_files}
+            restore_set = {Path(p).as_posix() for p in changed_test_files}
+            restore_set.update(Path(p).as_posix() for p in (restore_paths or []))
 
             if used_git_worktree:
                 staged_files = list(self.worker_staged_paths) if self.worker_staged_paths else []
@@ -2763,7 +2766,7 @@ class Workspace:
 
                 for sf in staged_files:
                     norm_sf = Path(sf).as_posix()
-                    if norm_sf in changed_set:
+                    if norm_sf in restore_set:
                         continue
                     src_file = self.worktree_dir / sf
                     dst_file = scratch_path / sf
@@ -2776,8 +2779,8 @@ class Workspace:
                         except Exception:
                             pass
 
-            # Restore original base versions of all changed_test_files in scratch_path
-            for tf in changed_test_files:
+            # Restore original base versions of all verifier/test files in scratch_path.
+            for tf in restore_set:
                 base_c = self._get_base_content(tf, base_commit_ref)
                 tf_dst = scratch_path / tf
                 if base_c is not None:
@@ -2812,6 +2815,73 @@ class Workspace:
                     self._run_repo_git(["worktree", "prune"])
                 if scratch_path.exists():
                     self._force_rmtree(scratch_path)
+
+    def _edited_test_recipe_paths(
+        self,
+        staged_paths: Sequence[str],
+        base_commit_ref: str,
+        resolved_cmd: Optional[ResolvedTestCommand],
+    ) -> List[str]:
+        """Find changed verifier files whose original test recipe the command executes."""
+        if not resolved_cmd or not resolved_cmd.command:
+            return []
+
+        command = [str(part).lower() for part in resolved_cmd.command]
+        tool = Path(command[0]).name
+        result: List[str] = []
+
+        def add_if_changed(path: str) -> None:
+            base = self._get_base_content(path, base_commit_ref)
+            candidate = self._get_candidate_content(path)
+            if base is not None and candidate is not None and base != candidate:
+                result.append(path)
+
+        for raw_path in staged_paths:
+            path = Path(raw_path).as_posix()
+            filename = Path(path).name.lower()
+            base = self._get_base_content(path, base_commit_ref)
+            candidate = self._get_candidate_content(path)
+            if base is None or candidate is None or base == candidate:
+                continue
+
+            if filename in ("makefile", "gnumakefile"):
+                base_target, base_recipe = extract_makefile_target_and_recipe(base)
+                candidate_target, candidate_recipe = extract_makefile_target_and_recipe(candidate)
+                runs_make = tool in ("make", "gmake", "mingw32-make", "nmake")
+                requested_targets = set(command[1:])
+                if (
+                    runs_make
+                    and base_target
+                    and base_target == candidate_target
+                    and base_recipe != candidate_recipe
+                    and (not requested_targets or base_target.lower() in requested_targets)
+                ):
+                    result.append(path)
+                continue
+
+            if filename == "package.json" and tool in ("npm", "yarn", "pnpm", "bun"):
+                try:
+                    base_json = json.loads(base)
+                    candidate_json = json.loads(candidate)
+                    base_test = (base_json.get("scripts") or {}).get("test")
+                    candidate_test = (candidate_json.get("scripts") or {}).get("test")
+                    if base_test != candidate_test and "test" in command[1:3]:
+                        result.append(path)
+                except (AttributeError, TypeError, ValueError):
+                    add_if_changed(path)
+                continue
+
+            pytest_config = filename in {
+                "pytest.ini", ".pytest.ini", "pyproject.toml", "tox.ini", "setup.cfg"
+            }
+            if pytest_config and (
+                resolved_cmd.ecosystem == "pytest"
+                or resolved_cmd.runner_profile_id == "pytest"
+                or "pytest" in command
+            ):
+                result.append(path)
+
+        return result
 
     def evaluate_tests(
         self,
@@ -3252,10 +3322,75 @@ class Workspace:
 
             is_exit_only = (ev_level == EvidenceLevel.EXIT_ONLY)
 
+            # Fix 7c: rerun the original test recipe/config in a scratch worktree.
+            base_ref_val = base_commit or self.base_commit or self._get_head_commit() or "HEAD"
+            edited_test_recipe_paths = self._edited_test_recipe_paths(
+                staged_paths=staged_paths,
+                base_commit_ref=base_ref_val,
+                resolved_cmd=resolved_cmd,
+            )
+            if edited_test_recipe_paths:
+                recipe_declared = all(
+                    self._is_test_file_in_ticket_scope(
+                        path,
+                        ticket=ticket or getattr(self, "current_ticket", None),
+                        ticket_scope=ticket_scope,
+                    )
+                    for path in edited_test_recipe_paths
+                )
+                if recipe_declared:
+                    return MechanicalEvidence(
+                        mech_status=MechStatus.UNMEASURED,
+                        reason=MechReason.COMMAND_IDENTITY_CHANGED,
+                        evidence_level=EvidenceLevel.NONE,
+                        comparison=Comparison.INCONCLUSIVE,
+                        comparison_valid=False,
+                        approval_valid=True,
+                        verifier_modified=True,
+                        mechanically_unverified=True,
+                        unverified_kind="verifier_modified",
+                        command_identity={**cmd_identity, "cmd": last_run.get("argv")},
+                        target_scope=target_scope_dict,
+                        target_rule=target_rule,
+                        target_confidence=target_confidence,
+                        worker_staged_paths=staged_paths,
+                        attribution_note="Edited test recipe is explicitly declared in ticket scope; human verification required.",
+                    )
+
+                scratch_exit, scratch_out, scratch_err, scratch_failing_ids = self._run_original_tests_in_scratch(
+                    changed_test_files=[],
+                    restore_paths=edited_test_recipe_paths,
+                    test_cmd=last_run.get("argv") or (resolved_cmd.command if resolved_cmd else None),
+                    base_commit_ref=base_ref_val,
+                )
+                if scratch_exit != 0:
+                    failing_ids = scratch_failing_ids or list(edited_test_recipe_paths)
+                    combined_tail = f"{scratch_out}\n{scratch_err}".strip()[-1000:]
+                    ev = MechanicalEvidence(
+                        mech_status=MechStatus.FAIL,
+                        evidence_level=EvidenceLevel.COUNTED if scratch_failing_ids else EvidenceLevel.EXIT_ONLY,
+                        failing_test_ids=failing_ids,
+                        comparison=Comparison.CANDIDATE_ONLY,
+                        comparison_valid=True,
+                        approval_valid=True,
+                        verifier_modified=True,
+                        mechanically_unverified=False,
+                        command_identity={**cmd_identity, "cmd": last_run.get("argv")},
+                        target_scope=target_scope_dict,
+                        target_rule=target_rule,
+                        target_confidence=target_confidence,
+                        worker_staged_paths=staged_paths,
+                        attribution_note=f"Edited test recipe weakened verification; original recipe fails on candidate: {', '.join(failing_ids[:5])}",
+                    )
+                    self.last_test_run["outcome"] = TestOutcome.FAILED.value
+                    self.last_test_run["exit_code"] = scratch_exit
+                    self.last_test_run["failing_test_ids"] = failing_ids
+                    self.last_test_run["output_tail"] = combined_tail
+                    return ev
+
             # Phase 7 Fix 7: Check for modified or deleted pre-existing test files
             actually_changed_preexisting_tests = []
             if worker_edited_preexisting_tests:
-                base_ref_val = base_commit or self.base_commit or self._get_head_commit() or "HEAD"
                 for tf in worker_edited_preexisting_tests:
                     base_c = self._get_base_content(tf, base_ref_val)
                     cand_c = self._get_candidate_content(tf)
