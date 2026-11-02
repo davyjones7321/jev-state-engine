@@ -98,13 +98,16 @@ class StructureRetriever(Protocol):
 ReadText = Callable[[Path], str]
 
 
-SECRET_DENYLIST_PARTS = {".aws", ".kube", ".ssh"}
+SECRET_DENYLIST_PARTS = {".aws", ".kube", ".ssh", "secrets", ".secrets", ".gnupg"}
 SECRET_DENYLIST_NAMES = {"credentials.json", "secrets.json", "id_rsa", "id_dsa", "id_ed25519"}
-SECRET_DENYLIST_EXTENSIONS = (".pem", ".key", ".pfx", ".p12", ".pkcs12")
+SECRET_DENYLIST_EXTENSIONS = (
+    ".pem", ".key", ".pfx", ".p12", ".pkcs12", ".tfstate", ".tfstate.backup",
+    ".tfvars", ".kdbx", ".jks", ".keystore",
+)
 
 
 def is_secret_path(path: str | Path) -> bool:
-    """Enforce the secret denylist (.env*, *.pem, *.key, id_rsa, credentials.json, secrets.json, .aws/, .kube/, .ssh/)."""
+    """Return whether a path is a known credential, key, state, or secret file."""
     if not path:
         return False
     raw = str(path).replace("\\", "/").strip()
@@ -113,7 +116,8 @@ def is_secret_path(path: str | Path) -> bool:
 
     # Path parts from Path and from posix normalized split
     parts = {part.lower() for part in path_obj.parts if part}
-    posix_parts = {part.lower() for part in raw.split("/") if part}
+    raw_parts = [part.lower() for part in raw.split("/") if part]
+    posix_parts = set(raw_parts)
     all_parts = parts | posix_parts
 
     # Directory patterns: .aws/, .kube/, .ssh/
@@ -127,12 +131,28 @@ def is_secret_path(path: str | Path) -> bool:
     if name.startswith(".env") or any(part.startswith(".env") for part in all_parts):
         return True
 
+    # Secret directories are denied recursively.
+    if any(secret_dir in all_parts for secret_dir in SECRET_DENYLIST_PARTS):
+        return True
+
     # Exact names: credentials.json, secrets.json, id_rsa, id_dsa, id_ed25519
     if name in SECRET_DENYLIST_NAMES or any(part in SECRET_DENYLIST_NAMES for part in all_parts):
         return True
 
+    # Common package, VCS, container, and deployment credential files.
+    if name in {".npmrc", ".pypirc", ".netrc"}:
+        return True
+    if len(raw_parts) >= 2 and raw_parts[-2:] == [".git", "config"]:
+        return True
+    if raw.lower().endswith("/.docker/config.json") or raw.lower() == ".docker/config.json":
+        return True
+    if name.startswith("service-account") and name.endswith(".json"):
+        return True
+    if name.endswith("-key.json") or ("credentials" in name and name.endswith(".json")):
+        return True
+
     # id_rsa* variants (e.g. id_rsa.pub, id_rsa_backup)
-    if name.startswith(("id_rsa", "id_dsa", "id_ed25519")) or any(
+    if name in ("id_ecdsa", "id_dsa") or name.startswith(("id_rsa", "id_dsa", "id_ed25519")) or any(
         part.startswith(("id_rsa", "id_dsa", "id_ed25519")) for part in all_parts
     ):
         return True
