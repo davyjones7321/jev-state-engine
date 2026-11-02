@@ -133,7 +133,28 @@ def is_shared_test_surface(
     if any(p in ("fixtures", "fixture", "test_fixtures", "__fixtures__", "helpers", "test_helpers", "test_utils", "support", "test_support") for p in parts_lower[:-1]):
         return True
 
-    # 5. Helper files by name that are NOT test files (e.g. helpers.py, test_utils.py, support.ts)
+    # 5. Helper / utility files by name (e.g. tests/testing_utils.py, test_util*, testutils*, test_helpers*)
+    # These count as shared test surface, NOT authored test files.
+    stem_lower = posixpath.splitext(filename)[0].lower()
+    if (
+        stem_lower.startswith("testing_util")
+        or stem_lower.startswith("testutils")
+        or stem_lower == "test_util"
+        or stem_lower.startswith("test_util_")
+        or stem_lower.startswith("test_helper")
+        or stem_lower.startswith("testhelpers")
+        or stem_lower.startswith("testing_helper")
+        or any(k in stem_lower for k in ("testing_utils", "testutils", "testing_util", "test_helper", "testhelpers"))
+    ):
+        return True
+
+    if stem_lower in ("test_utils", "test_utilities", "test_utility"):
+        content = candidate_content or base_content
+        if content and re.search(r"(?m)^\s*(?:def\s+test_|test\s*\(|it\s*\()", content):
+            return False
+        return True
+
+    # 6. Other helper files by name that are NOT test files (e.g. helpers.py, support.ts)
     if not (name_lower.startswith("test_") or name_lower.endswith("_test.py") or ".test." in name_lower or ".spec." in name_lower):
         if any(k in name_lower for k in ("fixture", "helper", "test_util", "support")):
             return True
@@ -141,11 +162,11 @@ def is_shared_test_surface(
     return False
 
 
-def is_test_file(path: Union[str, Path]) -> bool:
+def is_test_file(path: Union[str, Path], content: Optional[str] = None) -> bool:
     """Returns True if path is an authored/targeted test file (and not shared surface)."""
     if not path:
         return False
-    if is_shared_test_surface(path):
+    if is_shared_test_surface(path, candidate_content=content):
         return False
     raw = str(path).replace("\\", "/").strip()
     norm = posixpath.normpath(raw)
@@ -169,11 +190,33 @@ def is_test_file(path: Union[str, Path]) -> bool:
         return True
     if (name_lower.endswith("test.java") or name_lower.endswith("tests.java") or name_lower.endswith("test.kt")):
         return True
-    if any(p in ("tests", "test", "__tests__", "spec", "specs") for p in parts_lower[:-1]):
+    if name_lower.endswith("test.cs") or name_lower.endswith("tests.cs"):
+        return True
+    if any(p in ("tests", "test", "__tests__", "spec", "specs") or p.endswith(".tests") or p.endswith(".test") for p in parts_lower[:-1]):
         ext = posixpath.splitext(name_lower)[1]
         if ext in (".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java", ".kt", ".rb", ".php", ".cs"):
             return True
 
+    return False
+
+
+def target_matches_authored_test(target_path: Union[str, Path], authored_path: Union[str, Path]) -> bool:
+    """Returns True if target_path equals authored_path or is a parent directory of authored_path.
+
+    Replaces loose bidirectional substring matching to prevent similar names from falsely matching.
+    """
+    tp = posixpath.normpath(str(target_path).replace("\\", "/")).strip()
+    auth = posixpath.normpath(str(authored_path).replace("\\", "/")).strip()
+    if tp.startswith("./"):
+        tp = tp[2:]
+    if auth.startswith("./"):
+        auth = auth[2:]
+    if tp == auth:
+        return True
+    if tp in ("", "."):
+        return True
+    if auth.startswith(tp.rstrip("/") + "/"):
+        return True
     return False
 
 
@@ -1705,7 +1748,7 @@ class Workspace:
                 res["protected_verifier_command"].append(posix_p)
             elif is_shared_test_surface(posix_p, self._get_base_content(posix_p, base_commit), self._get_candidate_content(posix_p)):
                 res["worker_staged_shared_test_surface"].append(posix_p)
-            elif is_test_file(posix_p):
+            elif is_test_file(posix_p, content=self._get_candidate_content(posix_p)):
                 base_content = self._get_base_content(posix_p, base_commit)
                 if base_content is not None:
                     res["pre_existing_test_surface"].append(posix_p)
@@ -2712,7 +2755,7 @@ class Workspace:
         if worker_authored_tests and not worker_edited_preexisting_tests:
             if test_targets:
                 raw_target_paths = [str(t).partition("::")[0] for t in test_targets]
-                if all(any(auth_t in tp or tp in auth_t for auth_t in worker_authored_tests) for tp in raw_target_paths):
+                if all(any(target_matches_authored_test(tp, auth_t) for auth_t in worker_authored_tests) for tp in raw_target_paths):
                     is_worker_authored_only = True
             else:
                 base_has_tests = False

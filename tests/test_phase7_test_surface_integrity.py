@@ -43,6 +43,7 @@ from jev.workspace import (
     Workspace,
     is_shared_test_surface,
     is_test_file,
+    target_matches_authored_test,
 )
 
 
@@ -469,3 +470,73 @@ def test_engine_outputs_removed_on_discard_engine_touched(clean_workspace):
 
     assert not engine_file.exists()
     assert len(ws.engine_touched_paths) == 0
+
+
+# ==============================================================================
+# 8. Classifier Gaps: C# tests, helper files, and targeted author matching
+# ==============================================================================
+
+def test_csharp_test_file_classifier():
+    """is_test_file properly classifies C# test files and .Tests/.Test directories."""
+    assert is_test_file("Foo.Tests/FooTests.cs") is True
+    assert is_test_file("Foo.Tests/BarTests.cs") is True
+    assert is_test_file("Foo.Test/BarTest.cs") is True
+    assert is_test_file("src/MyServiceTest.cs") is True
+    assert is_test_file("src/MyServiceTests.cs") is True
+    assert is_test_file("Project.Tests/Service.cs") is True
+    assert is_test_file("Project.Test/Service.cs") is True
+
+    # Negative cases
+    assert is_test_file("src/Service.cs") is False
+    assert is_test_file("Foo.Models/Bar.cs") is False
+
+
+def test_helper_files_classified_as_shared_test_surface():
+    """Helper files (testing_utils.py, test_util*, testutils*) count as shared surface, not authored test files."""
+    # testing_utils.py
+    assert is_shared_test_surface("tests/testing_utils.py") is True
+    assert is_test_file("tests/testing_utils.py") is False
+
+    # test_util*
+    assert is_shared_test_surface("tests/test_utils.py") is True
+    assert is_test_file("tests/test_utils.py") is False
+    assert is_shared_test_surface("test_util.ts") is True
+    assert is_test_file("test_util.ts") is False
+    assert is_shared_test_surface("tests/test_utilities.py") is True
+    assert is_test_file("tests/test_utilities.py") is False
+
+    # testutils*
+    assert is_shared_test_surface("tests/testutils.py") is True
+    assert is_test_file("tests/testutils.py") is False
+    assert is_shared_test_surface("testutils.ts") is True
+    assert is_test_file("testutils.ts") is False
+
+    # test_helpers*
+    assert is_shared_test_surface("tests/test_helpers.py") is True
+    assert is_test_file("tests/test_helpers.py") is False
+
+    # Standard authored test files remain test files
+    assert is_shared_test_surface("tests/test_feature.py") is False
+    assert is_test_file("tests/test_feature.py") is True
+
+
+def test_target_matches_authored_test_normalized_equality_and_parent_dir():
+    """target_matches_authored_test matches exact path or parent directory, rejecting similar names."""
+    # Normalized equality
+    assert target_matches_authored_test("tests/test_foo.py", "tests/test_foo.py") is True
+    assert target_matches_authored_test("./tests/test_foo.py", "tests/test_foo.py") is True
+    assert target_matches_authored_test("tests/test_foo.py", "./tests/test_foo.py") is True
+    assert target_matches_authored_test("tests\\test_foo.py", "tests/test_foo.py") is True
+
+    # Parent directory
+    assert target_matches_authored_test("tests", "tests/test_foo.py") is True
+    assert target_matches_authored_test("tests/unit", "tests/unit/test_foo.py") is True
+    assert target_matches_authored_test(".", "tests/test_foo.py") is True
+    assert target_matches_authored_test("", "tests/test_foo.py") is True
+
+    # Negative tests: similar names must NOT match
+    assert target_matches_authored_test("tests/test_foo_extra.py", "tests/test_foo.py") is False
+    assert target_matches_authored_test("tests/test_fo", "tests/test_foo.py") is False
+    assert target_matches_authored_test("tests/test_foo.py", "tests/test_foo_extra.py") is False
+    assert target_matches_authored_test("tests/test_foo.py", "other/test_foo.py") is False
+

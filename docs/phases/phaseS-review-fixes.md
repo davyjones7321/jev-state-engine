@@ -71,3 +71,45 @@ Because command lines cannot be safely redacted without breaking command syntax 
 ### 5. Open Problems
 
 - None. Full offline test suite passed (1001 passed, 24 skipped, 0 failed in 833.45s).
+
+## Fix 3 (Phase 7): Classifier Gaps
+
+### 1. What Changed (Files and Lines)
+
+- `src/jev/workspace.py`:
+  - Lines 136–161: Enhanced `is_shared_test_surface` to recognize helper and utility files by name (`testing_utils.py`, `test_util*`, `testutils*`, `test_helpers*`) as shared test surface. For files named `test_utils`, if candidate/base content explicitly defines actual test cases (`def test_...`), it allows targeted test classification for a utils module.
+  - Lines 165–183: Updated `is_test_file` to:
+    - Accept optional `content: Optional[str] = None` and forward it to `is_shared_test_surface(path, candidate_content=content)`.
+    - Recognize C# test conventions: files ending in `test.cs` / `tests.cs` (e.g. `FooTests.cs`, `*Test.cs`, `*Tests.cs`) and files under directory paths ending in `.Tests` or `.Test` (e.g. `Foo.Tests/FooTests.cs`).
+  - Lines 186–203: Added `target_matches_authored_test(target_path: Union[str, Path], authored_path: Union[str, Path]) -> bool` to perform normalized path comparison: checks exact path equality or verifies that the target path is a parent directory of the authored test file.
+  - Lines 1762: Updated `classify_touched_paths` to pass `content=self._get_candidate_content(posix_p)` to `is_test_file`.
+  - Line 2766: Replaced loose bidirectional substring matching `auth_t in tp or tp in auth_t` in `is_worker_authored_only` determination with `target_matches_authored_test(tp, auth_t)`.
+- `tests/test_phase7_test_surface_integrity.py`:
+  - Line 46: Imported `target_matches_authored_test`.
+  - Lines 476–542: Added unit tests:
+    - `test_csharp_test_file_classifier`: tests `is_test_file("Foo.Tests/FooTests.cs")`, `*Test.cs`, `*Tests.cs`, `.Tests/` and `.Test/` folders, and negative non-test cases.
+    - `test_helper_files_classified_as_shared_test_surface`: tests `tests/testing_utils.py`, `test_util*`, `testutils*`, and standard authored test files.
+    - `test_target_matches_authored_test_normalized_equality_and_parent_dir`: tests exact path equality, parent directory matching, and negative tests for similar name substrings.
+
+### 2. How It Works
+
+1. **C# Test Recognition**: .NET test naming conventions typically place test classes in projects/folders ending in `.Tests` or `.Test` (such as `Foo.Tests/FooTests.cs`), with file names ending in `Test.cs` or `Tests.cs`. `is_test_file` now checks both parent component names ending with `.tests`/`.test` and file suffixes ending in `test.cs`/`tests.cs`.
+2. **Helper File Classification**: Test helper scripts like `tests/testing_utils.py`, `test_utils.py`, and `testutils.py` do not contain standalone test suites; they provide fixtures and utilities shared across tests. They are categorized as shared test surface rather than authored test files, ensuring edits to them trigger shared surface handling rather than worker-authored test paths.
+3. **Targeted Authorship Matching**: Instead of substring matching (`auth_t in tp or tp in auth_t`), which erroneously matches unrelated files sharing prefix substrings (e.g. `test_foo` in `test_foo_extra.py`), `target_matches_authored_test` normalizes directory separators and verifies either exact path equality or directory-ancestor hierarchy (`authored_path.startswith(target_dir + "/")`).
+
+### 3. Rule Enforcement: Enforced by Test vs Only by Prompt
+
+| Rule / Requirement | Enforced By Test | Enforced Only By Prompt | Test Name(s) |
+|---|:---:|:---:|---|
+| `is_test_file("Foo.Tests/FooTests.cs")` and C# conventions return True | Yes | No | `test_csharp_test_file_classifier` |
+| Helper files (`testing_utils.py`, `test_util*`, `testutils*`) count as shared test surface | Yes | No | `test_helper_files_classified_as_shared_test_surface` |
+| Author matching requires normalized path equality or parent directory containment | Yes | No | `test_target_matches_authored_test_normalized_equality_and_parent_dir` |
+| Similar test names do not falsely match as worker-authored targets | Yes | No | `test_target_matches_authored_test_normalized_equality_and_parent_dir` |
+
+### 4. Unrequested Changes
+
+- None.
+
+### 5. Open Problems
+
+- None. Full offline test suite passed (1004 passed, 24 skipped, 0 failed in 866.57s).
