@@ -225,7 +225,18 @@ def is_build_or_test_config(
 
         return False
 
-    # 3. Known build and test config filenames
+    # 3. Structural check for Makefile test recipe
+    if filename in ("Makefile", "GNUmakefile", "makefile"):
+        if base_content is None and candidate_content is None:
+            return True
+        from jev.proposals import extract_makefile_target_and_recipe
+        base_t, base_r = extract_makefile_target_and_recipe(base_content or "")
+        cand_t, cand_r = extract_makefile_target_and_recipe(candidate_content or "")
+        if base_t != cand_t or base_r != cand_r:
+            return True
+        return False
+
+    # 4. Known build and test config filenames
     if filename in BUILD_TEST_CONFIG_FILES or norm in BUILD_TEST_CONFIG_FILES:
         return True
 

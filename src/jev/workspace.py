@@ -116,12 +116,14 @@ def is_shared_test_surface(
         return True
 
     # 2. Build or test config, task definitions, package scripts
-    if filename in ("package.json", "pyproject.toml"):
+    if filename in ("package.json", "pyproject.toml", "Makefile", "GNUmakefile", "makefile"):
         if base_content is not None or candidate_content is not None:
             if is_build_or_test_config(path, base_content, candidate_content):
                 return True
             else:
                 return False
+        elif is_build_or_test_config(path):
+            return True
     elif is_build_or_test_config(path):
         return True
 
@@ -1784,7 +1786,10 @@ class Workspace:
                 res["protected_verifier_command"].append(posix_p)
             elif is_shared_test_surface(posix_p, self._get_base_content(posix_p, base_commit), self._get_candidate_content(posix_p)):
                 res["worker_staged_shared_test_surface"].append(posix_p)
-            elif is_test_file(posix_p, content=self._get_candidate_content(posix_p)):
+            elif is_test_file(posix_p, content=self._get_candidate_content(posix_p)) or (
+                self._get_base_content(posix_p, base_commit) is not None
+                and is_test_file(posix_p, content=self._get_base_content(posix_p, base_commit))
+            ):
                 base_content = self._get_base_content(posix_p, base_commit)
                 if base_content is not None:
                     res["pre_existing_test_surface"].append(posix_p)
@@ -2686,6 +2691,138 @@ class Workspace:
                     self._force_rmtree(cand_wt_path)
                 self._run_repo_git(["worktree", "prune"])
 
+    def _is_test_file_in_ticket_scope(
+        self,
+        file_path: str,
+        ticket: Optional[Union[str, Any]] = None,
+        ticket_scope: Optional[Sequence[str]] = None,
+        subgoal_scope: Optional[Sequence[str]] = None,
+    ) -> bool:
+        norm_p = Path(file_path).as_posix().lower()
+        file_name = Path(file_path).name.lower()
+        stem = Path(file_path).stem.lower()
+
+        # Check explicit ticket_scope sequence
+        if ticket_scope:
+            for s in ticket_scope:
+                norm_s = Path(s).as_posix().lower()
+                if norm_p == norm_s or norm_p.endswith("/" + norm_s) or norm_s.endswith("/" + norm_p) or file_name == norm_s or stem == norm_s:
+                    return True
+                if norm_s.endswith("/") and norm_p.startswith(norm_s):
+                    return True
+
+        # Check ticket string
+        if isinstance(ticket, str) and ticket:
+            t_lower = ticket.lower()
+            if norm_p in t_lower or file_name in t_lower or stem in t_lower:
+                return True
+
+        # Check ticket dict/object if applicable
+        if isinstance(ticket, dict):
+            t_scope = ticket.get("scope") or ticket.get("ticket_scope")
+            if t_scope and isinstance(t_scope, (list, tuple, set)):
+                return self._is_test_file_in_ticket_scope(file_path, ticket_scope=list(t_scope))
+
+        # Check subgoal_scope if provided and matches ticket context
+        if subgoal_scope:
+            for s in subgoal_scope:
+                norm_s = Path(s).as_posix().lower()
+                if norm_p == norm_s or norm_p.endswith("/" + norm_s) or norm_s.endswith("/" + norm_p) or file_name == norm_s or stem == norm_s:
+                    return True
+                if norm_s.endswith("/") and norm_p.startswith(norm_s):
+                    return True
+
+        return False
+
+    def _run_original_tests_in_scratch(
+        self,
+        changed_test_files: Sequence[str],
+        test_cmd: Optional[List[str]],
+        base_commit_ref: str,
+    ) -> Tuple[int, str, str, Optional[List[str]]]:
+        """Runs the original base versions of modified or deleted test files in an isolated scratch copy against candidate code.
+
+        Never modifies files in the candidate worktree or real repository.
+        """
+        worktree_base = self.repo_dir / ".jev-worktrees"
+        worktree_base.mkdir(parents=True, exist_ok=True)
+        scratch_path = (worktree_base / f"scratch-verify-{uuid.uuid4().hex[:8]}").resolve()
+
+        used_git_worktree = False
+        res = self._run_repo_git(["worktree", "add", "--detach", str(scratch_path), base_commit_ref])
+        if res.returncode == 0:
+            used_git_worktree = True
+        else:
+            shutil.copytree(
+                self.worktree_dir,
+                scratch_path,
+                ignore=shutil.ignore_patterns(".git", ".jev-worktrees", "node_modules", ".pytest_cache", "__pycache__"),
+            )
+
+        try:
+            self._link_node_modules(self.repo_dir, scratch_path)
+
+            changed_set = {Path(p).as_posix() for p in changed_test_files}
+
+            if used_git_worktree:
+                staged_files = list(self.worker_staged_paths) if self.worker_staged_paths else []
+                if not staged_files:
+                    diff_res = self._run_git(["diff", "--name-only", str(base_commit_ref)])
+                    if diff_res.returncode == 0 and diff_res.stdout.strip():
+                        staged_files = [p.strip() for p in diff_res.stdout.splitlines() if p.strip()]
+
+                for sf in staged_files:
+                    norm_sf = Path(sf).as_posix()
+                    if norm_sf in changed_set:
+                        continue
+                    src_file = self.worktree_dir / sf
+                    dst_file = scratch_path / sf
+                    if src_file.exists() and src_file.is_file():
+                        dst_file.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(src_file, dst_file)
+                    elif not src_file.exists() and dst_file.exists():
+                        try:
+                            dst_file.unlink()
+                        except Exception:
+                            pass
+
+            # Restore original base versions of all changed_test_files in scratch_path
+            for tf in changed_test_files:
+                base_c = self._get_base_content(tf, base_commit_ref)
+                tf_dst = scratch_path / tf
+                if base_c is not None:
+                    tf_dst.parent.mkdir(parents=True, exist_ok=True)
+                    tf_dst.write_text(base_c, encoding="utf-8")
+                else:
+                    if tf_dst.exists():
+                        try:
+                            tf_dst.unlink()
+                        except Exception:
+                            pass
+
+            cmd = test_cmd
+            if not cmd:
+                resolved = self.resolve_test_command()
+                cmd = resolved.command if resolved else None
+            if not cmd:
+                cmd = ["pytest"]
+
+            proc = self._run_test_subprocess(cmd, cwd=scratch_path, timeout=self.test_timeout)
+            exit_code = proc.returncode if hasattr(proc, "returncode") else 0
+            stdout_str = proc.stdout if isinstance(proc.stdout, str) else (proc.stdout.decode("utf-8", errors="replace") if proc.stdout else "")
+            stderr_str = proc.stderr if isinstance(proc.stderr, str) else (proc.stderr.decode("utf-8", errors="replace") if proc.stderr else "")
+            combined = f"{stdout_str}\n{stderr_str}".strip()
+            failing_ids = parse_failing_test_ids(combined, exit_code=exit_code)
+            return exit_code, stdout_str, stderr_str, list(failing_ids) if failing_ids else None
+        finally:
+            if scratch_path.exists():
+                self._unlink_node_modules(scratch_path)
+                if used_git_worktree:
+                    self._run_repo_git(["worktree", "remove", "--force", str(scratch_path)])
+                    self._run_repo_git(["worktree", "prune"])
+                if scratch_path.exists():
+                    self._force_rmtree(scratch_path)
+
     def evaluate_tests(
         self,
         subgoal: Subgoal,
@@ -2695,6 +2832,8 @@ class Workspace:
         compile_res: Optional[Dict[str, Any]] = None,
         attempt: int = 1,
         rerun_mode: Optional[str] = None,
+        ticket: Optional[Union[str, Any]] = None,
+        ticket_scope: Optional[Sequence[str]] = None,
     ) -> Optional[MechanicalEvidence]:
         """Evaluates tests using same-command comparison between base and candidate."""
         if test_policy == "never":
@@ -3122,6 +3261,83 @@ class Workspace:
                 ev_level = EvidenceLevel.EXIT_ONLY
 
             is_exit_only = (ev_level == EvidenceLevel.EXIT_ONLY)
+
+            # Phase 7 Fix 7: Check for modified or deleted pre-existing test files
+            actually_changed_preexisting_tests = []
+            if worker_edited_preexisting_tests:
+                base_ref_val = base_commit or self.base_commit or self._get_head_commit() or "HEAD"
+                for tf in worker_edited_preexisting_tests:
+                    base_c = self._get_base_content(tf, base_ref_val)
+                    cand_c = self._get_candidate_content(tf)
+                    if cand_c is None or (base_c is not None and cand_c != base_c):
+                        actually_changed_preexisting_tests.append(tf)
+
+            if actually_changed_preexisting_tests:
+                # Check if ticket scope explicitly includes the changed test files
+                is_declared_in_ticket = all(
+                    self._is_test_file_in_ticket_scope(
+                        tf,
+                        ticket=ticket or getattr(self, "current_ticket", None),
+                        ticket_scope=ticket_scope,
+                    )
+                    for tf in actually_changed_preexisting_tests
+                )
+                if is_declared_in_ticket:
+                    return MechanicalEvidence(
+                        mech_status=MechStatus.UNMEASURED,
+                        reason=MechReason.TEST_SURFACE_CHANGED,
+                        evidence_level=EvidenceLevel.NONE,
+                        comparison=Comparison.INCONCLUSIVE,
+                        comparison_valid=False,
+                        approval_valid=True,
+                        verifier_modified=True,
+                        test_surface_changed=bool(test_surface_changed),
+                        lockfile_changed=bool(lockfile_changed),
+                        mechanically_unverified=True,
+                        unverified_kind="verifier_modified",
+                        command_identity={**cmd_identity, "cmd": last_run.get("argv")},
+                        target_scope=target_scope_dict,
+                        target_rule=target_rule,
+                        target_confidence=target_confidence,
+                        worker_staged_paths=staged_paths,
+                        attribution_note="Pre-existing test file modified/deleted within declared ticket scope; human verification required.",
+                    )
+
+                # Not declared in ticket scope: restore original base test files in scratch copy and run against candidate code
+                scratch_exit, scratch_out, scratch_err, scratch_failing_ids = self._run_original_tests_in_scratch(
+                    changed_test_files=actually_changed_preexisting_tests,
+                    test_cmd=last_run.get("argv") or (resolved_cmd.command if resolved_cmd else None),
+                    base_commit_ref=base_ref_val,
+                )
+
+                if scratch_exit != 0:
+                    failing_ids = scratch_failing_ids or list(actually_changed_preexisting_tests)
+                    combined_tail = f"{scratch_out}\n{scratch_err}".strip()[-1000:]
+                    ev = MechanicalEvidence(
+                        mech_status=MechStatus.FAIL,
+                        reason=None,
+                        evidence_level=EvidenceLevel.COUNTED if failing_ids else EvidenceLevel.EXIT_ONLY,
+                        failing_test_ids=failing_ids,
+                        comparison=Comparison.CANDIDATE_ONLY,
+                        comparison_valid=True,
+                        approval_valid=True,
+                        verifier_modified=True,
+                        test_surface_changed=bool(test_surface_changed),
+                        lockfile_changed=bool(lockfile_changed),
+                        mechanically_unverified=False,
+                        command_identity={**cmd_identity, "cmd": last_run.get("argv")},
+                        target_scope=target_scope_dict,
+                        target_rule=target_rule,
+                        target_confidence=target_confidence,
+                        worker_staged_paths=staged_paths,
+                        attribution_note=f"Pre-existing test weakened or deleted; original test fails on candidate: {', '.join(failing_ids[:5])}",
+                    )
+                    self.last_test_run["outcome"] = TestOutcome.FAILED.value
+                    self.last_test_run["exit_code"] = scratch_exit
+                    self.last_test_run["failing_test_ids"] = failing_ids
+                    self.last_test_run["output_tail"] = combined_tail
+                    return ev
+
             if verifier_modified_flag or test_surface_changed or lockfile_changed or is_worker_authored_only:
                 ev_level = EvidenceLevel.EXIT_ONLY
                 is_exit_only = True
@@ -4914,6 +5130,8 @@ class Workspace:
         base_commit: Optional[str] = None,
         test_policy: str = "auto",
         test_targets: Optional[Sequence[Union[str, Path]]] = None,
+        ticket: Optional[Union[str, Any]] = None,
+        ticket_scope: Optional[Sequence[str]] = None,
     ) -> MechanicalCheckResult:
         self.last_test_run = None
         self.last_compile_run = None
@@ -5097,6 +5315,8 @@ class Workspace:
                 test_policy=test_policy,
                 test_targets=test_targets,
                 compile_res=compile_res,
+                ticket=ticket,
+                ticket_scope=ticket_scope,
             )
             test_run_details = getattr(self, "last_test_run", None)
             if isinstance(test_run_details, dict):
@@ -5173,7 +5393,9 @@ class Workspace:
                 test_classification = TestOutcome.FAILED.value
                 full_suite_clean = False
                 reason_val = mech_evidence.reason.value if hasattr(mech_evidence.reason, "value") else str(mech_evidence.reason)
-                failed_check_val = "env_not_ready" if mech_evidence.reason in (MechReason.MISSING_TOOL, MechReason.ENVIRONMENT_UNAVAILABLE) else "tests"
+                failed_check_val = "env_not_ready" if mech_evidence.reason in (MechReason.MISSING_TOOL, MechReason.ENVIRONMENT_UNAVAILABLE) else (
+                    "test_surface_changed" if (mech_evidence.reason == MechReason.TEST_SURFACE_CHANGED or getattr(mech_evidence, "test_surface_changed", False) or getattr(mech_evidence, "verifier_modified", False)) else "tests"
+                )
                 detail_msg = f"Environment not ready: {reason_val}" if failed_check_val == "env_not_ready" else f"Mechanical tests unmeasured: {reason_val}"
                 return self._finalize_mechanical_result(MechanicalCheckResult(
                     passed=False,

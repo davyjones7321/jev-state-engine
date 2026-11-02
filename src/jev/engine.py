@@ -3835,6 +3835,10 @@ def node_gate(
         kwargs["base_commit"] = subgoal_base_commit
     if _accepts_param(workspace.run_mechanical_checks, "test_policy"):
         kwargs["test_policy"] = test_policy
+    if _accepts_param(workspace.run_mechanical_checks, "ticket"):
+        kwargs["ticket"] = state.get("ticket")
+    if _accepts_param(workspace.run_mechanical_checks, "ticket_scope"):
+        kwargs["ticket_scope"] = state.get("ticket_scope")
     targets = _test_targets(workspace, diff, subgoal.scope)
     should_target = bool(targets and (test_policy == "always" or
                                       (test_policy == "auto" and subgoal.expects_tests)))

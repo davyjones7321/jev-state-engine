@@ -356,3 +356,65 @@ Single-letter flags `-i`, `-w`, and `-d` have conflicting meanings across tools:
 ### 5. Open Problems
 
 - None. Full offline test suite passed (1040 passed, 24 skipped, 2 deselected, 0 failed in 1009.83s).
+
+
+---
+
+## Fix 7 (Phase 7): Mechanical Response to Weakened or Deleted Tests
+
+### 1. Files and Lines Changed
+
+- `src/jev/repo_config.py`:
+  - Lines 228–238: In `is_build_or_test_config`, added structural parsing for `Makefile`, `GNUmakefile`, and `makefile` using `extract_makefile_target_and_recipe`. When base and candidate content are provided, returns `True` only if the test target or recipe changed, ensuring non-test target edits (e.g. `build:`) do not trigger test surface changes.
+- `src/jev/workspace.py`:
+  - Lines 119–125: In `is_shared_test_surface`, recognized `Makefile`, `GNUmakefile`, and `makefile` as build/test config, and evaluated recipe changes via `is_build_or_test_config`.
+  - Lines 1789–1794: In `classify_touched_paths`, detected deleted pre-existing test files by checking whether a file existed at base commit and was a test file (`is_test_file(posix_p, content=base_content)`), placing it into `pre_existing_test_surface`.
+  - Lines 2692–2734: Implemented `_is_test_file_in_ticket_scope` to check whether a modified/deleted test file path is explicitly authorized by ticket scope (checking `ticket_scope` sequences, ticket strings, and ticket dictionaries).
+  - Lines 2735–2825: Implemented `_run_original_tests_in_scratch` to isolate candidate test verification:
+    - Creates a temporary detached worktree or clean scratch copy from base commit (`.jev-worktrees/scratch-verify-<id>`).
+    - Applies candidate production code edits while restoring the original base versions of any modified or deleted pre-existing test files.
+    - Executes the test suite against the scratch copy without touching candidate worktree files or repo files.
+    - Cleans up the scratch worktree with `worktree remove --force` and `worktree prune`.
+    - Parses and returns failing test identifiers and exit codes.
+  - Lines 3264–3339: In `evaluate_tests`:
+    - Checks for modified or deleted pre-existing test files.
+    - If declared in ticket scope: returns `UNMEASURED(reason=TEST_SURFACE_CHANGED, verifier_modified=True)` with 0 strikes.
+    - If not declared in ticket scope: runs original base test files in scratch copy. If scratch run fails, returns strikable `FAIL` with failing test IDs, `comparison=Comparison.CANDIDATE_ONLY`, and `verifier_modified=True`.
+    - If scratch run passes, continues with `EXIT_ONLY` pass and `mechanically_unverified=True`.
+  - Lines 5130–5133, 5317–5318: In `run_mechanical_checks`: accepted `ticket` and `ticket_scope` parameters and forwarded them to `evaluate_tests`.
+  - Lines 5396–5398: In `run_mechanical_checks`: on UNMEASURED with `TEST_SURFACE_CHANGED` or `verifier_modified`, set `failed_check="test_surface_changed"`.
+- `src/jev/engine.py`:
+  - Lines 3838–3841: In `node_gate`: passed `ticket=state.get("ticket")` and `ticket_scope=state.get("ticket_scope")` to `workspace.run_mechanical_checks`.
+- `tests/test_fix7_weakened_deleted_tests.py`:
+  - Added unit and integration tests covering all 5 required specifications:
+    - (a) `test_weaken_assertion_edited_passes_original_fails_strikable_fail`: weakening assertion so candidate passes while original fails produces strikable FAIL (1 strike in `node_gate`) with failing test IDs.
+    - (b) `test_delete_test_file_original_restored_fail_if_behavior_broke`: deleting a pre-existing test file restores the original test in scratch copy, producing strikable FAIL if candidate behavior is broken.
+    - (c) `test_ticket_scope_explicitly_includes_changed_test_file_unmeasured`: pre-existing test file modified within explicit ticket scope returns `UNMEASURED(TEST_SURFACE_CHANGED, verifier_modified=True)` with 0 strikes.
+    - (d) `test_untouched_tests_behavior_unchanged`: untouched pre-existing tests preserve normal behavior and bypass scratch verification.
+    - (e) `test_edited_makefile_test_recipe_handled_same_as_changed_test_surface`: edited Makefile test recipe is classified as shared test surface, producing `EXIT_ONLY` unverified pass or `UNMEASURED` failure with 0 strikes, while editing non-test targets does not trigger test surface changes.
+
+### 2. How It Works
+
+1. **Isolation in Scratch Copy**: To prevent verifier poisoning or test weakening, candidate runs that modify or delete pre-existing tests are validated against the base versions of those tests. This run occurs exclusively inside a temporary scratch worktree detached from base (`.jev-worktrees/scratch-verify-*`), ensuring the candidate working tree is never touched or polluted.
+2. **Strikable Failure on Regression**: If the original base test fails against the candidate code, it proves that the test modification weakened verification or obscured a real regression. The engine returns `MechStatus.FAIL`, extracts failing test IDs, and awards 1 mechanical strike in `node_gate`.
+3. **Explicit Ticket Scope Exemption**: When a ticket specifically authorizes modifying or updating existing test suites (e.g. updating assertions for breaking requirement changes), `_is_test_file_in_ticket_scope` detects that the changed test is in `ticket_scope` or ticket description. Instead of auto-failing, it returns `UNMEASURED(TEST_SURFACE_CHANGED, verifier_modified=True)` and incurs 0 strikes, routing to human / Jev review.
+4. **Makefile Test Recipe Structural Change**: `Makefile` test targets and recipes are parsed structurally with `extract_makefile_target_and_recipe`. Editing the test recipe flags `worker_staged_shared_test_surface` and `test_surface_changed=True`, treating Makefile changes identically to shared test configuration (`conftest.py`) changes without generating false parser-free strikes. Editing unrelated Makefile targets (e.g. `build:`) does not trigger test surface changes.
+
+### 3. Rule Enforcement: Enforced by Test vs Only by Prompt
+
+| Rule / Requirement | Enforced By Test | Enforced Only By Prompt | Test Name(s) |
+|---|:---:|:---:|---|
+| Weakening assertion so edited passes but original fails produces strikable FAIL with test IDs | Yes | No | `test_weaken_assertion_edited_passes_original_fails_strikable_fail` |
+| Deleting test file restores original in scratch; fails if candidate broken | Yes | No | `test_delete_test_file_original_restored_fail_if_behavior_broke` |
+| Ticket scope explicitly naming test file returns UNMEASURED (0 strikes, no auto-FAIL) | Yes | No | `test_ticket_scope_explicitly_includes_changed_test_file_unmeasured` |
+| Untouched tests preserve normal behavior and bypass scratch checks | Yes | No | `test_untouched_tests_behavior_unchanged` |
+| Edited Makefile test recipe handled same as changed test surface | Yes | No | `test_edited_makefile_test_recipe_handled_same_as_changed_test_surface` |
+| All existing Phase 7 tests pass unmodified | Yes | No | `tests/test_phase7_test_surface_integrity.py` |
+
+### 4. Unrequested Changes
+
+- None.
+
+### 5. Open Problems
+
+- None. Full offline test suite passed (1045 passed, 24 skipped, 2 deselected, 0 failed in 948.72s).
