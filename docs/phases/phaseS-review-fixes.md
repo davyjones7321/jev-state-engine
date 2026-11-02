@@ -391,14 +391,14 @@ Single-letter flags `-i`, `-w`, and `-d` have conflicting meanings across tools:
     - (b) `test_delete_test_file_original_restored_fail_if_behavior_broke`: deleting a pre-existing test file restores the original test in scratch copy, producing strikable FAIL if candidate behavior is broken.
     - (c) `test_ticket_scope_explicitly_includes_changed_test_file_unmeasured`: pre-existing test file modified within explicit ticket scope returns `UNMEASURED(TEST_SURFACE_CHANGED, verifier_modified=True)` with 0 strikes.
     - (d) `test_untouched_tests_behavior_unchanged`: untouched pre-existing tests preserve normal behavior and bypass scratch verification.
-    - (e) `test_edited_makefile_test_recipe_handled_same_as_changed_test_surface`: edited Makefile test recipe is classified as shared test surface, producing `EXIT_ONLY` unverified pass or `UNMEASURED` failure with 0 strikes, while editing non-test targets does not trigger test surface changes.
+     - (e) `test_edited_makefile_test_recipe_handled_same_as_changed_test_surface`: the pre-7c regression coverage preserves non-test target behavior, while 7c adds mechanical rerunning of the original recipe.
 
 ### 2. How It Works
 
 1. **Isolation in Scratch Copy**: To prevent verifier poisoning or test weakening, candidate runs that modify or delete pre-existing tests are validated against the base versions of those tests. This run occurs exclusively inside a temporary scratch worktree detached from base (`.jev-worktrees/scratch-verify-*`), ensuring the candidate working tree is never touched or polluted.
 2. **Strikable Failure on Regression**: If the original base test fails against the candidate code, it proves that the test modification weakened verification or obscured a real regression. The engine returns `MechStatus.FAIL`, extracts failing test IDs, and awards 1 mechanical strike in `node_gate`.
 3. **Explicit Ticket Scope Exemption**: When a ticket specifically authorizes modifying or updating existing test suites (e.g. updating assertions for breaking requirement changes), `_is_test_file_in_ticket_scope` detects that the changed test is in `ticket_scope` or ticket description. Instead of auto-failing, it returns `UNMEASURED(TEST_SURFACE_CHANGED, verifier_modified=True)` and incurs 0 strikes, routing to human / Jev review.
-4. **Makefile Test Recipe Structural Change**: `Makefile` test targets and recipes are parsed structurally with `extract_makefile_target_and_recipe`. Editing the test recipe flags `worker_staged_shared_test_surface` and `test_surface_changed=True`, treating Makefile changes identically to shared test configuration (`conftest.py`) changes without generating false parser-free strikes. Editing unrelated Makefile targets (e.g. `build:`) does not trigger test surface changes.
+4. **Makefile Test Recipe Structural Change**: `Makefile` test targets and recipes are parsed structurally with `extract_makefile_target_and_recipe`. Before 7c, an edited recipe could produce an exit-only result without mechanically checking the original recipe. 7c now restores the base Makefile in a scratch worktree and reruns the approved test command; a failing original recipe is a strikable FAIL, while an explicitly declared recipe change is UNMEASURED. Editing unrelated Makefile targets (e.g. `build:`) does not trigger test-surface verification.
 
 ### 3. Rule Enforcement: Enforced by Test vs Only by Prompt
 
@@ -408,7 +408,8 @@ Single-letter flags `-i`, `-w`, and `-d` have conflicting meanings across tools:
 | Deleting test file restores original in scratch; fails if candidate broken | Yes | No | `test_delete_test_file_original_restored_fail_if_behavior_broke` |
 | Ticket scope explicitly naming test file returns UNMEASURED (0 strikes, no auto-FAIL) | Yes | No | `test_ticket_scope_explicitly_includes_changed_test_file_unmeasured` |
 | Untouched tests preserve normal behavior and bypass scratch checks | Yes | No | `test_untouched_tests_behavior_unchanged` |
-| Edited Makefile test recipe handled same as changed test surface | Yes | No | `test_edited_makefile_test_recipe_handled_same_as_changed_test_surface` |
+| Edited Makefile test recipe is mechanically rerun; weakened recipe produces strikable FAIL | Yes | No | `test_weakened_makefile_recipe_runs_original_and_strikes` |
+| Declared recipe edit is UNMEASURED without a scratch run; non-test recipe edit is unchanged | Yes | No | `test_declared_makefile_recipe_change_is_unmeasured_without_scratch`, `test_non_test_makefile_target_and_untouched_recipe_do_not_run_scratch` |
 | All existing Phase 7 tests pass unmodified | Yes | No | `tests/test_phase7_test_surface_integrity.py` |
 
 ### 4. Unrequested Changes
@@ -417,7 +418,181 @@ Single-letter flags `-i`, `-w`, and `-d` have conflicting meanings across tools:
 
 ### 5. Open Problems
 
-- None. Full offline test suite passed (1045 passed, 24 skipped, 2 deselected, 0 failed in 948.72s).
+- Before 7b, ticket authorization could match a test-file stem or bidirectional suffix, allowing unrelated files to be declared authorized. 7b fixes this with whole-token file/path matching and normalized explicit scopes.
+- Before 7c, an edited Makefile test recipe could remain EXIT_ONLY without a mechanical check of the original recipe. 7c fixes this with scratch-worktree reruns and strikable failures.
+- Full offline test suite passed (1125 passed, 24 skipped, 2 deselected, 0 failed before the 8c documentation changes).
+
+
+---
+
+## Fix 7b (Phase 7): Strict Ticket-Scope Authorization
+
+### 1. Files and Lines Changed
+
+- `src/jev/workspace.py`:
+  - Lines 2694–2731: Reworked `_is_test_file_in_ticket_scope` to normalize path separators and dot segments, authorize explicit scopes only by normalized path equality or directory prefix, and match ticket text only by whole relative path or exact filename tokens. Removed stem-substring matching and bidirectional `endswith` authorization.
+- `tests/test_fix7b_ticket_scope.py`:
+  - Added regression tables for the required unauthorized ticket phrases, exact path/filename mentions, explicit scopes, directory prefixes, normalized paths, and ticket dictionaries.
+
+### 2. How It Works
+
+An existing test file is authorized only when its normalized full path or exact filename appears as a whole token in the ticket text, or when an explicit ticket/subgoal scope equals the path or names an ancestor directory. Similar stems, suffixes, and unrelated words cannot authorize the file.
+
+### 3. Rule Enforcement: Enforced by Test vs Only by Prompt
+
+| Rule / Requirement | Enforced By Test | Enforced Only By Prompt | Test Name(s) |
+|---|:---:|:---:|---|
+| Stem substring does not authorize `tests.py`, `tests/api.py`, or `tests/test_login.py` | Yes | No | `test_ticket_text_requires_whole_path_or_filename` |
+| Exact full path or filename token authorizes the test | Yes | No | `test_ticket_text_requires_whole_path_or_filename` |
+| Explicit scope uses normalized equality or directory prefix only | Yes | No | `test_explicit_scope_requires_normalized_equality_or_directory_prefix` |
+| Ticket dictionaries use the same strict scope rules | Yes | No | `test_ticket_dict_scope_uses_same_strict_rules` |
+
+### 4. Unrequested Changes
+
+- None.
+
+### 5. Open Problems
+
+- None specific to 7b. The deliberate Phase S leftovers are recorded in the 8c section below.
+
+
+---
+
+## Fix 7c (Phase 7): Mechanical Response to Edited Test Recipes
+
+### 1. Files and Lines Changed
+
+- `src/jev/workspace.py`:
+  - Lines 2727–2817: Extended scratch verification to restore changed verifier/config files as well as original test files.
+  - Lines 2819–2884: Added detection for changed Makefile test recipes, package.json `scripts.test`, and pytest configuration files (`pytest.ini`, `.pytest.ini`, `pyproject.toml`, `tox.ini`, `setup.cfg`) when the approved command runs them.
+  - Lines 3349–3427: Rerun the original recipe/config in a detached scratch worktree against candidate code; return a strikable FAIL with failing IDs on failure, or UNMEASURED with `verifier_modified` when the ticket explicitly declares the file.
+- `tests/test_fix7c_edited_test_recipes.py`:
+  - Added Makefile weakened-recipe, declared-scope, non-test-target, untouched-recipe, package.json, pytest.ini, and node-gate strike tests.
+
+### 2. How It Works
+
+The candidate command runs first. If its test recipe changed, the engine creates a scratch worktree, copies candidate production changes into it, restores the base verifier/config file, and reruns the approved command. A failing original recipe is mechanical FAIL evidence and costs one strike through the existing `engine.node_gate` path. A declared edit is UNMEASURED with `verifier_modified=True` and no scratch run. A passing original recipe leaves the candidate as PASS but forces EXIT_ONLY evidence, so it is never counted or named evidence. Non-test Makefile targets and untouched recipes do not trigger this path.
+
+### 3. Rule Enforcement: Enforced by Test vs Only by Prompt
+
+| Rule / Requirement | Enforced By Test | Enforced Only By Prompt | Test Name(s) |
+|---|:---:|:---:|---|
+| Weakened Makefile recipe fails against candidate and costs a strike | Yes | No | `test_weakened_makefile_recipe_runs_original_and_strikes` |
+| Explicitly declared recipe edit is UNMEASURED without scratch verification | Yes | No | `test_declared_makefile_recipe_change_is_unmeasured_without_scratch` |
+| Non-test target edit and untouched recipe do not run scratch verification | Yes | No | `test_non_test_makefile_target_and_untouched_recipe_do_not_run_scratch` |
+| package.json `scripts.test` and pytest.ini changes identify the original verifier | Yes | No | `test_package_json_test_script_and_pytest_config_are_originally_rechecked` |
+| Existing engine gate turns the mechanical FAIL into one strike | Yes | No | `test_weakened_makefile_recipe_runs_original_and_strikes` |
+
+### 4. Unrequested Changes
+
+- None.
+
+### 5. Open Problems
+
+- The cleanly covered recipe/config formats are Makefile targets, package.json `scripts.test`, and pytest.ini/pyproject.toml/tox.ini/setup.cfg detection. Other ecosystem-specific recipe syntaxes remain outside this fix.
+
+
+---
+
+## Fix 8a (Phase S): Redaction Gaps
+
+### 1. Files and Lines Changed
+
+- `src/jev/proposals.py`:
+  - Lines 47–78: Tightened secret-name matching and added env-style key/value redaction, bare Google API keys, JWTs, credentials in any URL scheme, and AWS secret-key context while excluding numeric counters and ordinary words.
+  - Lines 84–98: The structured-data path now uses the tightened key-name rule, preserving non-secret keys such as `token_count` and `KEYBOARD_LAYOUT`.
+- `tests/test_fix8a_redaction_gaps.py`:
+  - Added one table-driven case per requested secret shape, false-positive cases, structured-data coverage, idempotence, `None`, empty, and very-long input checks.
+
+### 2. How It Works
+
+Redaction matches secret keywords within underscore/hyphen-delimited environment names, rejects purely numeric values, recognizes Google and JWT token structures, and replaces credentials in any URI scheme's user-information section. The same precise key-name rule is applied recursively to dictionaries. Reapplying redaction is stable.
+
+### 3. Rule Enforcement: Enforced by Test vs Only by Prompt
+
+| Rule / Requirement | Enforced By Test | Enforced Only By Prompt | Test Name(s) |
+|---|:---:|:---:|---|
+| Env-style API key/password/secret values and AWS secret-key context are redacted | Yes | No | `test_requested_secret_shapes_are_fully_redacted` |
+| Bare Google keys and JWTs are redacted | Yes | No | `test_requested_secret_shapes_are_fully_redacted` |
+| postgres/mysql/mongodb/redis/amqp/ftp credentials are redacted | Yes | No | `test_requested_secret_shapes_are_fully_redacted` |
+| Counters, hashes, keyboard layout, and ordinary prose stay unchanged | Yes | No | `test_non_secret_values_remain_unchanged` |
+| Structured data preserves non-secret key names | Yes | No | `test_data_structure_redaction_keeps_non_secret_key_names` |
+| Redaction is idempotent and handles edge inputs | Yes | No | `test_redaction_is_idempotent_and_handles_empty_none_and_very_long_text` |
+
+### 4. Unrequested Changes
+
+- None.
+
+### 5. Open Problems
+
+- None known for the requested patterns. The redactor remains pattern-based and intentionally does not attempt semantic secret detection.
+
+
+---
+
+## Fix 8b (Phase S): Secret-File Denylist Gaps
+
+### 1. Files and Lines Changed
+
+- `src/jev/retrieval.py`:
+  - Lines 101–164: Expanded `is_secret_path` for service-account and credential JSON names, secret directories, registry/VCS/container credential files, Terraform state/vars, ECDSA/DSA private-key names, `.gnupg`, KDBX, JKS, and keystore files.
+- `docs/secrets-policy.md`:
+  - Documents the denylist and records that this policy document is intentionally allowed.
+- `tests/test_fix8b_secret_file_denylist.py`:
+  - Added denylist/allowlist tables and real `cat`, engine `read_file`, direct mutation, and engine `stage_file_mutation` coverage.
+
+### 2. How It Works
+
+All retrieval, workspace read/mutation, investigation, and implementation tools already call `is_secret_path`; expanding that single predicate propagates the denylist automatically. Paths under `secrets/`, `.secrets/`, and `.gnupg/` are denied recursively, while the documented policy file remains readable.
+
+### 3. Rule Enforcement: Enforced by Test vs Only by Prompt
+
+| Rule / Requirement | Enforced By Test | Enforced Only By Prompt | Test Name(s) |
+|---|:---:|:---:|---|
+| Requested secret-file patterns return True | Yes | No | `test_new_secret_paths_are_denied` |
+| README, source examples, dummy fixture JSON, and policy docs remain allowed | Yes | No | `test_normal_paths_and_documented_policy_are_allowed` |
+| Workspace cat and direct mutation are blocked | Yes | No | `test_new_secret_path_is_blocked_by_cat_and_stage_file_mutation` |
+| Engine read_file and stage_file_mutation tools are blocked | Yes | No | `test_engine_read_file_and_stage_file_mutation_tools_use_denylist` |
+
+### 4. Unrequested Changes
+
+- None.
+
+### 5. Open Problems
+
+- None specific to 8b. The deliberate Phase S leftovers are recorded in the 8c section below.
+
+
+---
+
+## Fix 8c (Phase S): Docs and Final Verification
+
+### 1. Files and Lines Changed
+
+- `docs/phases/phaseS-review-fixes.md`: Added the 7b, 7c, 8a, and 8b sections, corrected the Fix 7 recipe/open-problem text, and appended the raw final verifier output.
+- `docs/phases/phaseS.md`: Appended the required post-review addendum without rewriting the original report.
+
+### 2. How It Works
+
+The review report records each fix's changed files, behavior, enforcement tests, unrequested changes, and open problems. `scripts/verify_phase.py origin/phaseS-security-hardening` provides the final branch, diff, test-change, grep, collection, and offline-suite evidence copied verbatim below.
+
+### 3. Rule Enforcement: Enforced by Test vs Only by Prompt
+
+| Rule / Requirement | Enforced By Test | Enforced Only By Prompt | Test Name(s) |
+|---|:---:|:---:|---|
+| Review documentation covers 7b, 7c, 8a, and 8b | No | Yes | N/A (documentation review) |
+| Phase S report receives an addendum without rewriting prior text | No | Yes | N/A (documentation review) |
+| Final verifier is run against `origin/phaseS-security-hardening` and raw output is pasted | No | Yes | N/A (command output below) |
+
+### 4. Unrequested Changes
+
+- None.
+
+### 5. Open Problems
+
+- Self-check and compile commands such as `cargo check`, `mvn compile`, and `bun run typecheck` run repository build code without owner approval until the sandbox/container phase.
+- Episodic memory is written but never read by the engine.
+- The advisor has never run successfully end to end.
 
 
 ---
@@ -510,4 +685,120 @@ SKIPPED [1] tests\test_runner_fixtures.py:361: terraform not found
 SKIPPED [1] tests\test_runner_fixtures.py:361: ansible-lint not found
 SKIPPED [1] tests\test_runner_fixtures.py:361: helm not found
 1045 passed, 24 skipped, 2 deselected, 2 warnings in 972.12s (0:16:12)
+```
+
+## Final Verification (8c raw output)
+
+```
+=== Verification Report for base: origin/phaseS-security-hardening ===
+Branch: phaseS-review-fixes
+Commit: 22cab3631d99d6ad23e5384fab0613dac937b55c
+
+--- Diff stat vs origin/phaseS-security-hardening ---
+docs/phases/phaseS-review-fixes.md          | 688 ++++++++++++++++++++++++++++
+docs/phases/phaseS.md                       |   7 +
+docs/secrets-policy.md                      |  11 +
+requirements.txt                            |   1 +
+src/jev/engine.py                           | 180 ++++++--
+src/jev/preflight.py                        |  46 +-
+src/jev/process_runner.py                   |   5 +
+src/jev/proposals.py                    | 275 +++++++++--
+src/jev/repo_config.py                      |  91 +++-
+src/jev/retrieval.py                        |  30 +-
+src/jev/workspace.py                        | 526 ++++++++++++++++++++-
+tests/test_compile_gate.py                  | 321 +++++++++++++
+tests/test_fix7_weakened_deleted_tests.py   | 421 +++++++++++++++++
+tests/test_fix7b_ticket_scope.py            |  55 +++
+tests/test_fix7c_edited_test_recipes.py     | 144 ++++++
+tests/test_fix8a_redaction_gaps.py          |  76 +++
+tests/test_fix8b_secret_file_denylist.py    |  97 ++++
+tests/test_phase7_test_surface_integrity.py |  71 +++
+tests/test_preflight.py                     |  60 +++
+tests/test_proposals.py                     | 363 +++++++++++++++
+20 files changed, 3365 insertions(+), 103 deletions(-)
+
+--- Test Changes ---
+Added tests:
+  + test_plain_js_repo_compile_exempt
+  + test_ruby_repo_compile_exempt
+  + test_php_repo_compile_exempt
+  + test_missing_compiler_produces_unmeasured_missing_tool_in_ledger
+  + test_real_compile_failure_still_strikes
+  + test_compile_node_modules_missing_is_environment_unavailable_not_missing_tool
+  + test_compile_executable_not_found_in_path_is_missing_tool
+  + test_weaken_assertion_edited_passes_original_fails_strikable_fail
+  + test_delete_test_file_original_restored_fail_if_behavior_broke
+  + test_ticket_scope_explicitly_includes_changed_test_file_unmeasured
+  + test_untouched_tests_behavior_unchanged
+  + test_edited_makefile_test_recipe_handled_same_as_changed_test_surface
+  + test_ticket_text_requires_whole_path_or_filename
+  + test_explicit_scope_requires_normalized_equality_or_directory_prefix
+  + test_ticket_dict_scope_uses_same_strict_rules
+  + test_weakened_makefile_recipe_runs_original_and_strikes
+  + test_declared_makefile_recipe_change_is_unmeasured_without_scratch
+  + test_non_test_makefile_target_and_untouched_recipe_do_not_run_scratch
+  + test_package_json_test_script_and_pytest_config_are_originally_rechecked
+  + test_requested_secret_shapes_are_fully_redacted
+  + test_non_secret_values_remain_unchanged
+  + test_data_structure_redaction_keeps_non_secret_key_names
+  + test_redaction_is_idempotent_and_handles_empty_none_and_very_long_text
+  + test_new_secret_paths_are_denied
+  + test_normal_paths_and_documented_policy_are_allowed
+  + test_new_secret_path_is_blocked_by_cat_and_stage_file_mutation
+  + test_engine_read_file_and_stage_file_mutation_tools_use_denylist
+  + test_csharp_test_file_classifier
+  + test_helper_files_classified_as_shared_test_surface
+  + test_target_matches_authored_test_normalized_equality_and_parent_dir
+  + test_preflight_false_positives_cleared
+  + test_preflight_true_positives_still_flagged
+  + test_proposal_creation_never_starts_subprocess
+  + test_secrets_in_exact_argv_refuses_save_and_approval_and_writes_no_secrets
+  + test_save_proposal_redacts_stored_fields_and_env_vars
+  + test_makefile_latest_before_test_proposes_make_test
+  + test_makefile_recipe_shown_on_approval_screen
+  + test_editing_recipe_after_approval_invalidates_trust
+  + test_ci_install_line_before_pytest_proposes_pytest
+  + test_ci_multiline_run_block_extracts_test_command
+  + test_ci_workflow_expression_left_unexpanded_and_shown_on_screen
+  + test_unexpanded_ci_expression_cannot_be_approved_without_manual_command
+  + test_windows_make_lookup_resolves_mingw32_make
+  + test_approve_proposal_fails_when_save_refuses_secret
+
+--- Collected Test Counts ---
+  tests/test_compile_gate.py: 30 tests collected in 2.69s
+  tests/test_fix7_weakened_deleted_tests.py: 5 tests collected in 1.95s
+  tests/test_fix7b_ticket_scope.py: 27 tests collected in 1.02s
+  tests/test_fix7c_edited_test_recipes.py: 4 tests collected in 2.28s
+  tests/test_fix8a_redaction_gaps.py: 23 tests collected in 0.97s
+  tests/test_fix8b_secret_file_denylist.py: 26 tests collected in 1.96s
+  tests/test_phase7_test_surface_integrity.py: 11 tests collected in 1.98s
+  tests/test_preflight.py: 38 tests collected in 2.03s
+  tests/test_proposals.py: 21 tests collected in 0.99s
+
+--- Grep Checks ---
+Pattern 'git add -A' in src/jev/:
+  None found (clean)
+Pattern 'run_baseline_tests(' in src/jev/engine.py:
+  None found in engine.py (clean)
+Occurrences of 'FULL_SUITE_PASSED' in workspace.py and engine.py:
+  src/jev/engine.py:5021:                verify_classification = "FULL_SUITE_PASSED"
+  src/jev/workspace.py:2449:                    "outcome": TestOutcome.FULL_SUITE_PASSED.value,
+  src/jev/workspace.py:5559:                        test_classification = TestOutcome.FULL_SUITE_PASSED.value
+Occurrences of 'worktree_dir == self.repo_dir' in workspace.py (guard check):
+  src/jev/workspace.py:1662:        if self.worktree_dir == self.repo_dir:
+  src/jev/workspace.py:1699:        if self.worktree_dir == self.repo_dir:
+
+--- Pytest Offline Suite Summary ---
+SKIPPED [1] tests\test_runner_fixtures.py:361: gradle not found
+SKIPPED [1] tests\test_runner_fixtures.py:361: dotnet not found
+SKIPPED [1] tests\test_runner_fixtures.py:361: ctest not found
+SKIPPED [1] tests\test_runner_fixtures.py:361: ruby not found
+SKIPPED [1] tests\test_runner_fixtures.py:361: php not found
+SKIPPED [1] tests\test_runner_fixtures.py:325: Profile 'swiftpm-test' not supported on win32 (platforms: ['linux', 'darwin'])
+SKIPPED [1] tests\test_runner_fixtures.py:361: mix not found
+SKIPPED [1] tests\test_runner_fixtures.py:325: Profile 'xcode-test' not supported on win32 (platforms: ['darwin'])
+SKIPPED [1] tests\test_runner_fixtures.py:361: terraform not found
+SKIPPED [1] tests\test_runner_fixtures.py:361: ansible-lint not found
+SKIPPED [1] tests\test_runner_fixtures.py:361: helm not found
+1125 passed, 24 skipped, 2 deselected, 2 warnings in 845.14s (0:14:05)
 ```

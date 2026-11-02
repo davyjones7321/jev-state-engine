@@ -216,3 +216,10 @@ SKIPPED [1] tests\test_runner_fixtures.py:361: ansible-lint not found
 SKIPPED [1] tests\test_runner_fixtures.py:361: helm not found
 998 passed, 24 skipped, 2 deselected, 2 warnings in 850.20s (0:14:10)
 ```
+
+## Addendum (post-review)
+
+The follow-up review fixes are documented in `docs/phases/phaseS-review-fixes.md`.
+
+- 8a fixed redaction gaps for env-style secret names, bare Google API keys, JWTs, non-HTTP URL credentials, AWS secret-key context, and false-positive counter/key-name matches.
+- 8b fixed secret-file denylist gaps for credential manifests, secret directories, package/VCS/container credential files, Terraform state/vars, private-key names, and keystore formats.
