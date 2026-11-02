@@ -11,6 +11,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import json
+import logging
 import os
 import re
 import shlex
@@ -92,6 +93,30 @@ def redact_data_structure(data: Any) -> Any:
     return data
 
 
+logger = logging.getLogger(__name__)
+
+
+def argv_contains_secrets(argv: Sequence[str]) -> bool:
+    """Checks whether any argument or the combined command contains secret patterns."""
+    if not argv:
+        return False
+    for arg in argv:
+        if not isinstance(arg, str):
+            continue
+        if redact_secrets_in_text(arg) != arg:
+            return True
+        for pattern in SECRET_VALUE_PATTERNS:
+            if pattern.search(arg):
+                return True
+    joined = " ".join(argv)
+    if redact_secrets_in_text(joined) != joined:
+        return True
+    for pattern in SECRET_VALUE_PATTERNS:
+        if pattern.search(joined):
+            return True
+    return False
+
+
 def compute_proposal_identity_hash(
     repo_id: str,
     exact_argv: Sequence[str],
@@ -163,8 +188,51 @@ def get_proposals_dir(repo_dir: Union[str, Path]) -> Path:
     return pdir
 
 
-def save_proposal(proposal: Proposal, repo_dir: Union[str, Path]) -> Path:
-    """Saves proposal to .jev/proposals/<id>.json."""
+def save_proposal(
+    proposal: Proposal,
+    repo_dir: Union[str, Path],
+    raise_on_secret: bool = False,
+) -> Optional[Path]:
+    """Saves proposal to .jev/proposals/<id>.json with secrets redacted.
+
+    If secret patterns are found inside exact_argv, refuses to save the proposal
+    with a clear message to pass secrets via environment variables.
+    """
+    if argv_contains_secrets(proposal.exact_argv):
+        msg = (
+            "Refusing to save proposal: exact_argv contains secret token or credentials. "
+            "A command cannot be safely redacted; pass secrets via environment variables instead."
+        )
+        logger.warning(msg)
+        if raise_on_secret:
+            raise ValueError(msg)
+        return None
+
+    # Redact secrets in every stored text field and environment variables
+    proposal.source_evidence = redact_secrets_in_text(proposal.source_evidence)
+    if proposal.expanded_package_script:
+        proposal.expanded_package_script = redact_secrets_in_text(proposal.expanded_package_script)
+    if proposal.tool_path:
+        proposal.tool_path = redact_secrets_in_text(proposal.tool_path)
+    if proposal.tool_version:
+        proposal.tool_version = redact_secrets_in_text(proposal.tool_version)
+    if proposal.network_assumptions:
+        proposal.network_assumptions = redact_secrets_in_text(proposal.network_assumptions)
+    proposal.scope = [redact_secrets_in_text(s) for s in proposal.scope]
+    proposal.generated_paths = [redact_secrets_in_text(p) for p in proposal.generated_paths]
+    proposal.environment_variables = redact_secrets_in_env(proposal.environment_variables)
+
+    # Recompute identity hash to match the redacted environment variables
+    proposal.identity_hash = compute_proposal_identity_hash(
+        repo_id=proposal.repo_id,
+        exact_argv=proposal.exact_argv,
+        cwd=proposal.cwd,
+        platform=proposal.platform,
+        env=proposal.environment_variables,
+        timeout=proposal.timeout,
+        target_rule=proposal.target_rule,
+    )
+
     pdir = get_proposals_dir(repo_dir)
     target = pdir / f"{proposal.id}.json"
     target.write_text(proposal.model_dump_json(indent=2), encoding="utf-8")
@@ -339,8 +407,15 @@ def approve_proposal(
     """Approves a proposal, writes .jev/config.json and records external owner trust.
     
     Validates proposal identity hash to ensure tampering is detected.
+    Refuses approval if exact_argv contains secrets.
     """
     repo = Path(repo_dir).resolve()
+    if argv_contains_secrets(proposal.exact_argv):
+        raise ValueError(
+            "Refusing to approve proposal: exact_argv contains secret token or credentials. "
+            "A command cannot be safely redacted; pass secrets via environment variables instead."
+        )
+
     is_valid, err = proposal.verify_identity()
     if not is_valid:
         raise ValueError(f"Cannot approve proposal: {err}")

@@ -497,3 +497,108 @@ def test_proposal_creation_never_starts_subprocess(tmp_path):
         inspect_executable(["python", "-m", "pytest"])
         mock_run.assert_not_called()
 
+
+def test_secrets_in_exact_argv_refuses_save_and_approval_and_writes_no_secrets(tmp_path, monkeypatch):
+    """Proposal with secrets in exact_argv refuses save and approval, writing nothing to repo or JEV_HOME."""
+    jev_home = tmp_path / "jev_home"
+    monkeypatch.setenv("JEV_HOME", str(jev_home))
+    repo = _create_git_repo(tmp_path / "secret_cmd_repo")
+    repo_id = compute_repo_id(repo)
+
+    secret_token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+    cmd = ["./run-tests.sh", f"--token={secret_token}"]
+
+    ident_hash = compute_proposal_identity_hash(repo_id, cmd, cwd=".", platform=sys.platform)
+    prop = Proposal(
+        id=f"prop-{ident_hash[:12]}",
+        repo_id=repo_id,
+        exact_argv=cmd,
+        cwd=".",
+        source_evidence="CI workflow line",
+        platform=sys.platform,
+        identity_hash=ident_hash,
+        created_at="2026-11-02T00:00:00Z",
+    )
+
+    # 1. save_proposal refuses to save and writes no proposal file
+    saved = save_proposal(prop, repo)
+    assert saved is None
+    proposals_dir = repo / ".jev" / "proposals"
+    assert not list(proposals_dir.glob("*.json"))
+
+    # Calling save_proposal with raise_on_secret=True raises ValueError
+    with pytest.raises(ValueError, match="exact_argv contains secret"):
+        save_proposal(prop, repo, raise_on_secret=True)
+
+    # 2. approve_proposal refuses to approve
+    with pytest.raises(ValueError, match="exact_argv contains secret"):
+        approve_proposal(prop, repo, approved_by="owner")
+
+    # 3. .jev/config.json is never written
+    assert not (repo / ".jev" / "config.json").exists()
+
+    # 4. No file under repo or JEV_HOME contains the token
+    for root_dir in (repo, jev_home):
+        if not root_dir.exists():
+            continue
+        for file_path in root_dir.rglob("*"):
+            if file_path.is_file():
+                content = file_path.read_text(encoding="utf-8", errors="ignore")
+                assert secret_token not in content, f"Secret token leaked in {file_path}"
+
+
+def test_save_proposal_redacts_stored_fields_and_env_vars(tmp_path):
+    """save_proposal redacts secrets in all stored text fields and env vars, maintaining identity hash validity."""
+    repo = _create_git_repo(tmp_path / "redact_storage_repo")
+    repo_id = compute_repo_id(repo)
+
+    secret_token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+    secret_key = "sk-1234567890abcdef1234567890abcdef"
+    bearer_val = "Bearer 12345678901234567890abcdef"
+
+    cmd = ["pytest", "tests/"]
+    env = {
+        "API_KEY": secret_key,
+        "SAFE_ENV_VAR": "safe_value",
+    }
+    source_ev = f"CI run with {secret_token}"
+    expanded_script = f"test runner with {bearer_val}"
+    scope = [f"tests/{secret_token}"]
+
+    ident_hash = compute_proposal_identity_hash(repo_id, cmd, cwd=".", platform=sys.platform, env=env)
+    prop = Proposal(
+        id=f"prop-{ident_hash[:12]}",
+        repo_id=repo_id,
+        exact_argv=cmd,
+        cwd=".",
+        source_evidence=source_ev,
+        expanded_package_script=expanded_script,
+        tool_path="/usr/bin/pytest",
+        platform=sys.platform,
+        target_rule="full_suite",
+        scope=scope,
+        environment_variables=env,
+        identity_hash=ident_hash,
+        created_at="2026-11-02T00:00:00Z",
+    )
+
+    saved_file = save_proposal(prop, repo)
+    assert saved_file is not None
+    assert saved_file.exists()
+
+    # Verify no secret tokens are stored unredacted in the proposal JSON file
+    file_text = saved_file.read_text(encoding="utf-8")
+    assert secret_token not in file_text
+    assert secret_key not in file_text
+    assert bearer_val not in file_text
+    assert "[REDACTED]" in file_text
+
+    # Loading the proposal preserves identity hash validity
+    loaded = load_proposal(prop.id, repo)
+    assert loaded is not None
+    is_valid, err = loaded.verify_identity()
+    assert is_valid, f"Proposal identity verification failed: {err}"
+    assert loaded.environment_variables["API_KEY"] == "[REDACTED]"
+    assert loaded.environment_variables["SAFE_ENV_VAR"] == "safe_value"
+
+

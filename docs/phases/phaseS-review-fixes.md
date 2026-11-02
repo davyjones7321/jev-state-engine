@@ -31,3 +31,43 @@ During command proposal extraction in `build_proposal_from_repo`, the candidate 
 ### 5. Open Problems
 
 - None. Full offline test suite passed (999 passed, 24 skipped, 0 failed).
+
+## Fix 2 (Phase 3b): Secrets Never Stored Unredacted
+
+### 1. What Changed (Files and Lines)
+
+- `src/jev/proposals.py`:
+  - Lines 13, 98: Imported `logging` and configured module logger.
+  - Lines 101–117: Implemented `argv_contains_secrets(argv: Sequence[str]) -> bool` to scan all arguments and concatenated command strings against `SECRET_VALUE_PATTERNS` and `redact_secrets_in_text`.
+  - Lines 188–234: Updated `save_proposal` to:
+    - Check `argv_contains_secrets(proposal.exact_argv)`. If secrets are present, refuse to save the proposal to disk, log a clear warning to pass secrets via environment variables, and return `None` (or raise `ValueError` when `raise_on_secret=True`).
+    - Redact secrets across all stored text fields (`source_evidence`, `expanded_package_script`, `tool_path`, `tool_version`, `network_assumptions`, `scope`, `generated_paths`) using `redact_secrets_in_text`.
+    - Redact secrets in `environment_variables` using `redact_secrets_in_env`.
+    - Recompute `proposal.identity_hash` with the redacted environment variables so that `proposal.verify_identity()` remains valid upon reload.
+  - Lines 402–415: Updated `approve_proposal` to check `argv_contains_secrets(proposal.exact_argv)`. If secrets are detected, refuse to approve the proposal by raising `ValueError("Refusing to approve proposal: exact_argv contains secret token or credentials. A command cannot be safely redacted; pass secrets via environment variables instead.")`, preventing writing secrets into `.jev/config.json` or recording them under `JEV_HOME`.
+- `tests/test_proposals.py`:
+  - Lines 496–598: Added unit tests:
+    - `test_secrets_in_exact_argv_refuses_save_and_approval_and_writes_no_secrets`: verifies that commands containing secrets (e.g. `./run-tests.sh --token ghp_abcdefghijklmnopqrstuvwxyz0123456789`) cause `save_proposal` to refuse to save, `approve_proposal` to refuse approval, prevent writing `.jev/config.json`, and ensure no file under `repo` or `JEV_HOME` contains the token.
+    - `test_save_proposal_redacts_stored_fields_and_env_vars`: verifies that sensitive information in `source_evidence`, `expanded_package_script`, `scope`, and `environment_variables` is redacted with `[REDACTED]` before writing `.jev/proposals/<id>.json`, while preserving `verify_identity()` integrity on load.
+
+### 2. How It Works
+
+Because command lines cannot be safely redacted without breaking command syntax and execution semantics, `save_proposal` and `approve_proposal` refuse to persist or approve proposals whose `exact_argv` contains credential tokens matching known secret patterns (e.g. GitHub personal access tokens, OpenAI keys, bearer tokens, passwords). Users and CI pipelines must pass secrets via environment variables instead. When storing approved or pending proposals, `save_proposal` redacts all diagnostic metadata fields and environment variable dictionaries using `redact_secrets_in_text` and `redact_secrets_in_env`, recalculating `identity_hash` so cryptographic binding remains internally consistent.
+
+### 3. Rule Enforcement: Enforced by Test vs Only by Prompt
+
+| Rule / Requirement | Enforced By Test | Enforced Only By Prompt | Test Name(s) |
+|---|:---:|:---:|---|
+| `save_proposal` redacts secrets in stored text fields and environment variables | Yes | No | `test_save_proposal_redacts_stored_fields_and_env_vars` |
+| `save_proposal` recomputes identity hash and preserves `verify_identity()` | Yes | No | `test_save_proposal_redacts_stored_fields_and_env_vars` |
+| `save_proposal` refuses to save proposal if `exact_argv` contains secrets | Yes | No | `test_secrets_in_exact_argv_refuses_save_and_approval_and_writes_no_secrets` |
+| `approve_proposal` refuses to approve proposal if `exact_argv` contains secrets | Yes | No | `test_secrets_in_exact_argv_refuses_save_and_approval_and_writes_no_secrets` |
+| Neither repo nor `JEV_HOME` contains secrets from proposed commands | Yes | No | `test_secrets_in_exact_argv_refuses_save_and_approval_and_writes_no_secrets` |
+
+### 4. Unrequested Changes
+
+- None.
+
+### 5. Open Problems
+
+- None. Full offline test suite passed (1001 passed, 24 skipped, 0 failed in 833.45s).
