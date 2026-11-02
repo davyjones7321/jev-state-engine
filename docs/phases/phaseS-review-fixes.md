@@ -418,3 +418,96 @@ Single-letter flags `-i`, `-w`, and `-d` have conflicting meanings across tools:
 ### 5. Open Problems
 
 - None. Full offline test suite passed (1045 passed, 24 skipped, 2 deselected, 0 failed in 948.72s).
+
+
+---
+
+## Final Verification (`scripts/verify_phase.py 58e63cddeb0439b3b92ae28406a03d8014c2b055`)
+
+```
+=== Verification Report for base: 58e63cddeb0439b3b92ae28406a03d8014c2b055 ===
+Branch: phaseS-review-fixes
+Commit: 2bc23367fa0cbb398bbee428194bb077cf87718d
+
+--- Diff stat vs 58e63cddeb0439b3b92ae28406a03d8014c2b055 ---
+docs/phases/phaseS-review-fixes.md          | 420 +++++++++++++++++++++++++++
+ requirements.txt                            |   1 +
+ src/jev/engine.py                           | 180 +++++++++---
+ src/jev/preflight.py                        |  46 ++-
+ src/jev/process_runner.py                   |   5 +
+ src/jev/proposals.py                        | 259 ++++++++++++++---
+ src/jev/repo_config.py                      |  91 +++++-
+ src/jev/workspace.py                        | 401 ++++++++++++++++++++++++--
+ tests/test_compile_gate.py                  | 321 +++++++++++++++++++++
+ tests/test_fix7_weakened_deleted_tests.py   | 421 ++++++++++++++++++++++++++++
+ tests/test_phase7_test_surface_integrity.py |  71 +++++
+ tests/test_preflight.py                     |  60 ++++
+ tests/test_proposals.py                     | 363 ++++++++++++++++++++++++
+ 13 files changed, 2545 insertions(+), 94 deletions(-)
+
+--- Test Changes ---
+Added tests:
+  + test_plain_js_repo_compile_exempt
+  + test_ruby_repo_compile_exempt
+  + test_php_repo_compile_exempt
+  + test_missing_compiler_produces_unmeasured_missing_tool_in_ledger
+  + test_real_compile_failure_still_strikes
+  + test_compile_node_modules_missing_is_environment_unavailable_not_missing_tool
+  + test_compile_executable_not_found_in_path_is_missing_tool
+  + test_weaken_assertion_edited_passes_original_fails_strikable_fail
+  + test_delete_test_file_original_restored_fail_if_behavior_broke
+  + test_ticket_scope_explicitly_includes_changed_test_file_unmeasured
+  + test_untouched_tests_behavior_unchanged
+  + test_edited_makefile_test_recipe_handled_same_as_changed_test_surface
+  + test_csharp_test_file_classifier
+  + test_helper_files_classified_as_shared_test_surface
+  + test_target_matches_authored_test_normalized_equality_and_parent_dir
+  + test_preflight_false_positives_cleared
+  + test_preflight_true_positives_still_flagged
+  + test_proposal_creation_never_starts_subprocess
+  + test_secrets_in_exact_argv_refuses_save_and_approval_and_writes_no_secrets
+  + test_save_proposal_redacts_stored_fields_and_env_vars
+  + test_makefile_latest_before_test_proposes_make_test
+  + test_makefile_recipe_shown_on_approval_screen
+  + test_editing_recipe_after_approval_invalidates_trust
+  + test_ci_install_line_before_pytest_proposes_pytest
+  + test_ci_multiline_run_block_extracts_test_command
+  + test_ci_workflow_expression_left_unexpanded_and_shown_on_screen
+  + test_unexpanded_ci_expression_cannot_be_approved_without_manual_command
+  + test_windows_make_lookup_resolves_mingw32_make
+  + test_approve_proposal_fails_when_save_refuses_secret
+
+--- Collected Test Counts ---
+  tests/test_compile_gate.py: 30 tests collected in 2.67s
+  tests/test_fix7_weakened_deleted_tests.py: 5 tests collected in 2.00s
+  tests/test_phase7_test_surface_integrity.py: 11 tests collected in 1.91s
+  tests/test_preflight.py: 38 tests collected in 1.95s
+  tests/test_proposals.py: 21 tests collected in 0.98s
+
+--- Grep Checks ---
+Pattern 'git add -A' in src/jev/:
+  None found (clean)
+Pattern 'run_baseline_tests(' in src/jev/engine.py:
+  None found in engine.py (clean)
+Occurrences of 'FULL_SUITE_PASSED' in workspace.py and engine.py:
+  src/jev/engine.py:5021:                verify_classification = "FULL_SUITE_PASSED"
+  src/jev/workspace.py:2448:                    "outcome": TestOutcome.FULL_SUITE_PASSED.value,
+  src/jev/workspace.py:5434:                        test_classification = TestOutcome.FULL_SUITE_PASSED.value
+Occurrences of 'worktree_dir == self.repo_dir' in workspace.py (guard check):
+  src/jev/workspace.py:1661:        if self.worktree_dir == self.repo_dir:
+  src/jev/workspace.py:1698:        if self.worktree_dir == self.repo_dir:
+
+--- Pytest Offline Suite Summary ---
+SKIPPED [1] tests\test_runner_fixtures.py:361: gradle not found
+SKIPPED [1] tests\test_runner_fixtures.py:361: dotnet not found
+SKIPPED [1] tests\test_runner_fixtures.py:361: ctest not found
+SKIPPED [1] tests\test_runner_fixtures.py:361: ruby not found
+SKIPPED [1] tests\test_runner_fixtures.py:361: php not found
+SKIPPED [1] tests\test_runner_fixtures.py:325: Profile 'swiftpm-test' not supported on win32 (platforms: ['linux', 'darwin'])
+SKIPPED [1] tests\test_runner_fixtures.py:361: mix not found
+SKIPPED [1] tests\test_runner_fixtures.py:325: Profile 'xcode-test' not supported on win32 (platforms: ['darwin'])
+SKIPPED [1] tests\test_runner_fixtures.py:361: terraform not found
+SKIPPED [1] tests\test_runner_fixtures.py:361: ansible-lint not found
+SKIPPED [1] tests\test_runner_fixtures.py:361: helm not found
+1045 passed, 24 skipped, 2 deselected, 2 warnings in 972.12s (0:16:12)
+```
