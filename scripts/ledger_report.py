@@ -2,6 +2,7 @@
 """Read-only viewer for Jev State Engine run ledgers."""
 
 import argparse
+import json
 import sqlite3
 import sys
 from pathlib import Path
@@ -12,7 +13,7 @@ _src_dir = str(Path(__file__).resolve().parent.parent / "src")
 if _src_dir not in sys.path:
     sys.path.insert(0, _src_dir)
 
-from jev.ledger import compute_repo_key, get_jev_home
+from jev.ledger import compute_repo_key, get_jev_home, phase11_metrics_report
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -43,6 +44,9 @@ def build_parser() -> argparse.ArgumentParser:
         default="latest",
         help="Run ID to report on (defaults to latest)",
     )
+    parser.add_argument("--metrics", action="store_true", help="Print Phase 11 aggregate metrics as JSON (all runs)")
+    parser.add_argument("--since", help="Metrics window start, inclusive ISO 8601 timestamp (UTC if naive)")
+    parser.add_argument("--until", help="Metrics window end, exclusive ISO 8601 timestamp (UTC if naive)")
     return parser
 
 
@@ -65,6 +69,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not db_path.exists():
         print(f"Error: Ledger database not found at {db_path}", file=sys.stderr)
         return 1
+
+    if args.metrics:
+        try:
+            with sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True) as metrics_conn:
+                report = phase11_metrics_report(metrics_conn, since=args.since, until=args.until)
+            print(json.dumps(report, indent=2, allow_nan=False))
+            return 0
+        except (ValueError, sqlite3.Error) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
 
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row

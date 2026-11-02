@@ -6,6 +6,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
@@ -30,6 +31,142 @@ def _compute_rates(measured: int, eligible: int, total: int) -> Tuple[Optional[f
     rate_all = (measured / total) if total > 0 else None
     rate_eligible = (measured / eligible) if eligible > 0 else None
     return rate_all, rate_eligible
+
+
+def phase11_metrics_report(
+    conn: sqlite3.Connection, *, since: Optional[str] = None, until: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Read attempt metrics, including old schemas, without modifying the database.
+
+    The time window is UTC [since, until); omitted boundaries are unbounded.
+    Correctness and safety observations must be independently supplied, not
+    inferred from Jev agreement or a passing command. Missing observations are unknown.
+    """
+    def timestamp(value: str) -> datetime:
+        result = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return result.replace(tzinfo=timezone.utc) if result.tzinfo is None else result.astimezone(timezone.utc)
+
+    start = timestamp(since) if since else None
+    end = timestamp(until) if until else None
+    if start and end and start >= end:
+        raise ValueError("since must be earlier than until")
+
+    def dictionaries(query: str) -> List[Dict[str, Any]]:
+        cursor = conn.execute(query)
+        names = [column[0] for column in cursor.description]
+        return [dict(zip(names, row)) for row in cursor.fetchall()]
+
+    tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    observations = {}
+    if "attempt_assessments" in tables:
+        observations = {
+            (row["run_id"], row["subgoal_id"], row["attempt_no"]): row
+            for row in dictionaries("SELECT * FROM attempt_assessments")
+        }
+
+    def accumulator() -> Dict[str, int]:
+        return dict.fromkeys((
+            "attempts_all", "measured", "attempts_eligible", "unmeasured", "exit_only_success_count",
+            "tooling_uncertainty", "verifier_modified", "worker_rejections_assessed",
+            "false_worker_rejections", "mechanical_acceptances_assessed", "false_mechanical_acceptances",
+            "unsafe_commit_count", "process_leak_count", "unsafe_commit_assessed_attempts",
+            "process_leak_assessed_attempts", "safety_assessed_attempts", "eligibility_unknown_count",
+        ), 0)
+
+    totals = accumulator()
+    groups: Dict[Tuple[Any, ...], Dict[str, int]] = {}
+    invalid_timestamps = 0
+    for row in dictionaries("SELECT * FROM attempts"):
+        if start or end:
+            try:
+                created = timestamp(row.get("created_at") or "")
+            except (ValueError, TypeError):
+                invalid_timestamps += 1
+                continue
+            if (start and created < start) or (end and created >= end):
+                continue
+        observation = observations.get((row["run_id"], row["subgoal_id"], row["attempt_no"]), {})
+        try:
+            identity = json.loads(row.get("mech_command_identity_json") or "{}")
+            if not isinstance(identity, dict):
+                identity = {}
+        except (TypeError, ValueError):
+            identity = {}
+        status = row.get("mech_status")
+        reason = row.get("mech_reason")
+        level = row.get("mech_evidence_level")
+        outside = identity.get("preflight_status") in ("OUTSIDE_PROFILE", "PROFILE_UNKNOWN")
+        eligible = status in ("PASS", "FAIL", "UNMEASURED") and not outside and reason not in {
+            "MISSING_TOOL", "NO_COMMAND", "ENVIRONMENT_UNAVAILABLE",
+        }
+        strong = (
+            eligible and status in ("PASS", "FAIL") and level in ("counted", "named")
+            and not row.get("mech_mechanically_unverified")
+            and not row.get("mech_verifier_modified")
+            and row.get("mech_approval_valid") != 0
+            and row.get("mech_comparison_valid") != 0
+        )
+        key = (
+            row.get("mech_language"),
+            row.get("mech_runner_profile_id") or identity.get("profile_id"),
+            identity.get("platform") or observation.get("platform"),
+            row.get("mech_registry_version") or identity.get("registry_version"),
+        )
+        group = groups.setdefault(key, accumulator())
+        rejected = row.get("outcome") in ("mechanical_failure", "semantic_failure", "failed", "rejected")
+        for counts in (totals, group):
+            counts["attempts_all"] += 1
+            counts["measured"] += int(strong)
+            counts["attempts_eligible"] += int(eligible)
+            counts["eligibility_unknown_count"] += int(status is None)
+            counts["unmeasured"] += int(status == "UNMEASURED")
+            counts["exit_only_success_count"] += int(status == "PASS" and level == "exit_only")
+            counts["tooling_uncertainty"] += int(status == "UNMEASURED" or status is None or outside)
+            counts["verifier_modified"] += int(bool(row.get("mech_verifier_modified")))
+            if rejected and observation.get("worker_should_accept") is not None:
+                counts["worker_rejections_assessed"] += 1
+                counts["false_worker_rejections"] += int(observation["worker_should_accept"] == 1)
+            if status == "PASS" and observation.get("mechanical_should_accept") is not None:
+                counts["mechanical_acceptances_assessed"] += 1
+                counts["false_mechanical_acceptances"] += int(observation["mechanical_should_accept"] == 0)
+            for metric in ("unsafe_commit", "process_leak"):
+                count = observation.get(metric + "_count")
+                if count is not None:
+                    counts[metric + "_count"] += count
+                    counts[metric + "_assessed_attempts"] += 1
+            counts["safety_assessed_attempts"] += int(
+                observation.get("unsafe_commit_count") is not None and observation.get("process_leak_count") is not None
+            )
+
+    def finish(counts: Dict[str, int]) -> Dict[str, Any]:
+        result: Dict[str, Any] = dict(counts)
+        for name, numerator, denominator in (
+            ("measured_rate_all", "measured", "attempts_all"),
+            ("measured_rate_eligible", "measured", "attempts_eligible"),
+            ("false_worker_rejection_rate", "false_worker_rejections", "worker_rejections_assessed"),
+            ("false_mechanical_acceptance_rate", "false_mechanical_acceptances", "mechanical_acceptances_assessed"),
+            ("tooling_uncertainty_rate", "tooling_uncertainty", "attempts_all"),
+            ("verifier_modified_rate", "verifier_modified", "attempts_all"),
+        ):
+            n, d = counts[numerator], counts[denominator]
+            result[name] = {"numerator": n, "denominator": d, "value": n / d if d else None}
+        for metric in ("unsafe_commit", "process_leak"):
+            if not counts[metric + "_assessed_attempts"]:
+                result[metric + "_count"] = None
+        return result
+
+    window = {"since": start.isoformat() if start else None, "until": end.isoformat() if end else None}
+    return {
+        "schema_version": 1,
+        "time_window": window,
+        "excluded_invalid_timestamp_count": invalid_timestamps,
+        "totals": finish(totals),
+        "groups": [
+            dict(zip(("language", "runner_profile", "platform", "registry_version"), key),
+                 time_window=window, **finish(counts))
+            for key, counts in sorted(groups.items(), key=lambda item: tuple(str(v or "") for v in item[0]))
+        ],
+    }
 
 
 REASONING_KEYS = {"cot", "chain_of_thought", "reasoning_trace", "hidden_reasoning"}
@@ -563,6 +700,66 @@ class SqliteLedger:
                 if name not in att_cols:
                     conn.execute(f"ALTER TABLE attempts ADD COLUMN {name} {col_type} DEFAULT NULL")
 
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS attempt_assessments (
+                    run_id TEXT, subgoal_id TEXT, attempt_no INTEGER,
+                    platform TEXT, worker_should_accept INTEGER,
+                    mechanical_should_accept INTEGER, unsafe_commit_count INTEGER,
+                    process_leak_count INTEGER,
+                    PRIMARY KEY (run_id, subgoal_id, attempt_no)
+                )"""
+            )
+
+    def record_attempt_assessment(
+        self, run_id: str, subgoal_id: str, attempt_no: int, *,
+        platform: Optional[str] = None,
+        worker_should_accept: Optional[bool] = None,
+        mechanical_should_accept: Optional[bool] = None,
+        unsafe_commit_count: Optional[int] = None,
+        process_leak_count: Optional[int] = None,
+    ) -> None:
+        """Attach independent evaluation labels; omitted fields preserve prior values.
+
+        A caller must supply correctness/safety ground truth from a reviewed run
+        or replay. Neither a Jev verdict nor command success is ground truth.
+        """
+        values = {
+            "platform": platform, "worker_should_accept": worker_should_accept,
+            "mechanical_should_accept": mechanical_should_accept,
+            "unsafe_commit_count": unsafe_commit_count, "process_leak_count": process_leak_count,
+        }
+        for value in (worker_should_accept, mechanical_should_accept):
+            if value is not None and type(value) is not bool:
+                raise ValueError("correctness assessments must be booleans")
+        for value in (unsafe_commit_count, process_leak_count):
+            if value is not None and (type(value) is not int or value < 0):
+                raise ValueError("safety counts must be nonnegative integers")
+        if platform is not None and (not isinstance(platform, str) or not platform.strip()):
+            raise ValueError("platform must be a nonempty string")
+        with self._get_connection() as conn:
+            if not conn.execute(
+                "SELECT 1 FROM attempts WHERE run_id=? AND subgoal_id=? AND attempt_no=?",
+                (run_id, subgoal_id, attempt_no),
+            ).fetchone():
+                raise ValueError("assessment must reference an existing attempt")
+            conn.execute(
+                "INSERT OR IGNORE INTO attempt_assessments (run_id, subgoal_id, attempt_no) VALUES (?, ?, ?)",
+                (run_id, subgoal_id, attempt_no),
+            )
+            for column, value in values.items():
+                if value is not None:
+                    conn.execute(
+                        f"UPDATE attempt_assessments SET {column}=? WHERE run_id=? AND subgoal_id=? AND attempt_no=?",
+                        (value, run_id, subgoal_id, attempt_no),
+                    )
+
+    def phase11_metrics_report(
+        self, *, since: Optional[str] = None, until: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Return strong-evidence Phase 11 metrics; the legacy report is unchanged."""
+        with self._get_connection() as conn:
+            return phase11_metrics_report(conn, since=since, until=until)
+
     def has_run(self, run_id: str) -> bool:
         with self._get_connection() as conn:
             row = conn.execute("SELECT 1 FROM runs WHERE run_id = ?", (run_id,)).fetchone()
@@ -982,6 +1179,10 @@ class SqliteLedger:
                     m_verif_inconclusive,
                 ),
             )
+            conn.execute(
+                "INSERT INTO attempt_assessments (run_id, subgoal_id, attempt_no, platform) VALUES (?, ?, ?, ?)",
+                (run_id, subgoal_id, attempt_no, sys.platform),
+            )
 
     def get_run_evidence_level(self, run_id: str) -> Optional[str]:
         with self._get_connection() as conn:
@@ -1063,6 +1264,10 @@ class SqliteLedger:
         self,
         since_days: int = 90,
     ) -> Dict[Tuple[Optional[str], Optional[str]], Dict[str, Any]]:
+        """Legacy verdict-availability report, including exit-only verdicts.
+
+        Use phase11_metrics_report for strong-evidence coverage and error rates.
+        """
         with self._get_connection() as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
