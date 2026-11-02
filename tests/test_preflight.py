@@ -23,6 +23,8 @@ from jev.preflight import (
     PROFILE_UNKNOWN,
     PreflightResult,
     PreflightStatus,
+    check_non_interactive_shape,
+    check_watch_daemon_indicators,
     run_preflight,
 )
 from jev.runner_registry import RunnerProfile, load_registry
@@ -396,3 +398,61 @@ def test_preflight_never_substitutes_another_runner(tmp_path):
     assert result.reason == MechReason.MISSING_TOOL
     # Profile ID remains cargo-test; no fallback to pytest or node
     assert result.profile_id == "cargo-test"
+
+
+# ==============================================================================
+# 14. Fix 4 Preflight False Positives and True Positives Test Table
+# ==============================================================================
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        ["jest", "-i"],             # run in band
+        ["make", "-i"],             # ignore errors
+        ["pytest", "-d"],           # xdist test distribution
+        ["jest", "-w", "2"],        # worker count
+        ["jest", "-w", "4"],        # worker count
+        ["pytest", "tests/"],       # standard command
+        ["make", "test"],           # standard make command
+    ],
+)
+def test_preflight_false_positives_cleared(cmd):
+    """Commands that were formerly false positives must pass preflight shape and watch checks."""
+    shape_res = check_non_interactive_shape(cmd)
+    assert shape_res.passed is True, f"Failed non_interactive_shape: {shape_res.detail}"
+    assert shape_res.status == PreflightStatus.IN_PROFILE
+
+    watch_res = check_watch_daemon_indicators(cmd)
+    assert watch_res.passed is True, f"Failed watch_daemon_indicators: {watch_res.detail}"
+    assert watch_res.status == PreflightStatus.IN_PROFILE
+
+
+@pytest.mark.parametrize(
+    "cmd, check_func_name",
+    [
+        (["python", "-i", "test.py"], "check_non_interactive_shape"),
+        (["python3", "-i"], "check_non_interactive_shape"),
+        (["node", "-i"], "check_non_interactive_shape"),
+        (["bash", "-i"], "check_non_interactive_shape"),
+        (["jest", "--interactive"], "check_non_interactive_shape"),
+        (["jest", "--watch"], "check_watch_daemon_indicators"),
+        (["jest", "--watchAll"], "check_watch_daemon_indicators"),
+        (["pytest", "--watch-all"], "check_watch_daemon_indicators"),
+        (["pytest", "--daemon"], "check_watch_daemon_indicators"),
+        (["vitest", "--serve"], "check_watch_daemon_indicators"),
+        (["npm", "test", "--", "--watch"], "check_watch_daemon_indicators"),
+        (["pytest", "--watch=true"], "check_watch_daemon_indicators"),
+        (["pytest", "-w"], "check_watch_daemon_indicators"),
+    ],
+)
+def test_preflight_true_positives_still_flagged(cmd, check_func_name):
+    """Known interactive and watch flags must still be flagged as OUTSIDE_PROFILE."""
+    if check_func_name == "check_non_interactive_shape":
+        res = check_non_interactive_shape(cmd)
+    else:
+        res = check_watch_daemon_indicators(cmd)
+
+    assert res.passed is False, f"Expected {cmd} to fail {check_func_name}"
+    assert res.status == PreflightStatus.OUTSIDE_PROFILE
+    assert res.reason == MechReason.TOOLING_ERROR
+

@@ -78,19 +78,29 @@ class PreflightResult(BaseModel):
 # Watch and daemon indicators
 WATCH_STANDALONE_FLAGS = {
     "--watch",
-    "-w",
     "--watchAll",
     "--watch-all",
     "--watch-files",
     "--live",
     "--hot",
     "--daemon",
-    "-d",
     "--serve",
 }
 
+INTERACTIVE_SHELLS = {
+    "python",
+    "python3",
+    "node",
+    "irb",
+    "bash",
+    "sh",
+    "zsh",
+    "cmd",
+    "powershell",
+    "pwsh",
+}
+
 INTERACTIVE_FLAGS = {
-    "-i",
     "--interactive",
     "-it",
     "--prompt",
@@ -293,6 +303,8 @@ def check_non_interactive_shape(command: Optional[Sequence[str]]) -> PreflightCh
             detail="No command provided",
         )
 
+    base_name = Path(command[0]).stem.lower()
+
     # Check for interactive flags
     for arg in command[1:]:
         if arg in INTERACTIVE_FLAGS:
@@ -303,11 +315,19 @@ def check_non_interactive_shape(command: Optional[Sequence[str]]) -> PreflightCh
                 reason=MechReason.TOOLING_ERROR,
                 detail=f"Command contains interactive flag '{arg}'. Test commands must be non-interactive/batch.",
             )
+        # Scope -i to known interactive shells/REPLs only (e.g. python -i, node -i, bash -i)
+        if arg == "-i" and base_name in INTERACTIVE_SHELLS:
+            return PreflightCheckResult(
+                name="non_interactive_shape",
+                passed=False,
+                status=PreflightStatus.OUTSIDE_PROFILE,
+                reason=MechReason.TOOLING_ERROR,
+                detail=f"Interactive shell '{command[0]}' invoked with '-i'. Test commands must be non-interactive/batch.",
+            )
 
     # Bare interactive interpreters with no script or module arguments
     if len(command) == 1:
-        base_name = Path(command[0]).stem.lower()
-        if base_name in ("python", "python3", "node", "irb", "bash", "sh", "zsh", "cmd", "powershell"):
+        if base_name in INTERACTIVE_SHELLS:
             return PreflightCheckResult(
                 name="non_interactive_shape",
                 passed=False,
@@ -351,6 +371,22 @@ def check_watch_daemon_indicators(command: Optional[Sequence[str]]) -> Preflight
                 reason=MechReason.TOOLING_ERROR,
                 detail=f"Watch or daemon mode indicator '{arg}' detected. Test execution must be bounded.",
             )
+
+        # Standalone -w is flagged as watch unless followed by worker count (e.g. jest -w 2)
+        if arg == "-w":
+            has_worker_count = False
+            if i + 1 < len(command):
+                next_arg = command[i + 1].strip()
+                if next_arg.isdigit():
+                    has_worker_count = True
+            if not has_worker_count:
+                return PreflightCheckResult(
+                    name="watch_daemon_indicators",
+                    passed=False,
+                    status=PreflightStatus.OUTSIDE_PROFILE,
+                    reason=MechReason.TOOLING_ERROR,
+                    detail="Watch indicator '-w' detected. Test execution must be bounded.",
+                )
 
         # Check subcommands (e.g. `cargo watch`, `jest watch`)
         if i == 1 and arg.lower() in ("watch", "daemon", "serve"):

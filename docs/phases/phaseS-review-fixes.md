@@ -113,3 +113,43 @@ Because command lines cannot be safely redacted without breaking command syntax 
 ### 5. Open Problems
 
 - None. Full offline test suite passed (1004 passed, 24 skipped, 0 failed in 866.57s).
+
+## Fix 4 (Phase 4): Preflight False Positives
+
+### 1. What Changed (Files and Lines)
+
+- `src/jev/preflight.py`:
+  - Lines 79–90: Removed `-d` and `-w` from `WATCH_STANDALONE_FLAGS`, preserving unambiguous flags (`--watch`, `--watchAll`, `--watch-all`, `--watch-files`, `--live`, `--hot`, `--daemon`, `--serve`).
+  - Lines 92–104: Added `INTERACTIVE_SHELLS = {"python", "python3", "node", "irb", "bash", "sh", "zsh", "cmd", "powershell", "pwsh"}`. Removed `-i` from `INTERACTIVE_FLAGS`, keeping unambiguous flags (`--interactive`, `-it`, `--prompt`).
+  - Lines 312–330: Scoped `-i` interactive flag rejection in `check_non_interactive_shape` to invocations of programs in `INTERACTIVE_SHELLS` only. Commands like `jest -i` (run in band) and `make -i` (ignore errors) are no longer flagged as interactive.
+  - Lines 374–387: In `check_watch_daemon_indicators`, updated standalone `-w` handling to inspect whether `-w` is followed by an integer (worker count, e.g. `jest -w 2`), preventing worker specification flags from triggering watch mode errors while maintaining watch mode rejection for standalone `-w` without a worker count. Removed `-d` so flags like `pytest -d` (xdist) are no longer flagged.
+- `tests/test_preflight.py`:
+  - Lines 25–26: Imported `check_non_interactive_shape` and `check_watch_daemon_indicators`.
+  - Lines 405–455: Added comprehensive test tables:
+    - `test_preflight_false_positives_cleared`: verifies that formerly misflagged valid commands (`jest -i`, `make -i`, `pytest -d`, `jest -w 2`, `jest -w 4`, `pytest tests/`, `make test`) pass both `check_non_interactive_shape` and `check_watch_daemon_indicators` in `IN_PROFILE`.
+    - `test_preflight_true_positives_still_flagged`: verifies that actual interactive flags (`python -i test.py`, `python3 -i`, `node -i`, `bash -i`, `jest --interactive`) and watch/daemon modes (`jest --watch`, `jest --watchAll`, `pytest --watch-all`, `pytest --daemon`, `vitest --serve`, `npm test -- --watch`, `pytest --watch=true`, `pytest -w`) remain strictly rejected as `OUTSIDE_PROFILE`.
+
+### 2. How It Works
+
+Single-letter flags `-i`, `-w`, and `-d` have conflicting meanings across tools:
+- In test runners and build tools, `-i` often means "run in band" (`jest`) or "ignore errors" (`make`), whereas in REPL shells (`python`, `bash`, `node`) `-i` drops into an interactive shell. Preflight now inspects the program executable name and only flags `-i` when invoking an interactive shell or interpreter.
+- `-w` in Jest represents worker count when followed by a number (e.g. `jest -w 2` is `--maxWorkers 2`). Preflight checks the subsequent token to avoid misclassifying worker specifications as watch loops.
+- `-d` in pytest distributes tests under `pytest-xdist`. Removing `-d` from standalone daemon flags prevents valid distributed test runs from being blocked, while unambiguous `--daemon`, `--watch`, `--watchAll`, and `--live` flags continue to be caught.
+
+### 3. Rule Enforcement: Enforced by Test vs Only by Prompt
+
+| Rule / Requirement | Enforced By Test | Enforced Only By Prompt | Test Name(s) |
+|---|:---:|:---:|---|
+| `jest -i` (run in band) and `make -i` (ignore errors) not flagged | Yes | No | `test_preflight_false_positives_cleared` |
+| `pytest -d` (xdist) and `jest -w 2` (workers) not flagged | Yes | No | `test_preflight_false_positives_cleared` |
+| `-i` scoped to interactive shells (`python`, `node`, `bash`, etc.) | Yes | No | `test_preflight_true_positives_still_flagged` |
+| Unambiguous long watch/daemon flags continue to be rejected | Yes | No | `test_preflight_true_positives_still_flagged`, `test_preflight_watch_mode_outside_profile` |
+| All existing watch and interactive preflight tests remain green | Yes | No | `test_preflight_watch_mode_outside_profile`, `test_preflight_interactive_command_outside_profile` |
+
+### 4. Unrequested Changes
+
+- None.
+
+### 5. Open Problems
+
+- None. Full offline test suite passed (1024 passed, 24 skipped, 0 failed in 943.18s).
