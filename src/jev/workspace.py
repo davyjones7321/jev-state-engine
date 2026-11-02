@@ -2698,38 +2698,28 @@ class Workspace:
         ticket_scope: Optional[Sequence[str]] = None,
         subgoal_scope: Optional[Sequence[str]] = None,
     ) -> bool:
-        norm_p = Path(file_path).as_posix().lower()
-        file_name = Path(file_path).name.lower()
-        stem = Path(file_path).stem.lower()
+        def normalize(path: str) -> str:
+            return posixpath.normpath(str(path).replace("\\", "/")).lower()
 
-        # Check explicit ticket_scope sequence
-        if ticket_scope:
-            for s in ticket_scope:
-                norm_s = Path(s).as_posix().lower()
-                if norm_p == norm_s or norm_p.endswith("/" + norm_s) or norm_s.endswith("/" + norm_p) or file_name == norm_s or stem == norm_s:
-                    return True
-                if norm_s.endswith("/") and norm_p.startswith(norm_s):
-                    return True
+        norm_p = normalize(file_path)
+        file_name = posixpath.basename(norm_p)
+
+        # Explicit scopes authorize only repository-relative equality or descendants.
+        scopes = list(ticket_scope or []) + list(subgoal_scope or [])
+        if isinstance(ticket, dict):
+            t_scope = ticket.get("scope") or ticket.get("ticket_scope")
+            if isinstance(t_scope, (list, tuple, set)):
+                scopes.extend(t_scope)
+        for scope in scopes:
+            norm_s = normalize(scope)
+            if norm_p == norm_s or norm_p.startswith(norm_s.rstrip("/") + "/"):
+                return True
 
         # Check ticket string
         if isinstance(ticket, str) and ticket:
-            t_lower = ticket.lower()
-            if norm_p in t_lower or file_name in t_lower or stem in t_lower:
-                return True
-
-        # Check ticket dict/object if applicable
-        if isinstance(ticket, dict):
-            t_scope = ticket.get("scope") or ticket.get("ticket_scope")
-            if t_scope and isinstance(t_scope, (list, tuple, set)):
-                return self._is_test_file_in_ticket_scope(file_path, ticket_scope=list(t_scope))
-
-        # Check subgoal_scope if provided and matches ticket context
-        if subgoal_scope:
-            for s in subgoal_scope:
-                norm_s = Path(s).as_posix().lower()
-                if norm_p == norm_s or norm_p.endswith("/" + norm_s) or norm_s.endswith("/" + norm_p) or file_name == norm_s or stem == norm_s:
-                    return True
-                if norm_s.endswith("/") and norm_p.startswith(norm_s):
+            t_lower = ticket.replace("\\", "/").lower()
+            for token in (norm_p, file_name):
+                if re.search(r"(?<![\w.-])" + re.escape(token) + r"(?![\w.-])", t_lower):
                     return True
 
         return False
