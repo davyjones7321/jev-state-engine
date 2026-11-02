@@ -1,0 +1,86 @@
+"""Tiny deterministic runner used by the Phase 12A conformance suite.
+
+The script deliberately has no test-framework knowledge.  It reads a JSON
+recipe, emits the requested bytes, exits with the requested status, and can
+record each invocation.  The product under test remains responsible for
+classifying the result.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+def _load() -> dict:
+    path = Path(os.environ["JEV_FAKE_RUNNER_CONFIG"])
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _kind() -> str:
+    name = Path.cwd().name
+    if name.startswith("base-"):
+        return "base"
+    if name.startswith("scratch-"):
+        return "scratch"
+    if name.startswith("cand-rerun-"):
+        return "candidate_rerun"
+    return "candidate"
+
+
+def _recipe(config: dict, kind: str) -> dict:
+    recipes = config.get("recipes", {})
+    selected = recipes.get(kind, recipes.get("candidate", {}))
+    if isinstance(selected, list):
+        state_path = Path(config["state"])
+        state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
+        index = int(state.get(kind, 0))
+        state[kind] = index + 1
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        return selected[min(index, len(selected) - 1)]
+    return selected
+
+
+def main() -> int:
+    if "--version" in sys.argv:
+        print("jev-fake-runner 1.0")
+        return 0
+
+    config = _load()
+    kind = _kind()
+    recipe = _recipe(config, kind)
+    log_path = config.get("log")
+    if log_path:
+        with Path(log_path).open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps({"kind": kind, "argv": sys.argv[1:], "cwd": str(Path.cwd())}) + "\n")
+
+    child_pid_path = recipe.get("child_pid_file")
+    if child_pid_path:
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import os,time; print(os.getpid(), flush=True); time.sleep(30)"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        child_pid = child.stdout.readline().strip()
+        Path(child_pid_path).write_text(child_pid, encoding="utf-8")
+
+    sleep_seconds = float(recipe.get("sleep", 0))
+    if sleep_seconds:
+        time.sleep(sleep_seconds)
+
+    stdout = recipe.get("stdout", "")
+    stderr = recipe.get("stderr", "")
+    if stdout:
+        sys.stdout.write(stdout)
+    if stderr:
+        sys.stderr.write(stderr)
+    return int(recipe.get("exit", 0))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
