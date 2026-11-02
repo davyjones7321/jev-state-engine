@@ -351,6 +351,7 @@ def build_proposal_from_repo(repo_dir: Union[str, Path]) -> Optional[Proposal]:
                 pass
     
     # 2. CI workflows (.github/workflows/*.yml, *.yaml)
+    unexpanded_ci_step: Optional[Tuple[str, str]] = None
     if not argv:
         wf_dir = repo / ".github" / "workflows"
         if wf_dir.is_dir():
@@ -385,6 +386,10 @@ def build_proposal_from_repo(repo_dir: Union[str, Path]) -> Optional[Proposal]:
                                     continue
                                 line_lower = line.lower()
                                 if any(kw in line_lower for kw in ("test", "pytest", "check", "run-tests")):
+                                    if "${{" in line:
+                                        if unexpanded_ci_step is None:
+                                            unexpanded_ci_step = (wf.name, line)
+                                        continue
                                     split_cmd = shlex.split(line, posix=(sys.platform != "win32"))
                                     if split_cmd:
                                         argv = split_cmd
@@ -423,16 +428,28 @@ def build_proposal_from_repo(repo_dir: Union[str, Path]) -> Optional[Proposal]:
                     m = re.search(r"```(?:bash|sh|shell)?\s*\n\s*((?:pytest|npm test|cargo test|make test|go test|ctest|\./run_tests\.sh)(?:[^\n]*))\s*\n\s*```", r_text)
                     if m:
                         raw_cmd = m.group(1).strip()
-                        argv = shlex.split(raw_cmd, posix=(sys.platform != "win32"))
-                        source_evidence = f"{r_name} code block: '{raw_cmd}'"
-                        break
+                        if "${{" in raw_cmd:
+                            if unexpanded_ci_step is None:
+                                unexpanded_ci_step = (r_name, raw_cmd)
+                        else:
+                            argv = shlex.split(raw_cmd, posix=(sys.platform != "win32"))
+                            source_evidence = f"{r_name} code block: '{raw_cmd}'"
+                            break
                 except Exception:
                     pass
 
-    if not argv:
-        return None
+    if argv and any("${{" in arg for arg in argv):
+        argv = []
 
-    exe_path, exe_ver = inspect_executable(argv)
+    if not argv:
+        if unexpanded_ci_step:
+            wf_name, line = unexpanded_ci_step
+            argv = []
+            source_evidence = f"CI workflow '{wf_name}' step: '{line}'"
+        else:
+            return None
+
+    exe_path, exe_ver = inspect_executable(argv) if argv else (None, None)
     identity_hash = compute_proposal_identity_hash(
         repo_id=repo_id,
         exact_argv=argv,
@@ -483,6 +500,10 @@ def approve_proposal(
     Refuses approval if exact_argv contains secrets.
     """
     repo = Path(repo_dir).resolve()
+    if not proposal.exact_argv:
+        raise ValueError("Cannot approve proposal: proposal has no exact_argv (needs manual command).")
+    if any("${{" in arg for arg in proposal.exact_argv):
+        raise ValueError("Cannot approve proposal: exact_argv contains unexpanded CI expressions (${{ ... }}).")
     if argv_contains_secrets(proposal.exact_argv):
         raise ValueError(
             "Refusing to approve proposal: exact_argv contains secret token or credentials. "
@@ -586,16 +607,19 @@ def format_proposal_screen(proposal: Proposal) -> str:
             break
     if not has_unexpanded and proposal.source_evidence and "${{" in proposal.source_evidence:
         has_unexpanded = True
-    if has_unexpanded:
-        lines.append("\nNOTICE: CI workflow expressions (${{ ... }}) left unexpanded.")
+    if has_unexpanded or not proposal.exact_argv:
+        lines.append("\nNOTICE: CI workflow expressions (${{ ... }}) detected: needs manual command.")
 
     # Exact argv (one argument per line)
     lines.append("\nExact Argv (one argument per line):")
     if proposal.exact_argv:
-        for idx, arg in enumerate(proposal.exact_argv):
-            lines.append(f"  [{idx}] {redact_secrets_in_text(arg)}")
+        if any("${{" in arg for arg in proposal.exact_argv):
+            lines.append("  (unexpanded expression detected - needs manual command)")
+        else:
+            for idx, arg in enumerate(proposal.exact_argv):
+                lines.append(f"  [{idx}] {redact_secrets_in_text(arg)}")
     else:
-        lines.append("  (empty)")
+        lines.append("  (none - needs manual command)")
 
     # Mandatory disclaimer statement
     lines.append("\n-----------------------------------------------------------------")

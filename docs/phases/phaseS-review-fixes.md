@@ -318,3 +318,41 @@ Single-letter flags `-i`, `-w`, and `-d` have conflicting meanings across tools:
 ### 5. Open Problems
 
 - None. Full offline test suite passed (1039 passed, 24 skipped, 2 deselected, 0 failed in 967.34s).
+
+
+---
+
+## Fix 6b (Phase 3b): No Proposal with Unexpanded CI Expressions
+
+### 1. Files and Lines Changed
+
+- `src/jev/proposals.py`:
+  - When scanning CI workflows or repository commands, any command step containing an unexpanded `${{ ... }}` expression is omitted from proposed commands (`argv = []`, ensuring no `argv` contains `"${{"`).
+  - If only unexpanded CI steps are found, creates a proposal recording the evidence with `exact_argv = []` and `tool_path = None`.
+  - In `approve_proposal`: refuses approval if `exact_argv` is empty or if any argument contains unexpanded `${{ ... }}` expressions.
+  - In `format_proposal_screen`: displays `needs manual command` on the review screen for proposals with unexpanded CI expressions or missing `exact_argv`.
+- `tests/test_proposals.py`:
+  - Updated `test_ci_workflow_expression_left_unexpanded_and_shown_on_screen` to verify no `argv` containing `"${{"` is proposed and `"needs manual command"` is shown on screen.
+  - Added `test_unexpanded_ci_expression_cannot_be_approved_without_manual_command` verifying approval refusal without a manual command.
+
+### 2. How It Works
+
+1. **Suppression of Unexpanded Expressions in Proposed Argv**: Commands containing `${{ ... }}` expressions (such as `${{ matrix.python-version }}`) cannot be executed directly by runners as valid shell commands without a workflow execution context. The proposal generator skips proposing them as the executable `exact_argv`.
+2. **Review Screen Manual Command Notice**: If no other valid command is discovered, the proposal records the CI step evidence but leaves `exact_argv` empty and displays `"needs manual command"` prominently on the review screen.
+3. **Approval Guard**: `approve_proposal` rejects any proposal whose `exact_argv` is empty or contains `${{ ... }}`, preventing unexpanded templates from entering `.jev/config.json` or external trust records.
+
+### 3. Rule Enforcement: Enforced by Test vs Only by Prompt
+
+| Rule / Requirement | Enforced By Test | Enforced Only By Prompt | Test Name(s) |
+|---|:---:|:---:|---|
+| CI step with `${{ ... }}` is not proposed as command (no argv containing `"${{"`) | Yes | No | `test_ci_workflow_expression_left_unexpanded_and_shown_on_screen` |
+| Approval screen shows "needs manual command" | Yes | No | `test_ci_workflow_expression_left_unexpanded_and_shown_on_screen` |
+| Proposal with unexpanded expression or empty argv cannot be approved | Yes | No | `test_unexpanded_ci_expression_cannot_be_approved_without_manual_command` |
+
+### 4. Unrequested Changes
+
+- None.
+
+### 5. Open Problems
+
+- None. Full offline test suite passed (1040 passed, 24 skipped, 2 deselected, 0 failed in 1009.83s).

@@ -720,7 +720,7 @@ def test_ci_multiline_run_block_extracts_test_command(tmp_path):
 
 
 def test_ci_workflow_expression_left_unexpanded_and_shown_on_screen(tmp_path):
-    """CI ${{ ... }} expressions are left unexpanded in proposal and flagged on screen."""
+    """If a CI step contains an unexpanded ${{ ... }} expression, do not propose it as command (no argv containing '${{') and show 'needs manual command' on screen."""
     repo = _create_git_repo(tmp_path / "repo_ci_expr")
     wf_dir = repo / ".github" / "workflows"
     wf_dir.mkdir(parents=True, exist_ok=True)
@@ -737,9 +737,40 @@ def test_ci_workflow_expression_left_unexpanded_and_shown_on_screen(tmp_path):
 
     prop = build_proposal_from_repo(repo)
     assert prop is not None
-    assert "${{" in " ".join(prop.exact_argv)
+    # Must not propose as command (no argv containing "${{")
+    assert not any("${{" in arg for arg in prop.exact_argv)
     screen = format_proposal_screen(prop)
-    assert "NOTICE: CI workflow expressions (${{ ... }}) left unexpanded." in screen
+    assert "needs manual command" in screen
+
+
+def test_unexpanded_ci_expression_cannot_be_approved_without_manual_command(tmp_path):
+    """Proposal with unexpanded CI expressions cannot be approved without a manual command."""
+    repo = _create_git_repo(tmp_path / "repo_ci_unexpanded_approve")
+    prop = Proposal(
+        id="prop-unexpanded",
+        repo_id="repo-test",
+        exact_argv=[],
+        cwd=".",
+        source_evidence="CI workflow step with ${{ matrix.x }}",
+        platform=sys.platform,
+        identity_hash="dummyhash",
+        created_at="2026-11-02T00:00:00Z",
+    )
+    with pytest.raises(ValueError, match="needs manual command"):
+        approve_proposal(prop, repo)
+
+    prop_with_expr = Proposal(
+        id="prop-with-expr",
+        repo_id="repo-test",
+        exact_argv=["pytest", "${{ matrix.target }}"],
+        cwd=".",
+        source_evidence="CI workflow",
+        platform=sys.platform,
+        identity_hash="dummyhash2",
+        created_at="2026-11-02T00:00:00Z",
+    )
+    with pytest.raises(ValueError, match="unexpanded CI expressions"):
+        approve_proposal(prop_with_expr, repo)
 
 
 def test_windows_make_lookup_resolves_mingw32_make(tmp_path, monkeypatch):
