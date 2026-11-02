@@ -523,7 +523,9 @@ def approve_proposal(
     proposal.status = "approved"
     proposal.approved_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     proposal.approved_by = approved_by
-    save_proposal(proposal, repo)
+    saved_path = save_proposal(proposal, repo, raise_on_secret=True)
+    if saved_path is None:
+        raise ValueError("Refusing to approve proposal: save_proposal refused because of secret in command")
 
     return cfg, trust_rec
 

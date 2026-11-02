@@ -3972,11 +3972,21 @@ def node_gate(
         detail_msg = getattr(mech_result, "detail", "") or ""
         cmd_raw = compile_telemetry.get("command") if isinstance(compile_telemetry, dict) else None
         cmd_val = [str(x) for x in cmd_raw] if isinstance(cmd_raw, (list, tuple)) else (str(cmd_raw) if isinstance(cmd_raw, str) else None)
-        is_missing_tool = any(s in str(detail_msg).lower() for s in ("not found", "filenotfound", "executable not found", "missing"))
-        reason_val = MechReason.MISSING_TOOL if is_missing_tool else MechReason.ENVIRONMENT_UNAVAILABLE
+        mech_r = None
+        if isinstance(compile_telemetry, dict):
+            mech_r = compile_telemetry.get("mech_reason") or compile_telemetry.get("reason")
+        if mech_r is None and hasattr(mech_result, "mech_evidence") and mech_result.mech_evidence:
+            mech_r = getattr(mech_result.mech_evidence, "reason", None)
+        if mech_r is None:
+            mech_r = MechReason.ENVIRONMENT_UNAVAILABLE
+        elif isinstance(mech_r, str):
+            try:
+                mech_r = MechReason(mech_r)
+            except Exception:
+                mech_r = MechReason.ENVIRONMENT_UNAVAILABLE
         mech_ev = MechanicalEvidence(
             mech_status=MechStatus.UNMEASURED,
-            reason=reason_val,
+            reason=mech_r,
             mechanically_unverified=True,
             command_identity={"cmd": cmd_val} if cmd_val else None,
             attribution_note=str(detail_msg),
@@ -4807,11 +4817,17 @@ def node_verify(
                 return state
             elif c_outcome == "ENV_NOT_READY":
                 detail_msg = compile_info.get("detail", "")
-                is_missing_tool = any(s in detail_msg.lower() for s in ("not found", "filenotfound", "executable not found", "missing"))
-                ev_reason = MechReason.MISSING_TOOL if is_missing_tool else MechReason.ENVIRONMENT_UNAVAILABLE
+                mech_r = compile_info.get("mech_reason") or compile_info.get("reason")
+                if mech_r is None:
+                    mech_r = MechReason.ENVIRONMENT_UNAVAILABLE
+                elif isinstance(mech_r, str):
+                    try:
+                        mech_r = MechReason(mech_r)
+                    except Exception:
+                        mech_r = MechReason.ENVIRONMENT_UNAVAILABLE
                 verify_ev = MechanicalEvidence(
                     mech_status=MechStatus.UNMEASURED,
-                    reason=ev_reason,
+                    reason=mech_r,
                     mechanically_unverified=True,
                     command_identity={"cmd": compile_info.get("command")},
                     attribution_note=detail_msg,

@@ -773,4 +773,26 @@ def test_windows_make_lookup_resolves_mingw32_make(tmp_path, monkeypatch):
     assert "resolved mingw32-make for make on Windows" in screen
 
 
+def test_approve_proposal_fails_when_save_refuses_secret(tmp_path):
+    """approve_proposal fails (does not silently continue) when proposal command contains a secret."""
+    repo = _create_git_repo(tmp_path / "repo_secret_approve")
+    repo_id = compute_repo_id(repo)
+    secret_token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+    cmd = ["./run-tests.sh", "--token", secret_token]
+    ident_hash = compute_proposal_identity_hash(repo_id, cmd, cwd=".", platform=sys.platform)
+    prop = Proposal(
+        id="prop-secret",
+        repo_id=repo_id,
+        exact_argv=cmd,
+        cwd=".",
+        source_evidence="CI workflow",
+        platform=sys.platform,
+        identity_hash=ident_hash,
+        created_at="2026-11-02T00:00:00Z",
+    )
+    with pytest.raises(ValueError, match="secret"):
+        approve_proposal(prop, repo)
+
+
+
 

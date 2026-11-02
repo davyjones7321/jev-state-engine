@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from jev.engine import node_gate, node_verify
+from jev.mech_evidence import MechReason, MechStatus
 from jev.models import (
     CompileOutcome,
     State,
@@ -1294,5 +1295,115 @@ def test_real_compile_failure_still_strikes(tmp_path):
     assert out["gate_status"] == "mechanical_failure"
     assert out["mechanical_strike_count"] == 1
     assert out["status"] != "escalated"
+
+
+def test_compile_node_modules_missing_is_environment_unavailable_not_missing_tool(tmp_path):
+    """When node_modules is missing, compile gate yields ENVIRONMENT_UNAVAILABLE, NOT MISSING_TOOL."""
+    repo = tmp_path / "repo_missing_nm"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Tester"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "tester@example.com"], cwd=repo, check=True, capture_output=True)
+
+    (repo / "package.json").write_text('{"name": "test-pkg", "scripts": {"typecheck": "tsc"}}', encoding="utf-8")
+    (repo / "index.ts").write_text("export const x: number = 1;\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+
+    ws = Workspace(repo_dir=repo)
+    (repo / "index.ts").write_text("export const x: number = 2;\n", encoding="utf-8")
+    subprocess.run(["git", "add", "index.ts"], cwd=repo, check=True, capture_output=True)
+
+    # Make sure node_modules does not exist
+    assert not (repo / "node_modules").exists()
+
+    compile_res = ws.check_compile(scope=["index.ts"])
+    assert compile_res["outcome"] == CompileOutcome.ENV_NOT_READY.value
+    assert "node_modules is missing" in compile_res["detail"]
+    assert compile_res.get("mech_reason") == MechReason.ENVIRONMENT_UNAVAILABLE
+    assert compile_res.get("mech_reason") != MechReason.MISSING_TOOL
+
+    recorder = MagicMock()
+    gk = FakeGatekeeper()
+    subgoal = Subgoal(description="Update index.ts", scope=["index.ts"], expects_tests=False)
+    state: State = {
+        "ticket": "Ticket TS",
+        "plan_queue": [],
+        "current_subgoal": subgoal,
+        "mechanical_strike_count": 0,
+        "semantic_strike_count": 0,
+        "trajectory": [],
+        "gate_status": None,
+        "last_feedback": None,
+        "status": None,
+        "investigation_notes": "Notes",
+        "current_worktree_path": None,
+        "current_worktree_branch": None,
+    }
+
+    out = node_gate(state, workspace=ws, gatekeeper=gk, recorder=recorder)
+    assert out["status"] == "escalated"
+    assert out["gate_status"] == "env_not_ready"
+    assert recorder.record_attempt.called
+    call_kwargs = recorder.record_attempt.call_args[1]
+    mech_ev = call_kwargs.get("mech_evidence")
+    assert mech_ev is not None
+    assert mech_ev.mech_status == MechStatus.UNMEASURED
+    assert mech_ev.reason == MechReason.ENVIRONMENT_UNAVAILABLE
+    assert mech_ev.reason != MechReason.MISSING_TOOL
+
+
+def test_compile_executable_not_found_in_path_is_missing_tool(tmp_path):
+    """When a compiler executable is not found on PATH, compile gate yields MISSING_TOOL."""
+    repo = tmp_path / "repo_missing_exe"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Tester"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "tester@example.com"], cwd=repo, check=True, capture_output=True)
+
+    (repo / "App.csproj").write_text("<Project></Project>", encoding="utf-8")
+    (repo / "App.cs").write_text("public class App {}", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+
+    ws = Workspace(repo_dir=repo)
+    (repo / "App.cs").write_text("public class App { int x = 1; }", encoding="utf-8")
+    subprocess.run(["git", "add", "App.cs"], cwd=repo, check=True, capture_output=True)
+
+    with patch("shutil.which", return_value=None):
+        compile_res = ws.check_compile(scope=["App.cs"])
+        assert compile_res["outcome"] == CompileOutcome.ENV_NOT_READY.value
+        assert "executable not found in PATH" in compile_res["detail"]
+        assert compile_res.get("mech_reason") == MechReason.MISSING_TOOL
+        assert compile_res.get("mech_reason") != MechReason.ENVIRONMENT_UNAVAILABLE
+
+        recorder = MagicMock()
+        gk = FakeGatekeeper()
+        subgoal = Subgoal(description="Update App.cs", scope=["App.cs"], expects_tests=False)
+        state: State = {
+            "ticket": "Ticket Dotnet Missing",
+            "plan_queue": [],
+            "current_subgoal": subgoal,
+            "mechanical_strike_count": 0,
+            "semantic_strike_count": 0,
+            "trajectory": [],
+            "gate_status": None,
+            "last_feedback": None,
+            "status": None,
+            "investigation_notes": "Notes",
+            "current_worktree_path": None,
+            "current_worktree_branch": None,
+        }
+
+        out = node_gate(state, workspace=ws, gatekeeper=gk, recorder=recorder)
+        assert out["status"] == "escalated"
+        assert out["gate_status"] == "env_not_ready"
+        assert recorder.record_attempt.called
+        call_kwargs = recorder.record_attempt.call_args[1]
+        mech_ev = call_kwargs.get("mech_evidence")
+        assert mech_ev is not None
+        assert mech_ev.mech_status == MechStatus.UNMEASURED
+        assert mech_ev.reason == MechReason.MISSING_TOOL
+
 
 

@@ -615,6 +615,7 @@ NPM_PACKAGE_PATTERN = re.compile(r"^(?:@[a-z0-9][a-z0-9_.-]*/)?[a-z0-9][a-z0-9_.
 class BaseCompileHandler:
     name: str = ""
     source_extensions: set[str] = set()
+    last_mech_reason: Optional[MechReason] = None
 
     def matches(self, touched_files: set[str], wt: Path, repo_dir: Path) -> bool:
         return any(Path(f).suffix.lower() in self.source_extensions for f in touched_files)
@@ -705,6 +706,7 @@ class JsTsCompileHandler(BaseCompileHandler):
             or (pm == "bun" and bool(shutil.which("bun")))
         )
         if not has_nm:
+            self.last_mech_reason = MechReason.ENVIRONMENT_UNAVAILABLE
             return None, CompileOutcome.ENV_NOT_READY, "Environment not ready: node_modules is missing in repository root. Please install dependencies before running."
 
         if "typecheck" in scripts:
@@ -893,6 +895,7 @@ class DotnetCompileHandler(BaseCompileHandler):
     ) -> tuple[Optional[List[str]], Optional[CompileOutcome], str]:
         dotnet_bin = shutil.which("dotnet")
         if not dotnet_bin:
+            self.last_mech_reason = MechReason.MISSING_TOOL
             return None, CompileOutcome.ENV_NOT_READY, "Environment not ready: dotnet SDK executable not found in PATH."
         return ["dotnet", "build"], None, ""
 
@@ -911,6 +914,7 @@ class CMakeCompileHandler(BaseCompileHandler):
     ) -> tuple[Optional[List[str]], Optional[CompileOutcome], str]:
         cmake_bin = shutil.which("cmake")
         if not cmake_bin:
+            self.last_mech_reason = MechReason.MISSING_TOOL
             return None, CompileOutcome.ENV_NOT_READY, "Environment not ready: cmake executable not found in PATH."
         build_dir = wt / "build"
         if not build_dir.exists():
@@ -932,6 +936,7 @@ class SwiftPMCompileHandler(BaseCompileHandler):
     ) -> tuple[Optional[List[str]], Optional[CompileOutcome], str]:
         swift_bin = shutil.which("swift")
         if not swift_bin:
+            self.last_mech_reason = MechReason.MISSING_TOOL
             return None, CompileOutcome.ENV_NOT_READY, "Environment not ready: swift toolchain executable not found in PATH."
         return ["swift", "build"], None, ""
 
@@ -950,6 +955,7 @@ class ElixirCompileHandler(BaseCompileHandler):
     ) -> tuple[Optional[List[str]], Optional[CompileOutcome], str]:
         mix_bin = shutil.which("mix")
         if not mix_bin:
+            self.last_mech_reason = MechReason.MISSING_TOOL
             return None, CompileOutcome.ENV_NOT_READY, "Environment not ready: mix executable not found in PATH."
         return ["mix", "compile"], None, ""
 
@@ -4531,10 +4537,14 @@ class Workspace:
             return record
 
         # 4. Prepare command and check environment
+        handler.last_mech_reason = None
         cmd, outcome_override, prep_detail = handler.prepare_and_get_command(
             self.worktree_dir, self.repo_dir, touched_source_files
         )
         if outcome_override is not None:
+            mech_r = getattr(handler, "last_mech_reason", None)
+            if mech_r is None and outcome_override == CompileOutcome.ENV_NOT_READY:
+                mech_r = MechReason.ENVIRONMENT_UNAVAILABLE
             record = {
                 "ecosystem": handler.name,
                 "command": cmd,
@@ -4546,6 +4556,8 @@ class Workspace:
                 "base_errors": [],
                 "outcome": outcome_override.value,
                 "detail": prep_detail,
+                "mech_reason": mech_r,
+                "reason": mech_r,
             }
             self.last_compile_run = record
             return record
@@ -4558,7 +4570,7 @@ class Workspace:
             exit_code, stdout, stderr = handler.run_command(
                 cmd, self.worktree_dir, touched_source_files, is_base=False
             )
-        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        except FileNotFoundError as e:
             record = {
                 "ecosystem": handler.name,
                 "command": cmd,
@@ -4570,6 +4582,25 @@ class Workspace:
                 "base_errors": [],
                 "outcome": CompileOutcome.ENV_NOT_READY.value,
                 "detail": f"Environment not ready: {type(e).__name__} running compile command {cmd}: {e}",
+                "mech_reason": MechReason.MISSING_TOOL,
+                "reason": MechReason.MISSING_TOOL,
+            }
+            self.last_compile_run = record
+            return record
+        except subprocess.TimeoutExpired as e:
+            record = {
+                "ecosystem": handler.name,
+                "command": cmd,
+                "exit_code": None,
+                "stdout_tail": "",
+                "stderr_tail": "",
+                "output_tail": "",
+                "new_errors": [],
+                "base_errors": [],
+                "outcome": CompileOutcome.ENV_NOT_READY.value,
+                "detail": f"Environment not ready: {type(e).__name__} running compile command {cmd}: {e}",
+                "mech_reason": MechReason.ENVIRONMENT_UNAVAILABLE,
+                "reason": MechReason.ENVIRONMENT_UNAVAILABLE,
             }
             self.last_compile_run = record
             return record
@@ -4585,6 +4616,8 @@ class Workspace:
                 "base_errors": [],
                 "outcome": CompileOutcome.ENV_NOT_READY.value,
                 "detail": f"Environment not ready: {type(e).__name__} running compile command {cmd}: {e}",
+                "mech_reason": MechReason.ENVIRONMENT_UNAVAILABLE,
+                "reason": MechReason.ENVIRONMENT_UNAVAILABLE,
             }
             self.last_compile_run = record
             return record
@@ -4687,6 +4720,8 @@ class Workspace:
                 "base_errors": [],
                 "outcome": CompileOutcome.ENV_NOT_READY.value,
                 "detail": f"Environment not ready: failed to create temporary baseline worktree at {base_commit_ref}: {res.stderr or res.stdout}",
+                "mech_reason": MechReason.ENVIRONMENT_UNAVAILABLE,
+                "reason": MechReason.ENVIRONMENT_UNAVAILABLE,
             }
             self.last_compile_run = record
             return record
@@ -4699,7 +4734,7 @@ class Workspace:
             base_exit, base_stdout, base_stderr = handler.run_command(
                 cmd, base_wt_path, touched_source_files, is_base=True, base_commit=base_commit_ref
             )
-        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        except FileNotFoundError as e:
             record = {
                 "ecosystem": handler.name,
                 "command": cmd,
@@ -4711,6 +4746,25 @@ class Workspace:
                 "base_errors": [],
                 "outcome": CompileOutcome.ENV_NOT_READY.value,
                 "detail": f"Environment not ready: {type(e).__name__} running base compile command {cmd}: {e}",
+                "mech_reason": MechReason.MISSING_TOOL,
+                "reason": MechReason.MISSING_TOOL,
+            }
+            self.last_compile_run = record
+            return record
+        except subprocess.TimeoutExpired as e:
+            record = {
+                "ecosystem": handler.name,
+                "command": cmd,
+                "exit_code": exit_code,
+                "stdout_tail": stdout_tail,
+                "stderr_tail": stderr_tail,
+                "output_tail": output_tail,
+                "new_errors": [e.raw_line for e in wt_errors],
+                "base_errors": [],
+                "outcome": CompileOutcome.ENV_NOT_READY.value,
+                "detail": f"Environment not ready: {type(e).__name__} running base compile command {cmd}: {e}",
+                "mech_reason": MechReason.ENVIRONMENT_UNAVAILABLE,
+                "reason": MechReason.ENVIRONMENT_UNAVAILABLE,
             }
             self.last_compile_run = record
             return record
@@ -4726,6 +4780,8 @@ class Workspace:
                 "base_errors": [],
                 "outcome": CompileOutcome.ENV_NOT_READY.value,
                 "detail": f"Environment not ready: {type(e).__name__} running base compile command {cmd}: {e}",
+                "mech_reason": MechReason.ENVIRONMENT_UNAVAILABLE,
+                "reason": MechReason.ENVIRONMENT_UNAVAILABLE,
             }
             self.last_compile_run = record
             return record
@@ -4964,10 +5020,17 @@ class Workspace:
             ))
         elif compile_outcome == CompileOutcome.ENV_NOT_READY.value:
             detail_str = compile_res.get("detail", "Environment not ready.")
-            is_missing_tool = any(s in detail_str.lower() for s in ("not found", "filenotfound", "executable not found", "missing"))
+            mech_r = compile_res.get("mech_reason") or compile_res.get("reason")
+            if mech_r is None:
+                mech_r = MechReason.ENVIRONMENT_UNAVAILABLE
+            elif isinstance(mech_r, str):
+                try:
+                    mech_r = MechReason(mech_r)
+                except Exception:
+                    mech_r = MechReason.ENVIRONMENT_UNAVAILABLE
             compile_evidence = MechanicalEvidence(
                 mech_status=MechStatus.UNMEASURED,
-                reason=MechReason.MISSING_TOOL if is_missing_tool else MechReason.ENVIRONMENT_UNAVAILABLE,
+                reason=mech_r,
                 mechanically_unverified=True,
                 command_identity={"cmd": compile_res.get("command")},
                 attribution_note=detail_str,

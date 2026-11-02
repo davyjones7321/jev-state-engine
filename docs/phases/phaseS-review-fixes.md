@@ -270,3 +270,51 @@ Single-letter flags `-i`, `-w`, and `-d` have conflicting meanings across tools:
 ### 5. Open Problems
 
 - None. Full offline test suite passed (1036 passed, 24 skipped, 2 deselected, 0 failed in 1135.80s).
+
+
+---
+
+## Fix 5b: Typed Missing-Tool Reason
+
+### 1. Files and Lines Changed
+
+- `src/jev/workspace.py`:
+  - Added `last_mech_reason: Optional[MechReason] = None` attribute to `BaseCompileHandler`.
+  - In `JsTsCompileHandler`: explicitly set `self.last_mech_reason = MechReason.ENVIRONMENT_UNAVAILABLE` when `node_modules` is missing.
+  - In `DotnetCompileHandler`, `CMakeCompileHandler`, `SwiftPMCompileHandler`, `ElixirCompileHandler`: set `self.last_mech_reason = MechReason.MISSING_TOOL` when the executable is not found in PATH.
+  - In `check_compile`: reset `handler.last_mech_reason = None` before invoking handler; propagate `mech_reason` and `reason` into the compile run record (typed `MISSING_TOOL` on `FileNotFoundError`, `ENVIRONMENT_UNAVAILABLE` on `TimeoutExpired` / other errors).
+  - In `run_mechanical_checks`: read typed `mech_reason` / `reason` directly from `compile_res` rather than searching detail string text for `"missing"` or `"not found"`.
+- `src/jev/engine.py`:
+  - In `node_gate`: read typed `mech_reason` / `reason` from `compile_telemetry` or `mech_result.mech_evidence` rather than matching substring `"missing"` or `"not found"`.
+  - In `node_verify`: read typed `mech_reason` / `reason` from `compile_info` rather than matching substring `"missing"` or `"not found"`.
+- `src/jev/proposals.py`:
+  - In `approve_proposal`: ensure `save_proposal(proposal, repo, raise_on_secret=True)` fails loudly with `ValueError` when secrets are present in the command, never silently continuing.
+- `tests/test_compile_gate.py`:
+  - Added `test_compile_node_modules_missing_is_environment_unavailable_not_missing_tool`: verifies `"node_modules is missing"` creates `ENVIRONMENT_UNAVAILABLE` and NOT `MISSING_TOOL`.
+  - Added `test_compile_executable_not_found_in_path_is_missing_tool`: verifies `"executable not found in PATH"` creates `MISSING_TOOL`.
+- `tests/test_proposals.py`:
+  - Added `test_approve_proposal_fails_when_save_refuses_secret`: verifies `approve_proposal` raises `ValueError` if proposal command contains a secret.
+
+### 2. How It Works
+
+1. **Typed Reason Creation at Point of Origin**: Instead of relying on brittle substring searches (`"missing"` or `"not found"` in error message strings), compile handlers explicitly record the exact typed failure category on the handler (`last_mech_reason`). When `node_modules` is missing, `JsTsCompileHandler` sets `MechReason.ENVIRONMENT_UNAVAILABLE`. When SDK or compiler binaries (`dotnet`, `cmake`, `swift`, `mix`) are missing from PATH, handlers set `MechReason.MISSING_TOOL`.
+2. **Compile Result Record Typing**: `Workspace.check_compile` preserves typed reasons on the compile record (`mech_reason` and `reason`). `FileNotFoundError` during execution directly maps to `MechReason.MISSING_TOOL`, while timeouts or baseline worktree issues map to `MechReason.ENVIRONMENT_UNAVAILABLE`.
+3. **Engine Integration Without Text Search**: Both `node_gate` and `node_verify` inspect the typed `mech_reason` on the compile outcome dictionary / mechanical evidence, eliminating string heuristics that previously conflated missing dependencies (`node_modules`) with missing toolchain executables.
+4. **Enforced Secret Refusal on Approval**: `approve_proposal` strictly validates that the command contains no secret tokens or credentials before creating configs or recording trust, and invokes `save_proposal(proposal, repo, raise_on_secret=True)`, raising `ValueError` and refusing to proceed if any secrets are present.
+
+### 3. Rule Enforcement: Enforced by Test vs Only by Prompt
+
+| Rule / Requirement | Enforced By Test | Enforced Only By Prompt | Test Name(s) |
+|---|:---:|:---:|---|
+| "node_modules is missing" is `ENVIRONMENT_UNAVAILABLE` and NOT `MISSING_TOOL` | Yes | No | `test_compile_node_modules_missing_is_environment_unavailable_not_missing_tool` |
+| "executable not found in PATH" is `MISSING_TOOL` | Yes | No | `test_compile_executable_not_found_in_path_is_missing_tool` |
+| `approve_proposal` fails loudly when command contains a secret | Yes | No | `test_approve_proposal_fails_when_save_refuses_secret` |
+| Substring search eliminated from `node_gate`, `node_verify`, and `run_mechanical_checks` | Yes | No | `test_compile_node_modules_missing_is_environment_unavailable_not_missing_tool`, `test_compile_executable_not_found_in_path_is_missing_tool` |
+
+### 4. Unrequested Changes
+
+- None.
+
+### 5. Open Problems
+
+- None. Full offline test suite passed (1039 passed, 24 skipped, 2 deselected, 0 failed in 967.34s).
