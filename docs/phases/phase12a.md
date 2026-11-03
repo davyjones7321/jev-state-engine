@@ -95,6 +95,57 @@ failures remain stable while changed failure identities differ.
 ## 7. Full verifier output
 
 ```text
+=== Verification Report for base: origin/phase12a-conformance-suite ===
+Branch: phase12a-review-fixes
+Commit: 8040562238ed646124bd8b64abd9d092214143f9
+
+--- Diff stat vs origin/phase12a-conformance-suite ---
+src/jev/ledger.py                                 |   8 +-
+src/jev/runner_registry.py                        | 288 +++++++++++++---------
+tests/conformance/test_fake_runner_conformance.py | 154 +++++++++++-
+tests/test_phase12a_metrics_review.py             |  26 ++
+4 files changed, 351 insertions(+), 125 deletions(-)
+
+--- Test Changes ---
+Added tests:
+  + test_scrambled_output_many_fixed_seed_variants_only_preserve_positive_summary
+  + test_summary_parser_rejects_noise_phrases_for_every_registry_profile
+  + test_summary_parser_accepts_anchored_true_summary_per_profile
+  + test_profiles_without_safe_count_shape_remain_exit_only
+  + test_truncated_pytest_count_remains_positive_when_count_is_intact
+  + test_unknown_runner_profile_is_not_strong_measured_evidence
+
+--- Collected Test Counts ---
+  tests/conformance/test_fake_runner_conformance.py: 46 tests collected in 1.12s
+  tests/test_phase12a_metrics_review.py: 1 test collected in 0.71s
+
+--- Grep Checks ---
+Pattern 'git add -A' in src/jev/:
+  None found (clean)
+Pattern 'run_baseline_tests(' in src/jev/engine.py:
+  None found in engine.py (clean)
+Occurrences of 'FULL_SUITE_PASSED' in workspace.py and engine.py:
+  src/jev/engine.py:5021:                verify_classification = "FULL_SUITE_PASSED"
+  src/jev/workspace.py:2449:                    "outcome": TestOutcome.FULL_SUITE_PASSED.value,
+  src/jev/workspace.py:5559:                        test_classification = TestOutcome.FULL_SUITE_PASSED.value
+Occurrences of 'worktree_dir == self.repo_dir' in workspace.py (guard check):
+  src/jev/workspace.py:1662:        if self.worktree_dir == self.repo_dir:
+  src/jev/workspace.py:1699:        if self.worktree_dir == self.repo_dir:
+
+--- Pytest Offline Suite Summary ---
+SKIPPED [1] tests\test_runner_fixtures.py:361: gradle not found
+SKIPPED [1] tests\test_runner_fixtures.py:361: dotnet not found
+SKIPPED [1] tests\test_runner_fixtures.py:361: ctest not found
+SKIPPED [1] tests\test_runner_fixtures.py:361: ruby not found
+SKIPPED [1] tests\test_runner_fixtures.py:361: php not found
+SKIPPED [1] tests\test_runner_fixtures.py:325: Profile 'swiftpm-test' not supported on win32 (platforms: ['linux', 'darwin'])
+SKIPPED [1] tests\test_runner_fixtures.py:361: mix not found
+SKIPPED [1] tests\test_runner_fixtures.py:325: Profile 'xcode-test' not supported on win32 (platforms: ['darwin'])
+SKIPPED [1] tests\test_runner_fixtures.py:361: terraform not found
+SKIPPED [1] tests\test_runner_fixtures.py:361: ansible-lint not found
+SKIPPED [1] tests\test_runner_fixtures.py:361: helm not found
+1188 passed, 24 skipped, 2 deselected, 2 warnings in 1007.93s (0:16:47)
+```
 === Verification Report for base: origin/phase11-measured-rate-metrics ===
 Branch: phase12a-conformance-suite
 Commit: 40fb6a8b7d8b752f7eccd1fe08353508e50136a5
@@ -150,3 +201,53 @@ SKIPPED [1] tests\test_runner_fixtures.py:361: ansible-lint not found
 SKIPPED [1] tests\test_runner_fixtures.py:361: helm not found
 1158 passed, 24 skipped, 2 deselected, 2 warnings in 1179.08s (0:19:39)
 ```
+
+## 8. Review-fix addendum
+
+This addendum records the review fixes completed on `phase12a-review-fixes`.
+
+### Step 1b — profile-anchored summary parsing
+
+- Commit: `b1d76b9` (`fix 12a-1b: summary lines anchored per runner profile`)
+- `src/jev/runner_registry.py`: positive count evidence now requires a
+  profile-specific summary-line grammar. Narrative phrases containing `N passed`
+  remain exit-only, while supported pytest, Node, Jest/Vitest, Bun, Deno, Go,
+  Cargo, Maven, Gradle, .NET, CTest, Ruby, PHPUnit, SwiftPM, Xcode, and Mix
+  summaries remain recognized. Profiles without a safe count grammar do not
+  invent counted evidence.
+- `tests/conformance/test_fake_runner_conformance.py`: added table-driven noise
+  rejection, per-profile true-summary checks, unsupported-profile checks, and
+  the truncated pytest summary case.
+- Pre-fix evidence: the new checks produced **14 failures**, including false
+  positives for narrative `N passed` lines.
+- Post-fix checks: **25 passed, 21 deselected**; existing parser, fixture, and
+  Phase 6 checks: **106 passed, 17 skipped**.
+- Full offline suite: **1187 passed, 24 skipped, 2 deselected, 2 warnings**.
+
+### Step 2 — held for owner review
+
+Step 2 was not started. Its required replacement of the existing timeout test's
+child-liveness assertion conflicts with the standing rule forbidding edits to
+existing tests. Production timeout code was not changed.
+
+### Step 3 — unknown profiles excluded from metrics
+
+- Commit: `8040562` (`fix 12a-3: exclude unknown profiles from metrics`)
+- `src/jev/ledger.py`: Phase 11 metrics now treat a missing runner profile as
+  outside/unknown-profile evidence, excluding it from strong measured and
+  eligible numerators while counting it as tooling uncertainty.
+- `tests/test_phase12a_metrics_review.py`: added a regression test that failed
+  before the fix (`measured_rate_all` was `1/1`) and passes after the fix.
+- Focused checks: **19 passed, 9 deselected**.
+- Full offline suite: **1188 passed, 24 skipped, 2 deselected, 2 warnings**.
+
+### Step 4 — documentation and verification
+
+This report is updated with the review-fix history, exact commits, test results,
+the Step 2 hold, and the raw verifier transcript below. Existing tests were not
+edited, deleted, or skipped. The intentionally untracked `session-1-v2.md`
+remains outside the commits.
+
+## 9. Review-fix verifier output
+
+```text
