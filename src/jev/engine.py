@@ -4077,217 +4077,225 @@ def node_gate(
             return state
 
         elif is_unmeasured:
-            current_unmeasured_retries = state.get("unmeasured_retry_count", 0) + 1
-            state["unmeasured_retry_count"] = current_unmeasured_retries
+            require_tests = state.get("require_tests")
+            require_tests_strict = (require_tests in ("on", True))
 
-            reason_val = "unmeasured"
-            if mech_ev and getattr(mech_ev, "reason", None):
-                reason_val = mech_ev.reason.value if hasattr(mech_ev.reason, "value") else str(mech_ev.reason)
+            if require_tests_strict or require_tests is None:
+                current_unmeasured_retries = state.get("unmeasured_retry_count", 0) + 1
+                state["unmeasured_retry_count"] = current_unmeasured_retries
 
-            base_fb = mech_result.detail or "Unit tests could not be measured."
-            output_tail = None
-            if isinstance(test_runner_telemetry, dict):
-                output_tail = test_runner_telemetry.get("output_tail")
-            elif hasattr(mech_result, "test_runner_outcome") and isinstance(mech_result.test_runner_outcome, dict):
-                output_tail = mech_result.test_runner_outcome.get("output_tail")
-            if output_tail:
-                tail_capped = output_tail[-4000:]
-                if tail_capped not in base_fb:
-                    formatted_fb = f"{base_fb}\n\n{tail_capped}"
+                reason_val = "unmeasured"
+                if mech_ev and getattr(mech_ev, "reason", None):
+                    reason_val = mech_ev.reason.value if hasattr(mech_ev.reason, "value") else str(mech_ev.reason)
+
+                base_fb = mech_result.detail or "Unit tests could not be measured."
+                output_tail = None
+                if isinstance(test_runner_telemetry, dict):
+                    output_tail = test_runner_telemetry.get("output_tail")
+                elif hasattr(mech_result, "test_runner_outcome") and isinstance(mech_result.test_runner_outcome, dict):
+                    output_tail = mech_result.test_runner_outcome.get("output_tail")
+                if output_tail:
+                    tail_capped = output_tail[-4000:]
+                    if tail_capped not in base_fb:
+                        formatted_fb = f"{base_fb}\n\n{tail_capped}"
+                    else:
+                        formatted_fb = base_fb
                 else:
                     formatted_fb = base_fb
+
+                state["last_feedback"] = f"Verification could not attribute this failure to your change (reason: {reason_val}). Fix it if it is yours.\n\n{formatted_fb}"
+                advisory_telemetry = _apply_advisory(advisory, mechanical_evidence, state)
+                _teardown_worktree(state, workspace)
+
+                if current_unmeasured_retries >= 3:
+                    state["status"] = "escalated"
+                    state["gate_status"] = "verification_inconclusive"
+                    subgoal.status = "failed"
+                    state["current_subgoal"] = subgoal
+                    if safe_rec:
+                        safe_rec.record_subgoal_status(run_id, subgoal_id, "failed")
+
+                    _snapshot_attempt(
+                        safe_rec,
+                        state,
+                        subgoal_id,
+                        tier="mechanical",
+                        outcome="verification_inconclusive",
+                        failed_check="tests_unmeasured",
+                        diff=diff,
+                        compile_info=compile_telemetry,
+                        tests_ran=tests_ran,
+                        test_outcome=test_runner_telemetry.get("outcome") if isinstance(test_runner_telemetry, dict) else None,
+                        feedback_sent=state["last_feedback"],
+                        failure_evidence=mechanical_evidence,
+                        mech_evidence=mech_ev,
+                    )
+
+                    state["trajectory"].append({
+                        "node": "gate",
+                        "subgoal": subgoal.model_dump() if hasattr(subgoal, "model_dump") else dict(subgoal),
+                        "gate_status": "verification_inconclusive",
+                        "status": "escalated",
+                        "tier0_result": tier0_telemetry,
+                        "compile": compile_telemetry,
+                        "test_runner": test_runner_telemetry,
+                        "failure_evidence": mechanical_evidence,
+                        "mech_evidence": mech_ev.model_dump() if mech_ev and hasattr(mech_ev, "model_dump") else None,
+                        "retry_metadata": retry_progress,
+                        "jev_request": None,
+                        "jev_verdict": None,
+                        "advisory": advisory_telemetry,
+                    })
+
+                    _safe_escalate_deadlock(
+                        gatekeeper,
+                        trajectory=state.get("trajectory", []),
+                        triggering_tier="verification",
+                        integration_branch=state.get("integration_branch"),
+                        thread_id=state.get("thread_id"),
+                    )
+                    _safe_record_memory(memory, state, outcome="verification_inconclusive",
+                                        failure_class="tests_unmeasured", summary=state.get("last_feedback", ""),
+                                        diff=diff, subgoal=subgoal)
+                    return state
+                else:
+                    state["gate_status"] = "unmeasured"
+                    _snapshot_attempt(
+                        safe_rec,
+                        state,
+                        subgoal_id,
+                        tier="mechanical",
+                        outcome="unmeasured",
+                        failed_check="tests_unmeasured",
+                        diff=diff,
+                        compile_info=compile_telemetry,
+                        tests_ran=tests_ran,
+                        test_outcome=test_runner_telemetry.get("outcome") if isinstance(test_runner_telemetry, dict) else None,
+                        feedback_sent=state["last_feedback"],
+                        failure_evidence=mechanical_evidence,
+                        mech_evidence=mech_ev,
+                    )
+
+                    state["trajectory"].append({
+                        "node": "gate",
+                        "subgoal": subgoal.model_dump() if hasattr(subgoal, "model_dump") else dict(subgoal),
+                        "gate_status": "unmeasured",
+                        "tier0_result": tier0_telemetry,
+                        "compile": compile_telemetry,
+                        "test_runner": test_runner_telemetry,
+                        "failure_evidence": mechanical_evidence,
+                        "mech_evidence": mech_ev.model_dump() if mech_ev and hasattr(mech_ev, "model_dump") else None,
+                        "retry_metadata": retry_progress,
+                        "jev_request": None,
+                        "jev_verdict": None,
+                        "advisory": advisory_telemetry,
+                    })
+                    _safe_record_memory(memory, state, outcome="unmeasured",
+                                        failure_class="tests_unmeasured", summary=state.get("last_feedback", ""),
+                                        diff=diff, subgoal=subgoal)
+                    return state
             else:
-                formatted_fb = base_fb
-
-            state["last_feedback"] = f"Verification could not attribute this failure to your change (reason: {reason_val}). Fix it if it is yours.\n\n{formatted_fb}"
-            advisory_telemetry = _apply_advisory(advisory, mechanical_evidence, state)
-            _teardown_worktree(state, workspace)
-
-            if current_unmeasured_retries >= 3:
-                state["status"] = "escalated"
-                state["gate_status"] = "verification_inconclusive"
-                subgoal.status = "failed"
-                state["current_subgoal"] = subgoal
-                if safe_rec:
-                    safe_rec.record_subgoal_status(run_id, subgoal_id, "failed")
-
-                _snapshot_attempt(
-                    safe_rec,
-                    state,
-                    subgoal_id,
-                    tier="mechanical",
-                    outcome="verification_inconclusive",
-                    failed_check="tests_unmeasured",
-                    diff=diff,
-                    compile_info=compile_telemetry,
-                    tests_ran=tests_ran,
-                    test_outcome=test_runner_telemetry.get("outcome") if isinstance(test_runner_telemetry, dict) else None,
-                    feedback_sent=state["last_feedback"],
-                    failure_evidence=mechanical_evidence,
-                    mech_evidence=mech_ev,
+                # require_tests is OFF (default): UNMEASURED may reach Jev (Tier 1 Gatekeeper) and be semantically accepted.
+                if mech_ev is not None:
+                    mech_ev.mechanically_unverified = True
+        else:
+            current_mech_strikes = state.get("mechanical_strike_count", 0) + 1
+            state["mechanical_strike_count"] = current_mech_strikes
+            state["gate_status"] = "mechanical_failure"
+            if mech_result.failed_check == "compile":
+                state["last_feedback"] = _format_compile_feedback(
+                    compile_telemetry or getattr(mech_result, "compile_outcome", None) or {},
+                    fallback_detail=mech_result.detail,
                 )
-
-                state["trajectory"].append({
-                    "node": "gate",
-                    "subgoal": subgoal.model_dump() if hasattr(subgoal, "model_dump") else dict(subgoal),
-                    "gate_status": "verification_inconclusive",
-                    "status": "escalated",
-                    "tier0_result": tier0_telemetry,
-                    "compile": compile_telemetry,
-                    "test_runner": test_runner_telemetry,
-                    "failure_evidence": mechanical_evidence,
-                    "mech_evidence": mech_ev.model_dump() if mech_ev and hasattr(mech_ev, "model_dump") else None,
-                    "retry_metadata": retry_progress,
-                    "jev_request": None,
-                    "jev_verdict": None,
-                    "advisory": advisory_telemetry,
-                })
-
-                _safe_escalate_deadlock(
-                    gatekeeper,
-                    trajectory=state.get("trajectory", []),
-                    triggering_tier="verification",
-                    integration_branch=state.get("integration_branch"),
-                    thread_id=state.get("thread_id"),
-                )
-                _safe_record_memory(memory, state, outcome="verification_inconclusive",
-                                    failure_class="tests_unmeasured", summary=state.get("last_feedback", ""),
-                                    diff=diff, subgoal=subgoal)
-                return state
-            else:
-                state["gate_status"] = "unmeasured"
-                _snapshot_attempt(
-                    safe_rec,
-                    state,
-                    subgoal_id,
-                    tier="mechanical",
-                    outcome="unmeasured",
-                    failed_check="tests_unmeasured",
-                    diff=diff,
-                    compile_info=compile_telemetry,
-                    tests_ran=tests_ran,
-                    test_outcome=test_runner_telemetry.get("outcome") if isinstance(test_runner_telemetry, dict) else None,
-                    feedback_sent=state["last_feedback"],
-                    failure_evidence=mechanical_evidence,
-                    mech_evidence=mech_ev,
-                )
-
-                state["trajectory"].append({
-                    "node": "gate",
-                    "subgoal": subgoal.model_dump() if hasattr(subgoal, "model_dump") else dict(subgoal),
-                    "gate_status": "unmeasured",
-                    "tier0_result": tier0_telemetry,
-                    "compile": compile_telemetry,
-                    "test_runner": test_runner_telemetry,
-                    "failure_evidence": mechanical_evidence,
-                    "mech_evidence": mech_ev.model_dump() if mech_ev and hasattr(mech_ev, "model_dump") else None,
-                    "retry_metadata": retry_progress,
-                    "jev_request": None,
-                    "jev_verdict": None,
-                    "advisory": advisory_telemetry,
-                })
-                _safe_record_memory(memory, state, outcome="unmeasured",
-                                    failure_class="tests_unmeasured", summary=state.get("last_feedback", ""),
-                                    diff=diff, subgoal=subgoal)
-                return state
-
-        current_mech_strikes = state.get("mechanical_strike_count", 0) + 1
-        state["mechanical_strike_count"] = current_mech_strikes
-        state["gate_status"] = "mechanical_failure"
-        if mech_result.failed_check == "compile":
-            state["last_feedback"] = _format_compile_feedback(
-                compile_telemetry or getattr(mech_result, "compile_outcome", None) or {},
-                fallback_detail=mech_result.detail,
-            )
-        elif mech_result.failed_check == "tests":
-            base_fb = mech_result.detail or "Unit tests failed."
-            output_tail = None
-            if isinstance(test_runner_telemetry, dict):
-                output_tail = test_runner_telemetry.get("output_tail")
-            elif hasattr(mech_result, "test_runner_outcome") and isinstance(mech_result.test_runner_outcome, dict):
-                output_tail = mech_result.test_runner_outcome.get("output_tail")
-            if output_tail:
-                tail_capped = output_tail[-4000:]
-                if tail_capped not in base_fb:
-                    state["last_feedback"] = f"{base_fb}\n\n{tail_capped}"
+            elif mech_result.failed_check == "tests":
+                base_fb = mech_result.detail or "Unit tests failed."
+                output_tail = None
+                if isinstance(test_runner_telemetry, dict):
+                    output_tail = test_runner_telemetry.get("output_tail")
+                elif hasattr(mech_result, "test_runner_outcome") and isinstance(mech_result.test_runner_outcome, dict):
+                    output_tail = mech_result.test_runner_outcome.get("output_tail")
+                if output_tail:
+                    tail_capped = output_tail[-4000:]
+                    if tail_capped not in base_fb:
+                        state["last_feedback"] = f"{base_fb}\n\n{tail_capped}"
+                    else:
+                        state["last_feedback"] = base_fb
                 else:
                     state["last_feedback"] = base_fb
             else:
-                state["last_feedback"] = base_fb
-        else:
-            state["last_feedback"] = mech_result.detail
+                state["last_feedback"] = mech_result.detail
 
-        mechanical_feedback = (
-            f"{state.get('last_feedback') or 'Mechanical validation failed.'}\n"
-            f"Failure evidence: {_feedback_packet(mechanical_evidence)}"
-        )
-        advisory_telemetry = _apply_advisory(advisory, mechanical_evidence, state)
-        mechanical_feedback = (
-            f"{state.get('last_feedback') or 'Mechanical validation failed.'}\n"
-            f"Failure evidence: {_feedback_packet(mechanical_evidence)}"
-        )
-        # Preserve a complete test tail when it already consumes the feedback budget.
-        if len(mechanical_feedback) <= MAX_SELF_CHECK_OUTPUT_CHARS:
-            state["last_feedback"] = mechanical_feedback
+            mechanical_feedback = (
+                f"{state.get('last_feedback') or 'Mechanical validation failed.'}\n"
+                f"Failure evidence: {_feedback_packet(mechanical_evidence)}"
+            )
+            advisory_telemetry = _apply_advisory(advisory, mechanical_evidence, state)
+            mechanical_feedback = (
+                f"{state.get('last_feedback') or 'Mechanical validation failed.'}\n"
+                f"Failure evidence: {_feedback_packet(mechanical_evidence)}"
+            )
+            # Preserve a complete test tail when it already consumes the feedback budget.
+            if len(mechanical_feedback) <= MAX_SELF_CHECK_OUTPUT_CHARS:
+                state["last_feedback"] = mechanical_feedback
 
-        if retry_intel != "off":
-            _record_failed_attempt_in_state(
+            if retry_intel != "off":
+                _record_failed_attempt_in_state(
+                    state,
+                    tier="mechanical",
+                    outcome="mechanical_failure",
+                    failed_check=mech_result.failed_check,
+                    diff=diff,
+                    compile_info=compile_telemetry,
+                    failure_evidence=mechanical_evidence,
+                )
+            _snapshot_attempt(
+                safe_rec,
                 state,
+                subgoal_id,
                 tier="mechanical",
                 outcome="mechanical_failure",
                 failed_check=mech_result.failed_check,
                 diff=diff,
                 compile_info=compile_telemetry,
+                tests_ran=tests_ran,
+                test_outcome=test_runner_telemetry.get("outcome") if isinstance(test_runner_telemetry, dict) else None,
+                feedback_sent=state.get("last_feedback"),
                 failure_evidence=mechanical_evidence,
+                mech_evidence=mech_ev,
             )
-        _snapshot_attempt(
-            safe_rec,
-            state,
-            subgoal_id,
-            tier="mechanical",
-            outcome="mechanical_failure",
-            failed_check=mech_result.failed_check,
-            diff=diff,
-            compile_info=compile_telemetry,
-            tests_ran=tests_ran,
-            test_outcome=test_runner_telemetry.get("outcome") if isinstance(test_runner_telemetry, dict) else None,
-            feedback_sent=state.get("last_feedback"),
-            failure_evidence=mechanical_evidence,
-            mech_evidence=mech_ev,
-        )
-        _teardown_worktree(state, workspace)
+            _teardown_worktree(state, workspace)
 
-        state["trajectory"].append({
-            "node": "gate",
-            "subgoal": subgoal.model_dump() if hasattr(subgoal, "model_dump") else dict(subgoal),
-            "gate_status": "mechanical_failure",
-            "tier0_result": tier0_telemetry,
-            "compile": compile_telemetry,
-            "test_runner": test_runner_telemetry,
-            "failure_evidence": mechanical_evidence,
-            "mech_evidence": mech_ev.model_dump() if mech_ev and hasattr(mech_ev, "model_dump") else None,
-            "retry_metadata": retry_progress,
-            "jev_request": None,
-            "jev_verdict": None,
-            "advisory": advisory_telemetry,
-        })
+            state["trajectory"].append({
+                "node": "gate",
+                "subgoal": subgoal.model_dump() if hasattr(subgoal, "model_dump") else dict(subgoal),
+                "gate_status": "mechanical_failure",
+                "tier0_result": tier0_telemetry,
+                "compile": compile_telemetry,
+                "test_runner": test_runner_telemetry,
+                "failure_evidence": mechanical_evidence,
+                "mech_evidence": mech_ev.model_dump() if mech_ev and hasattr(mech_ev, "model_dump") else None,
+                "retry_metadata": retry_progress,
+                "jev_request": None,
+                "jev_verdict": None,
+                "advisory": advisory_telemetry,
+            })
 
-        if current_mech_strikes >= 3:
-            subgoal.status = "failed"
-            state["current_subgoal"] = subgoal
-            if safe_rec:
-                safe_rec.record_subgoal_status(run_id, subgoal_id, "failed")
-            _safe_escalate_deadlock(
-                gatekeeper,
-                trajectory=state.get("trajectory", []),
-                triggering_tier="mechanical",
-                integration_branch=state.get("integration_branch"),
-                thread_id=state.get("thread_id"),
-            )
-        _safe_record_memory(memory, state, outcome="mechanical_failure",
-                            failure_class=mech_result.failed_check, summary=state.get("last_feedback", ""),
-                            diff=diff, subgoal=subgoal)
-        return state
+            if current_mech_strikes >= 3:
+                subgoal.status = "failed"
+                state["current_subgoal"] = subgoal
+                if safe_rec:
+                    safe_rec.record_subgoal_status(run_id, subgoal_id, "failed")
+                _safe_escalate_deadlock(
+                    gatekeeper,
+                    trajectory=state.get("trajectory", []),
+                    triggering_tier="mechanical",
+                    integration_branch=state.get("integration_branch"),
+                    thread_id=state.get("thread_id"),
+                )
+            _safe_record_memory(memory, state, outcome="mechanical_failure",
+                                failure_class=mech_result.failed_check, summary=state.get("last_feedback", ""),
+                                diff=diff, subgoal=subgoal)
+            return state
 
     # Tier 0 Passed -> Proceed to Tier 1 (Semantic check via Gatekeeper)
     if gatekeeper is None:
@@ -4573,6 +4581,9 @@ def node_gate(
         if not tests_ran or not getattr(subgoal, "expects_tests", True) or test_policy in ("never", "verify-only"):
             is_unv = True
             unv_kind = "untested"
+        elif is_unmeasured or (mech_ev is not None and getattr(mech_ev, "mech_status", None) == MechStatus.UNMEASURED):
+            is_unv = True
+            unv_kind = "unmeasured"
         elif (
             (mech_ev is not None and (
                 getattr(mech_ev, "mechanically_unverified", False)
@@ -5048,6 +5059,21 @@ def node_verify(
                     test_runner_info["new_failures"] = verify_new_failures
                 test_runner_info["full_suite_clean"] = verify_full_suite_clean
 
+        require_tests = state.get("require_tests")
+        require_tests_strict = (require_tests in ("on", True))
+        if require_tests_strict and (not tests_ran or outcome not in (TestOutcome.PASSED, "PASSED")):
+            state["gate_status"] = "verification_failed"
+            state["status"] = "escalated"
+            state["last_feedback"] = "Verification failed: strict --require-tests is enabled but tests were unmeasured or did not pass."
+            _safe_escalate_deadlock(
+                gatekeeper,
+                trajectory=state.get("trajectory", []),
+                triggering_tier="mechanical",
+                integration_branch=integration_branch,
+                thread_id=state.get("thread_id"),
+            )
+            return state
+
         unverified_subgoals = list(state.get("mechanically_unverified_subgoals") or [])
         for entry in state.get("trajectory", []):
             if isinstance(entry, dict) and entry.get("node") == "gate" and entry.get("gate_status") == "passed":
@@ -5381,6 +5407,10 @@ class JevEngine:
         subgoal_timeout: int = 600,
         ticket_timeout: int = 2700,
         process_cleanup_grace_period: float = 2.0,
+        registry_resolution: str = "off",
+        approved_proposals: str = "off",
+        same_command_authority: str = "off",
+        require_tests: str = "off",
     ):
         if subgoal_timeout <= 0:
             raise ValueError(f"subgoal_timeout must be a positive integer, got {subgoal_timeout}")
@@ -5408,6 +5438,10 @@ class JevEngine:
         self.replan_enabled = replan_enabled
         self.replan_planner = replan_planner
         self.replan_validator = replan_validator
+        self.registry_resolution = registry_resolution
+        self.approved_proposals = approved_proposals
+        self.same_command_authority = same_command_authority
+        self.require_tests = require_tests
         if recorder is None:
             self.recorder = SafeRecorder(NullRecorder())
         elif isinstance(recorder, SafeRecorder):
@@ -5600,6 +5634,14 @@ class JevEngine:
             self.workspace.subgoal_start_time = None
             self.workspace.subgoal_timeout = self.subgoal_timeout
             self.workspace.ticket_timeout = self.ticket_timeout
+            if hasattr(self.workspace, "registry_resolution"):
+                self.workspace.registry_resolution = (self.registry_resolution == "on")
+            if hasattr(self.workspace, "approved_proposals"):
+                self.workspace.approved_proposals = (self.approved_proposals == "on")
+            if hasattr(self.workspace, "same_command_authority"):
+                self.workspace.same_command_authority = (self.same_command_authority == "on")
+            if hasattr(self.workspace, "require_tests"):
+                self.workspace.require_tests = (self.require_tests == "on")
 
         initial_state: State = {
             "ticket": ticket,
@@ -5630,6 +5672,10 @@ class JevEngine:
             "last_feedback": None,
             "status": None,
             "role_provenance": self.role_provenance,
+            "registry_resolution": self.registry_resolution,
+            "approved_proposals": self.approved_proposals,
+            "same_command_authority": self.same_command_authority,
+            "require_tests": self.require_tests,
         }
 
         config: RunnableConfig = {"configurable": {"thread_id": thread_id}}

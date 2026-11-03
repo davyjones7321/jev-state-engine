@@ -162,10 +162,40 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--approved-proposals",
         "--proposals",
+        nargs="?",
+        const="on",
         choices=["on", "off"],
         default="off",
         dest="approved_proposals",
         help="Build command proposals for unknown ecosystems (on, off; defaults to off).",
+    )
+    parser.add_argument(
+        "--registry-resolution",
+        "--runner-registry",
+        nargs="?",
+        const="on",
+        choices=["on", "off"],
+        default="off",
+        dest="registry_resolution",
+        help="Enable registry-backed test and compile runner resolution (on, off; defaults to off).",
+    )
+    parser.add_argument(
+        "--same-command-authority",
+        nargs="?",
+        const="on",
+        choices=["on", "off"],
+        default="off",
+        dest="same_command_authority",
+        help="Enforce same-command comparison as sole comparison authority (on, off; defaults to off).",
+    )
+    parser.add_argument(
+        "--require-tests",
+        nargs="?",
+        const="on",
+        choices=["on", "off"],
+        default="off",
+        dest="require_tests",
+        help="Strict test requirement: reject or escalate unmeasured subgoals without tests (on, off; defaults to off).",
     )
     parser.add_argument(
         "--env-file",
@@ -246,6 +276,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # Wire Dependency Injection
     workspace = Workspace(repo_dir=repo_dir, test_timeout=args.test_timeout, strict_provenance=True)
+    if hasattr(workspace, "registry_resolution"):
+        workspace.registry_resolution = (args.registry_resolution == "on")
+    if hasattr(workspace, "approved_proposals"):
+        workspace.approved_proposals = (args.approved_proposals == "on")
+    if hasattr(workspace, "same_command_authority"):
+        workspace.same_command_authority = (args.same_command_authority == "on")
     gatekeeper = Gatekeeper(env_file=env_file)
 
     if args.advisory_policy == "off":
@@ -310,6 +346,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         subgoal_timeout=args.subgoal_timeout,
         ticket_timeout=args.ticket_timeout,
         process_cleanup_grace_period=args.process_cleanup_grace_period,
+        registry_resolution=args.registry_resolution,
+        approved_proposals=args.approved_proposals,
+        same_command_authority=args.same_command_authority,
+        require_tests=args.require_tests,
     )
 
     final_state = engine.execute(ticket=args.ticket, thread_id=args.thread_id)
