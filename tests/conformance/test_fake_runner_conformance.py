@@ -274,6 +274,50 @@ def test_timeout_kills_descendants_and_missing_or_absent_commands_are_unmeasured
     assert no_cmd_ev.reason == MechReason.NO_COMMAND
 
 
+def _pid_is_alive_cross_platform(pid: int) -> bool:
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    import ctypes
+    from ctypes import wintypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return False
+    try:
+        exit_code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return False
+        return exit_code.value == STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def test_timeout_independently_proves_child_liveness_cleanup(tmp_path, monkeypatch):
+    child_pid_file = tmp_path / "child.pid"
+    _configure(
+        tmp_path,
+        monkeypatch,
+        {"candidate": {"sleep": 30, "child_pid_file": str(child_pid_file)}},
+        log=False,
+    )
+    result = run_command([sys.executable, str(FAKE_RUNNER)], cwd=tmp_path, timeout=2.0, env=os.environ.copy())
+    assert result.timed_out is True
+    child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+    time.sleep(0.1)
+    assert not _pid_is_alive_cross_platform(child_pid)
+    assert result.descendants_remaining == 0
+
+
 def test_malformed_output_scrambling_and_fingerprints_are_conservative(tmp_path, monkeypatch):
     repo, head = _git_repo(tmp_path)
     malformed = {"exit": 1, "stdout": "runner crashed: malformed output\n"}
