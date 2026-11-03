@@ -67,8 +67,9 @@ def phase11_metrics_report(
     def accumulator() -> Dict[str, int]:
         return dict.fromkeys((
             "attempts_all", "measured", "attempts_eligible", "unmeasured", "exit_only_success_count",
-            "tooling_uncertainty", "verifier_modified", "worker_rejections_assessed",
-            "false_worker_rejections", "mechanical_acceptances_assessed", "false_mechanical_acceptances",
+            "tooling_uncertainty", "verifier_modified", "worker_rejections_total",
+            "worker_rejections_assessed", "false_worker_rejections", "mechanical_acceptances_total",
+            "mechanical_acceptances_assessed", "false_mechanical_acceptances",
             "unsafe_commit_count", "process_leak_count", "unsafe_commit_assessed_attempts",
             "process_leak_assessed_attempts", "safety_assessed_attempts", "eligibility_unknown_count",
         ), 0)
@@ -127,6 +128,8 @@ def phase11_metrics_report(
             counts["exit_only_success_count"] += int(status == "PASS" and level == "exit_only")
             counts["tooling_uncertainty"] += int(status == "UNMEASURED" or status is None or outside)
             counts["verifier_modified"] += int(bool(row.get("mech_verifier_modified")))
+            counts["worker_rejections_total"] += int(rejected)
+            counts["mechanical_acceptances_total"] += int(status == "PASS")
             if rejected and observation.get("worker_should_accept") is not None:
                 counts["worker_rejections_assessed"] += 1
                 counts["false_worker_rejections"] += int(observation["worker_should_accept"] == 1)
