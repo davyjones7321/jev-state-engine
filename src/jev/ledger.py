@@ -95,7 +95,11 @@ def phase11_metrics_report(
         status = row.get("mech_status")
         reason = row.get("mech_reason")
         level = row.get("mech_evidence_level")
-        outside = identity.get("preflight_status") in ("OUTSIDE_PROFILE", "PROFILE_UNKNOWN")
+        profile_id = row.get("mech_runner_profile_id") or identity.get("profile_id")
+        outside = (
+            identity.get("preflight_status") in ("OUTSIDE_PROFILE", "PROFILE_UNKNOWN")
+            or not profile_id
+        )
         eligible = status in ("PASS", "FAIL", "UNMEASURED") and not outside and reason not in {
             "MISSING_TOOL", "NO_COMMAND", "ENVIRONMENT_UNAVAILABLE",
         }
@@ -108,7 +112,7 @@ def phase11_metrics_report(
         )
         key = (
             row.get("mech_language"),
-            row.get("mech_runner_profile_id") or identity.get("profile_id"),
+            profile_id,
             identity.get("platform") or observation.get("platform"),
             row.get("mech_registry_version") or identity.get("registry_version"),
         )
