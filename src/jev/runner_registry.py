@@ -785,129 +785,173 @@ def parse_test_counts_summary(
     skipped = 0
     matched = False
 
-    # 1. Pytest: 'X passed', 'X failed', 'X skipped', 'X error'
-    m_pass = re.search(r"\b(\d+)\s+passed\b", clean, re.I)
-    m_fail = re.search(r"\b(\d+)\s+failed\b", clean, re.I)
-    m_err = re.search(r"\b(\d+)\s+error(?:s)?\b", clean, re.I)
-    m_skip = re.search(r"\b(\d+)\s+skipped\b", clean, re.I)
-    if m_pass or m_fail or m_err or m_skip:
-        matched = True
-        if m_pass:
-            passed += int(m_pass.group(1))
-        if m_fail:
-            failed += int(m_fail.group(1))
-        if m_err:
-            failed += int(m_err.group(1))
-        if m_skip:
-            skipped += int(m_skip.group(1))
+    def scan(pattern: str, handler) -> None:
+        nonlocal matched
+        for line in clean.splitlines():
+            match = re.match(pattern, line, re.IGNORECASE)
+            if match:
+                matched = True
+                handler(match)
 
-    # 2. Bun: 'X pass', 'X fail', 'X skip'
-    if not matched:
-        b_pass = re.search(r"^\s*(\d+)\s+pass\b", clean, re.MULTILINE | re.I)
-        b_fail = re.search(r"^\s*(\d+)\s+fail\b", clean, re.MULTILINE | re.I)
-        b_skip = re.search(r"^\s*(\d+)\s+skip\b", clean, re.MULTILINE | re.I)
-        if b_pass or b_fail or b_skip:
-            matched = True
-            if b_pass:
-                passed += int(b_pass.group(1))
-            if b_fail:
-                failed += int(b_fail.group(1))
-            if b_skip:
-                skipped += int(b_skip.group(1))
+    def add_word_counts(body: str) -> None:
+        nonlocal passed, failed, skipped
+        for count_text, kind in re.findall(r"(\d+)\s+(passed|failed|skipped|errors?)\b", body, re.IGNORECASE):
+            count = int(count_text)
+            kind = kind.lower()
+            if kind == "passed":
+                passed += count
+            elif kind == "failed" or kind.startswith("error"):
+                failed += count
+            else:
+                skipped += count
 
-    # 3. Cargo: 'test result: ok. 1 passed; 0 failed; 0 ignored'
-    if not matched:
-        c_m = re.search(
-            r"test result:\s*(?:ok|FAILED)\.\s*(\d+)\s+passed;\s*(\d+)\s+failed;\s*(\d+)\s+ignored",
-            clean,
-            re.I,
+    def _add_node_count(match):
+        nonlocal passed, failed, skipped
+        count = int(match.group("count"))
+        if match.group("kind").lower() == "pass":
+            passed += count
+        elif match.group("kind").lower() == "fail":
+            failed += count
+        else:
+            skipped += count
+
+    def _add_mocha_count(match):
+        nonlocal passed, failed
+        if match.group("passed"):
+            passed += int(match.group("passed"))
+        if match.group("failed"):
+            failed += int(match.group("failed"))
+
+    def _add_bun_count(match):
+        nonlocal passed, failed, skipped
+        count = int(match.group("count"))
+        if match.group("kind").lower() == "pass":
+            passed += count
+        elif match.group("kind").lower() == "fail":
+            failed += count
+        else:
+            skipped += count
+
+    def _add_deno_count(match):
+        nonlocal passed, failed, skipped
+        passed += int(match.group("passed"))
+        failed += int(match.group("failed"))
+        skipped += int(match.group("skipped"))
+
+    def _add_maven_count(match):
+        nonlocal passed, failed, skipped
+        total = int(match.group("total"))
+        failed_count = int(match.groupdict().get("failed") or 0) + int(match.groupdict().get("errors") or 0)
+        skipped_count = int(match.groupdict().get("skipped") or 0)
+        failed += failed_count
+        skipped += skipped_count
+        passed += max(0, total - failed_count - skipped_count)
+
+    def _add_gradle_count(match):
+        nonlocal passed, failed, skipped
+        total = int(match.group("total"))
+        failed_count = int(match.group("failed"))
+        skipped_count = int(match.groupdict().get("skipped") or 0)
+        failed += failed_count
+        skipped += skipped_count
+        passed += max(0, total - failed_count - skipped_count)
+
+    def _add_cmake_count(match):
+        nonlocal passed, failed
+        total = int(match.group("total"))
+        failed_count = int(match.group("failed"))
+        failed += failed_count
+        passed += max(0, total - failed_count)
+
+    def _add_one_pass():
+        nonlocal passed
+        passed += 1
+
+    def _add_one_fail():
+        nonlocal failed
+        failed += 1
+
+    # Each grammar is anchored to a complete summary line.  A known profile
+    # without a safe grammar intentionally remains unparsed/exit-only.
+    if pid in (None, "pytest"):
+        scan(
+            r"^\s*=*\s*(?P<body>\d+\s+(?:passed|failed|skipped|errors?)(?:\s*,\s*\d+\s+(?:passed|failed|skipped|errors?|warnings?))*)(?:\s+in\s+(?:\d+(?:\.\d+)?|<DUR>)(?:\s*(?:s|sec|secs|seconds))?)?\s*=*\s*$",
+            lambda m: add_word_counts(m.group("body")),
         )
-        if c_m:
-            matched = True
-            passed = int(c_m.group(1))
-            failed = int(c_m.group(2))
-            skipped = int(c_m.group(3))
-
-    # 4. Node native: 'ℹ pass 1', 'ℹ fail 0', 'ℹ skipped 0'
-    if not matched:
-        n_pass = re.search(r"\bpass\s+(\d+)\b", clean, re.I)
-        n_fail = re.search(r"\bfail\s+(\d+)\b", clean, re.I)
-        n_skip = re.search(r"\bskipped\s+(\d+)\b", clean, re.I)
-        if n_pass or n_fail or n_skip:
-            matched = True
-            if n_pass:
-                passed += int(n_pass.group(1))
-            if n_fail:
-                failed += int(n_fail.group(1))
-            if n_skip:
-                skipped += int(n_skip.group(1))
-
-    # 5. Jest / Vitest: 'Tests: 1 passed, 1 total'
-    if not matched:
-        j_pass = re.search(r"Tests:\s*.*?(\d+)\s+passed", clean, re.I)
-        j_fail = re.search(r"Tests:\s*.*?(\d+)\s+failed", clean, re.I)
-        j_skip = re.search(r"Tests:\s*.*?(\d+)\s+skipped", clean, re.I)
-        if j_pass or j_fail or j_skip:
-            matched = True
-            if j_pass:
-                passed += int(j_pass.group(1))
-            if j_fail:
-                failed += int(j_fail.group(1))
-            if j_skip:
-                skipped += int(j_skip.group(1))
-
-    # 6. Deno: '1 passed; 0 failed; 0 ignored'
-    if not matched:
-        d_m = re.search(r"(\d+)\s+passed;\s*(\d+)\s+failed;\s*(\d+)\s+ignored", clean, re.I)
-        if d_m:
-            matched = True
-            passed = int(d_m.group(1))
-            failed = int(d_m.group(2))
-            skipped = int(d_m.group(3))
-
-    # 7. Mocha: '1 passing', '0 failing'
-    if not matched:
-        m_pass = re.search(r"(\d+)\s+passing\b", clean, re.I)
-        m_fail = re.search(r"(\d+)\s+failing\b", clean, re.I)
-        if m_pass or m_fail:
-            matched = True
-            if m_pass:
-                passed += int(m_pass.group(1))
-            if m_fail:
-                failed += int(m_fail.group(1))
-
-    # 8. Maven: 'Tests run: 1, Failures: 0, Errors: 0, Skipped: 0'
-    if not matched:
-        mv_m = re.search(r"Tests run:\s*(\d+),\s*Failures:\s*(\d+),\s*Errors:\s*(\d+),\s*Skipped:\s*(\d+)", clean, re.I)
-        if mv_m:
-            matched = True
-            total = int(mv_m.group(1))
-            failed = int(mv_m.group(2)) + int(mv_m.group(3))
-            skipped = int(mv_m.group(4))
-            passed = max(0, total - failed - skipped)
-
-    # 9. DotNet: 'Passed: 1, Failed: 0, Skipped: 0'
-    if not matched:
-        dn_pass = re.search(r"Passed:\s*(\d+)", clean, re.I)
-        dn_fail = re.search(r"Failed:\s*(\d+)", clean, re.I)
-        dn_skip = re.search(r"Skipped:\s*(\d+)", clean, re.I)
-        if dn_pass or dn_fail or dn_skip:
-            matched = True
-            if dn_pass:
-                passed += int(dn_pass.group(1))
-            if dn_fail:
-                failed += int(dn_fail.group(1))
-            if dn_skip:
-                skipped += int(dn_skip.group(1))
-
-    # 10. Go: 'ok  package  0.01s' or '--- PASS: TestName'
-    if not matched and pid == "go-test":
-        if re.search(r"^ok\s+\S+", clean, re.MULTILINE) or "--- PASS:" in clean:
-            matched = True
-            passed = len(re.findall(r"--- PASS:", clean)) or 1
-        elif re.search(r"^FAIL\s+\S+", clean, re.MULTILINE) or "--- FAIL:" in clean:
-            matched = True
-            failed = len(re.findall(r"--- FAIL:", clean)) or 1
+    elif pid == "node-native-test":
+        scan(
+            r"^\s*(?:[^\s]+\s+)?(?P<kind>pass|fail|skipped)\s+(?P<count>\d+)\s*$",
+            _add_node_count,
+        )
+    elif pid in ("jest", "vitest"):
+        scan(
+            r"^\s*Tests:\s*(?P<body>.*\btotal\b.*)\s*$",
+            lambda m: add_word_counts(m.group("body")),
+        )
+    elif pid == "mocha":
+        scan(
+            r"^\s*(?:(?P<passed>\d+)\s+passing|(?P<failed>\d+)\s+failing)\s*$",
+            _add_mocha_count,
+        )
+    elif pid == "bun-test":
+        scan(
+            r"^\s*(?P<count>\d+)\s+(?P<kind>pass|fail|skip)\s*$",
+            _add_bun_count,
+        )
+    elif pid == "deno-test":
+        scan(
+            r"^\s*(?P<passed>\d+)\s+passed;\s*(?P<failed>\d+)\s+failed;\s*(?P<skipped>\d+)\s+ignored(?:;.*)?\s*$",
+            _add_deno_count,
+        )
+    elif pid == "cargo-test":
+        scan(
+            r"^\s*test result:\s*(?:ok|FAILED)\.\s*(?P<passed>\d+)\s+passed;\s*(?P<failed>\d+)\s+failed;\s*(?P<skipped>\d+)\s+ignored(?:;.*)?\s*$",
+            _add_deno_count,
+        )
+    elif pid == "maven-surefire":
+        scan(
+            r"^\s*(?:\[INFO\]\s*)?Tests run:\s*(?P<total>\d+),\s*Failures:\s*(?P<failed>\d+),\s*Errors:\s*(?P<errors>\d+),\s*Skipped:\s*(?P<skipped>\d+)\s*$",
+            _add_maven_count,
+        )
+    elif pid == "gradle-test":
+        scan(
+            r"^\s*(?P<total>\d+)\s+tests?\s+completed,\s*(?P<failed>\d+)\s+failed(?:,\s*(?P<skipped>\d+)\s+skipped)?\s*$",
+            _add_gradle_count,
+        )
+    elif pid == "dotnet-test":
+        scan(
+            r"^\s*(?:Total tests:\s*\d+,\s*)?Passed:\s*(?P<passed>\d+),\s*Failed:\s*(?P<failed>\d+),\s*Skipped:\s*(?P<skipped>\d+)\s*$",
+            _add_deno_count,
+        )
+    elif pid == "cmake-ctest":
+        scan(
+            r"^\s*\d+%\s+tests?\s+passed,\s*(?P<failed>\d+)\s+tests?\s+failed\s+out\s+of\s+(?P<total>\d+)\s*$",
+            _add_cmake_count,
+        )
+    elif pid == "ruby-rake":
+        scan(
+            r"^\s*(?P<total>\d+)\s+runs?,\s*\d+\s+assertions?,\s*(?P<failed>\d+)\s+failures?,\s*(?P<errors>\d+)\s+errors?\s*$",
+            _add_maven_count,
+        )
+    elif pid == "phpunit":
+        scan(
+            r"^\s*Tests:\s*(?P<total>\d+),\s*Assertions:\s*\d+(?:,\s*Failures:\s*(?P<failed>\d+))?(?:,\s*Errors:\s*(?P<errors>\d+))?(?:,\s*Skipped:\s*(?P<skipped>\d+))?\.?\s*$",
+            _add_maven_count,
+        )
+    elif pid in ("swiftpm-test", "xcode-test"):
+        scan(
+            r"^\s*Executed\s+(?P<total>\d+)\s+tests?,\s*with\s*(?P<failed>\d+)\s+failures?\s+\(\d+\s+unexpected\)\s+in\s+.*$",
+            _add_maven_count,
+        )
+    elif pid == "mix-test":
+        scan(
+            r"^\s*(?P<total>\d+)\s+tests?,\s*(?P<failed>\d+)\s+failures?\s*$",
+            _add_gradle_count,
+        )
+    elif pid == "go-test":
+        scan(r"^\s*ok\s+\S+(?:\s+[\d.]+s)?(?:\s+\(cached\))?\s*$", lambda m: _add_one_pass())
+        scan(r"^\s*---\s+PASS:\s+\S+.*$", lambda m: _add_one_pass())
+        scan(r"^\s*FAIL\s+\S+.*$", lambda m: _add_one_fail())
 
     skip_indicators = (
         "(skip) skip" in clean or

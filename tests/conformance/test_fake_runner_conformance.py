@@ -18,7 +18,7 @@ import pytest
 from jev.mech_evidence import BaseStatus, EvidenceLevel, MechReason, MechStatus, TargetConfidence
 from jev.models import Subgoal, TestOutcome
 from jev.process_runner import run_command
-from jev.runner_registry import RunnerProfile, build_targeted_command, parse_test_counts_summary
+from jev.runner_registry import RunnerProfile, build_targeted_command, load_registry, parse_test_counts_summary
 from jev.workspace import ResolvedTestCommand, Workspace, compute_failure_fingerprint, is_shared_surface_path
 
 
@@ -320,6 +320,15 @@ def test_scrambled_output_many_fixed_seed_variants_only_preserve_positive_summar
             ("extra_whitespace", lambda: [f"  {line.replace(' ', '   ')}  " for line in lines]),
             ("interleaved_noise", lambda: ["noise before", *lines, "noise after" ]),
             ("unicode_noise", lambda: ["ℹ️ λ noise", *lines, "✓ завершено"]),
+            (
+                "passed_noise",
+                lambda: [
+                    *lines,
+                    "step 3 passed the lint check",
+                    "deploy: 2 passed health checks, continuing",
+                    "tests: 5 passed (mock)",
+                ],
+            ),
         ]
         for name, transform in transforms:
             transformed = "\n".join(transform()) + "\n"
@@ -333,7 +342,7 @@ def test_scrambled_output_many_fixed_seed_variants_only_preserve_positive_summar
 
         for index in range(24):
             lines = source.splitlines()
-            operation = rng.choice(("shuffle", "drop", "truncate", "duplicate", "case", "space", "noise", "unicode"))
+            operation = rng.choice(("shuffle", "drop", "truncate", "duplicate", "case", "space", "noise", "unicode", "passed_noise"))
             summary_index = next((i for i, line in enumerate(lines) if "passed" in line.lower()), None)
             if operation == "shuffle":
                 lines = rng.sample(lines, len(lines))
@@ -353,6 +362,8 @@ def test_scrambled_output_many_fixed_seed_variants_only_preserve_positive_summar
                 lines.insert(rng.randrange(len(lines) + 1), f"noise-{index} 0xDEADBEEF")
             elif operation == "unicode":
                 lines.insert(rng.randrange(len(lines) + 1), "⚠️ λ шум")
+            elif operation == "passed_noise":
+                lines.insert(rng.randrange(len(lines) + 1), "deploy: 2 passed health checks, continuing")
             transformed = "\n".join(lines) + "\n"
             has_valid_summary = any(summary_line.fullmatch(line) for line in transformed.splitlines())
             cases.append((f"random-{index}", transformed, has_valid_summary))
@@ -365,6 +376,73 @@ def test_scrambled_output_many_fixed_seed_variants_only_preserve_positive_summar
         for exit_code in (0, 1):
             parsed = parse_test_counts_summary(None, text, exit_code=exit_code)
             assert parsed["has_positive_pass"] is has_valid_summary, (name, exit_code, text)
+
+
+@pytest.mark.parametrize(
+    "noise",
+    [
+        "step 3 passed the lint check",
+        "deploy: 2 passed health checks, continuing",
+        "tests: 5 passed (mock)",
+        "INFO: 7 passed through the compatibility shim",
+        "worker reported 8 passed during setup",
+        "not a test summary: 9 passed in staging",
+    ],
+)
+def test_summary_parser_rejects_noise_phrases_for_every_registry_profile(noise):
+    """Narrative N-passed phrases never create measured evidence."""
+    registry = load_registry()
+    for profile in registry.profiles:
+        parsed = parse_test_counts_summary(profile, noise, exit_code=0)
+        assert parsed["has_positive_pass"] is False, (profile.profile_id, noise, parsed)
+
+
+PROFILE_SUMMARY_CASES = {
+    "pytest": "=== 1 passed, 3 warnings in 0.01s ===",
+    "node-native-test": "ℹ tests 1\nℹ pass 1\nℹ fail 0\nℹ skipped 0",
+    "jest": "Tests: 1 passed, 1 total",
+    "mocha": "1 passing",
+    "vitest": "Tests: 1 passed, 1 total",
+    "bun-test": " 1 pass\n 0 fail\n",
+    "deno-test": "1 passed; 0 failed; 0 ignored",
+    "go-test": "ok example.test 0.01s",
+    "cargo-test": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+    "maven-surefire": "Tests run: 1, Failures: 0, Errors: 0, Skipped: 0",
+    "gradle-test": "1 test completed, 0 failed",
+    "dotnet-test": "Passed: 1, Failed: 0, Skipped: 0",
+    "cmake-ctest": "100% tests passed, 0 tests failed out of 1",
+    "ruby-rake": "1 runs, 1 assertions, 0 failures, 0 errors",
+    "phpunit": "Tests: 1, Assertions: 1, Failures: 0.",
+    "swiftpm-test": "Executed 1 test, with 0 failures (0 unexpected) in 0.01 seconds",
+    "mix-test": "1 test, 0 failures",
+    "xcode-test": "Executed 1 test, with 0 failures (0 unexpected) in 0.01 seconds",
+}
+
+
+@pytest.mark.parametrize("profile_id, output", sorted(PROFILE_SUMMARY_CASES.items()))
+def test_summary_parser_accepts_anchored_true_summary_per_profile(profile_id, output):
+    """Every profile with a safe count grammar recognizes its real summary shape."""
+    profile = load_registry().get_profile(profile_id)
+    assert profile is not None
+    parsed = parse_test_counts_summary(profile, output, exit_code=0)
+    assert parsed["has_positive_pass"] is True, (profile_id, output, parsed)
+    assert parsed["passed"] >= 1
+
+
+@pytest.mark.parametrize("profile_id", ["terraform", "ansible", "helm"])
+def test_profiles_without_safe_count_shape_remain_exit_only(profile_id):
+    profile = load_registry().get_profile(profile_id)
+    assert profile is not None
+    parsed = parse_test_counts_summary(profile, "validation completed: 1 passed", exit_code=0)
+    assert parsed["has_positive_pass"] is False
+
+
+def test_truncated_pytest_count_remains_positive_when_count_is_intact():
+    profile = load_registry().get_profile("pytest")
+    assert profile is not None
+    parsed = parse_test_counts_summary(profile, "1 passed in 0", exit_code=0)
+    assert parsed["has_positive_pass"] is True
+    assert parsed["passed"] == 1
 
 
 def test_heuristic_target_failure_widens_once_without_a_strike(tmp_path, monkeypatch):
