@@ -192,3 +192,21 @@ SKIPPED [1] tests\test_runner_fixtures.py:361: ansible-lint not found
 SKIPPED [1] tests\test_runner_fixtures.py:361: helm not found
 1141 passed, 24 skipped, 2 deselected, 2 warnings in 1308.30s (0:21:48)
 ```
+
+## Addendum (post-review)
+
+The original pasted verifier output above recorded commit `d7532c3` instead
+of the final Phase 11 commit `ceb495d`, and it did not include a pytest summary
+section. Therefore, the original full-suite result was never recorded in that
+verifier transcript.
+
+Commit `8040562` subsequently excluded attempts with unknown runner profiles
+from eligible and strong measured metrics while retaining them as tooling
+uncertainty, with a regression test in
+`tests/test_phase12a_metrics_review.py`.
+
+Step 3b commit `063f419` added the additive `worker_rejections_total` and
+`mechanical_acceptances_total` fields to Phase 11 totals and groups, which are
+also present in the CLI JSON because it uses the same report function. The
+new `tests/test_phase12a_totals.py` covers assessed-versus-total coverage,
+groups, CLI JSON, and empty ledgers.

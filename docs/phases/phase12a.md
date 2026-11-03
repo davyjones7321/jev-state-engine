@@ -292,4 +292,13 @@ remains outside the commits.
 
 ## 9. Review-fix verifier output
 
+### Correction
+
+The Step 2 status above is historical as recorded at commit `8c5e19a`.
+After review, Step 2 was completed additively in `aa78e9e` by adding a new
+cross-platform child-liveness test; the existing timeout test was left
+untouched. Step 1c recognizes the documented additive formats listed above,
+but those formats are not verified against captured real output for 17 of the
+21 profiles; the table is parser regression evidence, not a live-tool claim.
+
 ```text
