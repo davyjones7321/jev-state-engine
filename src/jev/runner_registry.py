@@ -871,6 +871,32 @@ def parse_test_counts_summary(
         nonlocal failed
         failed += 1
 
+    def _add_direct_counts(match):
+        nonlocal passed, failed, skipped
+        passed += int(match.groupdict().get("passed") or 0)
+        failed += int(match.groupdict().get("failed") or 0)
+        skipped += int(match.groupdict().get("skipped") or 0)
+
+    def _add_deno_pipe_counts(match):
+        nonlocal passed, failed
+        passed += int(match.group("passed"))
+        failed += int(match.group("failed"))
+
+    def _add_dotnet_old_pass(match):
+        nonlocal passed
+        passed += int(match.group("passed"))
+
+    def _add_ansible_counts(match):
+        nonlocal passed, failed
+        failed_count = int(match.group("failed"))
+        failed += failed_count
+        if failed_count == 0:
+            passed += int(match.group("files"))
+
+    def _add_helm_counts(match):
+        nonlocal passed
+        passed += int(match.group("passed"))
+
     # Each grammar is anchored to a complete summary line.  A known profile
     # without a safe grammar intentionally remains unparsed/exit-only.
     if pid in (None, "pytest"):
@@ -883,14 +909,28 @@ def parse_test_counts_summary(
             r"^\s*(?:[^\s]+\s+)?(?P<kind>pass|fail|skipped)\s+(?P<count>\d+)\s*$",
             _add_node_count,
         )
-    elif pid in ("jest", "vitest"):
+    elif pid == "jest":
+        # Jest 29 documented text reporter: https://jestjs.io/docs/cli#--verbose
         scan(
             r"^\s*Tests:\s*(?P<body>.*\btotal\b.*)\s*$",
             lambda m: add_word_counts(m.group("body")),
         )
-    elif pid == "mocha":
+    elif pid == "vitest":
+        # Vitest 1 documented reporter: https://vitest.dev/guide/cli.html
+        # Keep the Jest-style Tests line accepted by Step 1b, and add the
+        # current Test Files / Tests pair.
         scan(
-            r"^\s*(?:(?P<passed>\d+)\s+passing|(?P<failed>\d+)\s+failing)\s*$",
+            r"^\s*Tests:\s*(?P<body>.*\btotal\b.*)\s*$",
+            lambda m: add_word_counts(m.group("body")),
+        )
+        scan(
+            r"^\s*(?:Test Files|Tests)\s+(?P<count>\d+)\s+passed(?:\s+\(\d+\))?\s*$",
+            lambda m: _add_one_pass() if int(m.group("count")) > 0 else None,
+        )
+    elif pid == "mocha":
+        # Mocha 10 documented spec reporter: https://mochajs.org/#reporters
+        scan(
+            r"^\s*(?:(?P<passed>\d+)\s+passing|(?P<failed>\d+)\s+failing)(?:\s+\(\d+ms\))?\s*$",
             _add_mocha_count,
         )
     elif pid == "bun-test":
@@ -899,9 +939,15 @@ def parse_test_counts_summary(
             _add_bun_count,
         )
     elif pid == "deno-test":
+        # Deno 1 documented test summary: https://docs.deno.com/runtime/manual/basics/testing/
+        # Preserve the older semicolon format accepted by Step 1b.
         scan(
             r"^\s*(?P<passed>\d+)\s+passed;\s*(?P<failed>\d+)\s+failed;\s*(?P<skipped>\d+)\s+ignored(?:;.*)?\s*$",
             _add_deno_count,
+        )
+        scan(
+            r"^\s*ok\s+\|\s+(?P<passed>\d+)\s+passed\s+\|\s+(?P<failed>\d+)\s+failed(?:\s+\([^)]*\))?\s*$",
+            _add_deno_pipe_counts,
         )
     elif pid == "cargo-test":
         scan(
@@ -919,26 +965,40 @@ def parse_test_counts_summary(
             _add_gradle_count,
         )
     elif pid == "dotnet-test":
+        # dotnet test current and older console logger formats:
+        # https://learn.microsoft.com/dotnet/core/tools/dotnet-test
         scan(
             r"^\s*(?:Total tests:\s*\d+,\s*)?Passed:\s*(?P<passed>\d+),\s*Failed:\s*(?P<failed>\d+),\s*Skipped:\s*(?P<skipped>\d+)\s*$",
             _add_deno_count,
         )
+        scan(
+            r"^\s*Passed!\s+-\s+Failed:\s*(?P<failed>\d+),\s*Passed:\s*(?P<passed>\d+),\s*Skipped:\s*(?P<skipped>\d+),\s*Total:\s*\d+,\s*Duration:.*$",
+            _add_direct_counts,
+        )
+        scan(r"^\s*Passed:\s*(?P<passed>\d+)\s*$", _add_dotnet_old_pass)
     elif pid == "cmake-ctest":
         scan(
             r"^\s*\d+%\s+tests?\s+passed,\s*(?P<failed>\d+)\s+tests?\s+failed\s+out\s+of\s+(?P<total>\d+)\s*$",
             _add_cmake_count,
         )
     elif pid == "ruby-rake":
+        # Ruby Minitest summary used by rake test: https://github.com/minitest/minitest
         scan(
-            r"^\s*(?P<total>\d+)\s+runs?,\s*\d+\s+assertions?,\s*(?P<failed>\d+)\s+failures?,\s*(?P<errors>\d+)\s+errors?\s*$",
+            r"^\s*(?P<total>\d+)\s+runs?,\s*\d+\s+assertions?,\s*(?P<failed>\d+)\s+failures?,\s*(?P<errors>\d+)\s+errors?(?:,\s*\d+\s+skips?)?\s*$",
             _add_maven_count,
         )
     elif pid == "phpunit":
+        # PHPUnit 10 documented result output: https://docs.phpunit.de/en/10.5/textui.html
         scan(
             r"^\s*Tests:\s*(?P<total>\d+),\s*Assertions:\s*\d+(?:,\s*Failures:\s*(?P<failed>\d+))?(?:,\s*Errors:\s*(?P<errors>\d+))?(?:,\s*Skipped:\s*(?P<skipped>\d+))?\.?\s*$",
             _add_maven_count,
         )
+        scan(
+            r"^\s*OK\s+\((?P<total>\d+)\s+tests?,\s*\d+\s+assertions?\)\s*$",
+            lambda m: _add_one_pass() if int(m.group("total")) > 0 else None,
+        )
     elif pid in ("swiftpm-test", "xcode-test"):
+        # SwiftPM/Xcode XCTest output: https://developer.apple.com/documentation/xctest
         scan(
             r"^\s*Executed\s+(?P<total>\d+)\s+tests?,\s*with\s*(?P<failed>\d+)\s+failures?\s+\(\d+\s+unexpected\)\s+in\s+.*$",
             _add_maven_count,
@@ -952,6 +1012,18 @@ def parse_test_counts_summary(
         scan(r"^\s*ok\s+\S+(?:\s+[\d.]+s)?(?:\s+\(cached\))?\s*$", lambda m: _add_one_pass())
         scan(r"^\s*---\s+PASS:\s+\S+.*$", lambda m: _add_one_pass())
         scan(r"^\s*FAIL\s+\S+.*$", lambda m: _add_one_fail())
+    elif pid == "ansible":
+        # ansible-lint documented text output: https://ansible.readthedocs.io/projects/lint/usage/
+        scan(
+            r"^\s*Passed:\s*(?P<failed>\d+)\s+failure\(s\),\s*\d+\s+warning\(s\)\s+in\s+(?P<files>\d+)\s+files\s+processed\s+of\s+\d+\s*$",
+            _add_ansible_counts,
+        )
+    elif pid == "helm":
+        # Helm 3 lint summary: https://helm.sh/docs/helm/helm_lint/
+        scan(
+            r"^\s*(?P<passed>\d+)\s+chart\(s\)\s+linted,\s*0\s+chart\(s\)\s+failed\s*$",
+            _add_helm_counts,
+        )
 
     skip_indicators = (
         "(skip) skip" in clean or

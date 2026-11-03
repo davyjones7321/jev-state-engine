@@ -211,10 +211,10 @@ This addendum records the review fixes completed on `phase12a-review-fixes`.
 - Commit: `b1d76b9` (`fix 12a-1b: summary lines anchored per runner profile`)
 - `src/jev/runner_registry.py`: positive count evidence now requires a
   profile-specific summary-line grammar. Narrative phrases containing `N passed`
-  remain exit-only, while supported pytest, Node, Jest/Vitest, Bun, Deno, Go,
-  Cargo, Maven, Gradle, .NET, CTest, Ruby, PHPUnit, SwiftPM, Xcode, and Mix
-  summaries remain recognized. Profiles without a safe count grammar do not
-  invent counted evidence.
+  remain exit-only. Existing accepted summaries remain positive; documented
+  Mocha, Vitest, Deno, .NET, PHPUnit, Ruby/Minitest, SwiftPM/Xcode, Ansible,
+  and Helm formats are additive. Terraform remains exit-code-only because no
+  safe test-count summary is defined.
 - `tests/conformance/test_fake_runner_conformance.py`: added table-driven noise
   rejection, per-profile true-summary checks, unsupported-profile checks, and
   the truncated pytest summary case.
@@ -223,6 +223,48 @@ This addendum records the review fixes completed on `phase12a-review-fixes`.
 - Post-fix checks: **25 passed, 21 deselected**; existing parser, fixture, and
   Phase 6 checks: **106 passed, 17 skipped**.
 - Full offline suite: **1187 passed, 24 skipped, 2 deselected, 2 warnings**.
+
+### Step 1c — documented real success formats
+
+- New regression table: `tests/test_phase12a_parser_real_formats.py` covers
+  every registry profile and preserves the positive result of every existing
+  Step 1b sample while adding documented real formats.
+- Before the parser fix, the new table produced **8 failures**: Ansible,
+  Deno, .NET, Helm, Mocha, PHPUnit, Ruby/Minitest, and Vitest.
+- After the fix: **21 passed** for the new table; existing parser, fixture,
+  conformance, and Phase 6 checks: **152 passed, 17 skipped**.
+- Full offline suite: **1209 passed, 24 skipped, 2 deselected, 2 warnings**.
+- The one-time old-module comparison loaded `runner_registry.py` from
+  `git show b1d76b9~1` outside the repository; that temporary module was not
+  retained.
+- The formats below are from tool documentation or existing captured fixture
+  conventions, not new live captures. Seventeen of the 21 registry profiles
+  still have no captured real output in the repository and remain unverified
+  against real execution.
+
+| Profile | Old positive | New positive | Old counts | New counts |
+|---|---:|---:|---:|---:|
+| pytest | true | true | 3/0/0 | 3/0/0 |
+| node-native-test | true | true | 3/0/0 | 3/0/0 |
+| jest | true | true | 1/0/0 | 3/0/0 |
+| mocha | true | true | 3/0/0 | 3/0/0 |
+| vitest | true | true | 1/0/0 | 2/0/0 |
+| bun-test | true | true | 3/0/0 | 3/0/0 |
+| deno-test | true | true | 3/0/0 | 3/0/0 |
+| go-test | true | true | 1/0/0 | 1/0/0 |
+| cargo-test | true | true | 3/0/0 | 3/0/0 |
+| maven-surefire | true | true | 3/0/0 | 3/0/0 |
+| gradle-test | false | true | 0/0/0 | 3/0/0 |
+| dotnet-test | true | true | 3/0/0 | 6/0/0 |
+| cmake-ctest | false | true | 0/0/0 | 3/0/0 |
+| ruby-rake | false | true | 0/0/0 | 3/0/0 |
+| phpunit | false | true | 0/0/0 | 1/0/0 |
+| swiftpm-test | false | true | 0/0/0 | 3/0/0 |
+| mix-test | false | true | 0/0/0 | 3/0/0 |
+| xcode-test | false | true | 0/0/0 | 3/0/0 |
+| terraform | false | false | 0/0/0 | 0/0/0 |
+| ansible | false | true | 0/0/0 | 3/0/0 |
+| helm | false | true | 0/0/0 | 1/0/0 |
 
 ### Step 2 — held for owner review
 
