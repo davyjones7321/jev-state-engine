@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import random
+import re
 import subprocess
 import sys
 import time
@@ -291,6 +293,78 @@ def test_malformed_output_scrambling_and_fingerprints_are_conservative(tmp_path,
     assert scrambled["has_positive_pass"] is False
     assert compute_failure_fingerprint("FAILED test_x at line 10\n") == compute_failure_fingerprint("FAILED test_x at line 99\n")
     assert compute_failure_fingerprint("FAILED test_x\n") != compute_failure_fingerprint("FAILED test_y\n")
+
+
+def test_scrambled_output_many_fixed_seed_variants_only_preserve_positive_summary():
+    """Fixed-exit output scrambling may preserve a real pytest pass summary only."""
+    summary = "collected 1 item\n1 passed in 0.01s\n"
+    failure = "collected 1 item\nFAILED tests/test_example.py::test_bad\n1 failed in 0.01s\n"
+    summary_line = re.compile(r"^\s*\d+\s+passed\s+in\s+\d+(?:\.\d+)?s\s*$", re.IGNORECASE)
+    rng = random.Random(1201)
+
+    def variants(text: str, source_has_summary: bool):
+        lines = text.splitlines()
+        summary_index = next((i for i, line in enumerate(lines) if "passed" in line.lower()), None)
+        transforms = [
+            ("shuffled", lambda: rng.sample(lines, len(lines))),
+            ("dropped_summary", lambda: [line for i, line in enumerate(lines) if i != summary_index]),
+            (
+                "truncated",
+                lambda: [
+                    line[: max(1, line.lower().find("passed") - 1)] if i == summary_index else line
+                    for i, line in enumerate(lines)
+                ],
+            ),
+            ("duplicated", lambda: lines + [lines[rng.randrange(len(lines))]]),
+            ("mixed_case", lambda: [line.swapcase() for line in lines]),
+            ("extra_whitespace", lambda: [f"  {line.replace(' ', '   ')}  " for line in lines]),
+            ("interleaved_noise", lambda: ["noise before", *lines, "noise after" ]),
+            ("unicode_noise", lambda: ["ℹ️ λ noise", *lines, "✓ завершено"]),
+        ]
+        for name, transform in transforms:
+            transformed = "\n".join(transform()) + "\n"
+            has_valid_summary = any(summary_line.fullmatch(line) for line in transformed.splitlines())
+            yield name, transformed, has_valid_summary
+
+    cases = []
+    for source, source_has_summary in ((summary, True), (failure, False)):
+        for name, text, has_valid_summary in variants(source, source_has_summary):
+            cases.append((f"{name}-fixed", text, has_valid_summary))
+
+        for index in range(24):
+            lines = source.splitlines()
+            operation = rng.choice(("shuffle", "drop", "truncate", "duplicate", "case", "space", "noise", "unicode"))
+            summary_index = next((i for i, line in enumerate(lines) if "passed" in line.lower()), None)
+            if operation == "shuffle":
+                lines = rng.sample(lines, len(lines))
+            elif operation == "drop" and summary_index is not None:
+                lines.pop(summary_index)
+            elif operation == "truncate" and summary_index is not None:
+                passed_at = lines[summary_index].lower().find("passed")
+                cutoff = rng.randint(1, max(1, passed_at - 1))
+                lines[summary_index] = lines[summary_index][:cutoff]
+            elif operation == "duplicate":
+                lines.insert(rng.randrange(len(lines) + 1), rng.choice(lines))
+            elif operation == "case":
+                lines = [line.upper() if rng.randrange(2) else line.lower() for line in lines]
+            elif operation == "space":
+                lines = [line.replace(" ", " " * rng.randint(1, 4)) for line in lines]
+            elif operation == "noise":
+                lines.insert(rng.randrange(len(lines) + 1), f"noise-{index} 0xDEADBEEF")
+            elif operation == "unicode":
+                lines.insert(rng.randrange(len(lines) + 1), "⚠️ λ шум")
+            transformed = "\n".join(lines) + "\n"
+            has_valid_summary = any(summary_line.fullmatch(line) for line in transformed.splitlines())
+            cases.append((f"random-{index}", transformed, has_valid_summary))
+
+    assert len(cases) >= 30
+    clean = parse_test_counts_summary(None, summary, exit_code=0)
+    assert clean["has_positive_pass"] is True
+
+    for name, text, has_valid_summary in cases:
+        for exit_code in (0, 1):
+            parsed = parse_test_counts_summary(None, text, exit_code=exit_code)
+            assert parsed["has_positive_pass"] is has_valid_summary, (name, exit_code, text)
 
 
 def test_heuristic_target_failure_widens_once_without_a_strike(tmp_path, monkeypatch):
