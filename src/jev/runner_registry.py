@@ -863,6 +863,25 @@ def parse_test_counts_summary(
         failed += failed_count
         passed += max(0, total - failed_count)
 
+    def _add_phpunit_counts(match):
+        nonlocal passed, failed, skipped
+        # NOTE: Documentation-based parsing (https://docs.phpunit.de/), not verified against real output yet.
+        # passed = tests - failures - errors - skipped - incomplete; failed = failures + errors
+        total = int(match.group("total"))
+        failures = int(match.groupdict().get("failures") or match.groupdict().get("failed") or 0)
+        errors = int(match.groupdict().get("errors") or 0)
+        skips = int(match.groupdict().get("skipped") or 0)
+        incomplete = int(match.groupdict().get("incomplete") or 0)
+        failed += failures + errors
+        skipped += skips + incomplete
+        passed += max(0, total - failures - errors - skips - incomplete)
+
+    def _add_phpunit_ok(match):
+        nonlocal passed
+        # NOTE: Documentation-based parsing (https://docs.phpunit.de/), not verified against real output yet.
+        total = int(match.group("total"))
+        passed += total
+
     def _add_one_pass():
         nonlocal passed
         passed += 1
@@ -989,14 +1008,15 @@ def parse_test_counts_summary(
             _add_maven_count,
         )
     elif pid == "phpunit":
-        # PHPUnit 10 documented result output: https://docs.phpunit.de/en/10.5/textui.html
+        # PHPUnit documented result output: https://docs.phpunit.de/
+        # NOTE: Documentation-based formats, not verified against real output yet.
         scan(
-            r"^\s*Tests:\s*(?P<total>\d+),\s*Assertions:\s*\d+(?:,\s*Failures:\s*(?P<failed>\d+))?(?:,\s*Errors:\s*(?P<errors>\d+))?(?:,\s*Skipped:\s*(?P<skipped>\d+))?\.?\s*$",
-            _add_maven_count,
+            r"^\s*Tests:\s*(?P<total>\d+),\s*Assertions:\s*\d+(?:,\s*Failures:\s*(?P<failures>\d+))?(?:,\s*Errors:\s*(?P<errors>\d+))?(?:,\s*Skipped:\s*(?P<skipped>\d+))?(?:,\s*Incomplete:\s*(?P<incomplete>\d+))?\.?\s*$",
+            _add_phpunit_counts,
         )
         scan(
             r"^\s*OK\s+\((?P<total>\d+)\s+tests?,\s*\d+\s+assertions?\)\s*$",
-            lambda m: _add_one_pass() if int(m.group("total")) > 0 else None,
+            _add_phpunit_ok,
         )
     elif pid in ("swiftpm-test", "xcode-test"):
         # SwiftPM/Xcode XCTest output: https://developer.apple.com/documentation/xctest
