@@ -212,3 +212,36 @@ SKIPPED [1] tests\test_runner_fixtures.py:361: ansible-lint not found
 SKIPPED [1] tests\test_runner_fixtures.py:361: helm not found
 1212 passed, 24 skipped, 2 deselected, 2 warnings in 1044.53s (0:17:24)
 ```
+
+
+## 8. Addendum (post-fix)
+
+The open problem identified in Section 6:
+> *"The Vitest passed count reports test files instead of tests, and the PHPUnit count reports `1` instead of the real number of tests. The verdict is unaffected, but those counts are inexact."*
+
+is resolved by the two follow-up commits on branch `fix-vitest-phpunit-counts`:
+1. `fix vitest-1: count tests from the Tests line only, parse failed and skipped`
+2. `fix phpunit-2: count tests from the documented summary lines`
+
+### Validation Status
+- **Vitest**: Now validated against REAL Vitest 1.6.0 runner output (fixture `tests/fixtures/runners/real/vitest_1.6.0_success.txt`), parsing only the `Tests` line rather than double-counting with `Test Files`.
+- **Jest 29.7.0 & Mocha 10.8.2**: Validated against real runner output during the Phase 12B dependency-backed runner replay work:
+
+#### Real Output: Jest 29.7.0
+```text
+PASS ./real.test.js
+  √ real repository (3 ms)
+Test Suites: 1 passed, 1 total
+Tests:       1 passed, 1 total
+Snapshots:   0 total
+Time:        0.985 s
+Ran all test suites.
+```
+
+#### Real Output: Mocha 10.8.2
+```text
+  √ real repository
+  1 passing (3ms)
+```
+
+- **PHPUnit**: Still documentation-based (per https://docs.phpunit.de/), parsing documented success `OK (<N> tests, <M> assertions)` and issues `Tests: <total>, Assertions: <assertions>...` lines. Real toolchain execution remains unverified in this environment.
