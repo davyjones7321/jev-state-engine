@@ -917,15 +917,16 @@ def parse_test_counts_summary(
         )
     elif pid == "vitest":
         # Vitest 1 documented reporter: https://vitest.dev/guide/cli.html
-        # Keep the Jest-style Tests line accepted by Step 1b, and add the
-        # current Test Files / Tests pair.
+        # Keep the Jest-style Tests line accepted by Step 1b.
+        # Parse ONLY the Tests summary line (not Test Files), reading every
+        # field of the documented format "Tests  <n> failed | <n> passed | <n> skipped | <n> todo (<total>)".
         scan(
             r"^\s*Tests:\s*(?P<body>.*\btotal\b.*)\s*$",
             lambda m: add_word_counts(m.group("body")),
         )
         scan(
-            r"^\s*(?:Test Files|Tests)\s+(?P<count>\d+)\s+passed(?:\s+\(\d+\))?\s*$",
-            lambda m: _add_one_pass() if int(m.group("count")) > 0 else None,
+            r"^\s*Tests\s+(?P<body>(?:(?:\d+\s+(?:failed|passed|skipped|todo))\s*(?:\|\s*)?)+\s*\(\d+\))\s*$",
+            lambda m: add_word_counts(m.group("body")),
         )
     elif pid == "mocha":
         # Mocha 10 documented spec reporter: https://mochajs.org/#reporters
