@@ -4079,8 +4079,21 @@ def node_gate(
         elif is_unmeasured:
             require_tests = state.get("require_tests")
             require_tests_strict = (require_tests in ("on", True))
+            is_verifier_modified = mech_ev is not None and getattr(mech_ev, "verifier_modified", False)
 
-            if require_tests_strict or require_tests is None:
+            is_strict_retry = (
+                require_tests_strict
+                or require_tests is None
+                or (
+                    mech_ev is not None
+                    and (
+                        mech_ev.reason == MechReason.TIMEOUT
+                        or (mech_ev.reason == MechReason.TEST_SURFACE_CHANGED and not is_verifier_modified)
+                    )
+                )
+            )
+
+            if is_strict_retry:
                 current_unmeasured_retries = state.get("unmeasured_retry_count", 0) + 1
                 state["unmeasured_retry_count"] = current_unmeasured_retries
 
@@ -4194,6 +4207,70 @@ def node_gate(
                                         failure_class="tests_unmeasured", summary=state.get("last_feedback", ""),
                                         diff=diff, subgoal=subgoal)
                     return state
+            elif is_verifier_modified:
+                # Step 2a: Declared test/recipe edit requires human approval; autonomous merge disabled.
+                state["status"] = "escalated"
+                state["gate_status"] = "human_approval_required"
+                subgoal.status = "failed"
+                state["current_subgoal"] = subgoal
+                if safe_rec:
+                    safe_rec.record_subgoal_status(run_id, subgoal_id, "failed")
+
+                reason_val = mech_ev.reason.value if hasattr(mech_ev.reason, "value") else str(mech_ev.reason)
+                attr_note = getattr(mech_ev, "attribution_note", "") or ""
+                note_suffix = f": {attr_note}" if attr_note else "."
+                fb_msg = (
+                    f"Human approval required: pre-existing test files or test commands were modified ({reason_val}){note_suffix} "
+                    f"Autonomous merge is disallowed even when require-tests is off."
+                )
+                state["last_feedback"] = fb_msg
+                advisory_telemetry = _apply_advisory(advisory, mechanical_evidence, state)
+                _teardown_worktree(state, workspace)
+
+                _snapshot_attempt(
+                    safe_rec,
+                    state,
+                    subgoal_id,
+                    tier="mechanical",
+                    outcome="human_approval_required",
+                    failed_check=mech_result.failed_check or "test_surface_changed",
+                    diff=diff,
+                    compile_info=compile_telemetry,
+                    tests_ran=tests_ran,
+                    test_outcome=test_runner_telemetry.get("outcome") if isinstance(test_runner_telemetry, dict) else None,
+                    feedback_sent=state["last_feedback"],
+                    failure_evidence=mechanical_evidence,
+                    mech_evidence=mech_ev,
+                )
+
+                state["trajectory"].append({
+                    "node": "gate",
+                    "subgoal": subgoal.model_dump() if hasattr(subgoal, "model_dump") else dict(subgoal),
+                    "gate_status": "human_approval_required",
+                    "status": "escalated",
+                    "tier0_result": tier0_telemetry,
+                    "compile": compile_telemetry,
+                    "test_runner": test_runner_telemetry,
+                    "failure_evidence": mechanical_evidence,
+                    "mech_evidence": mech_ev.model_dump() if mech_ev and hasattr(mech_ev, "model_dump") else None,
+                    "retry_metadata": retry_progress,
+                    "jev_request": None,
+                    "jev_verdict": None,
+                    "advisory": advisory_telemetry,
+                })
+
+                _safe_escalate_deadlock(
+                    gatekeeper,
+                    trajectory=state.get("trajectory", []),
+                    triggering_tier="mechanical",
+                    integration_branch=state.get("integration_branch"),
+                    thread_id=state.get("thread_id"),
+                )
+                _safe_record_memory(memory, state, outcome="human_approval_required",
+                                    failure_class=mech_result.failed_check or "test_surface_changed",
+                                    summary=state.get("last_feedback", ""),
+                                    diff=diff, subgoal=subgoal)
+                return state
             else:
                 # require_tests is OFF (default): UNMEASURED may reach Jev (Tier 1 Gatekeeper) and be semantically accepted.
                 if mech_ev is not None:
@@ -5368,7 +5445,7 @@ def route_gate(state: State) -> str:
     if (
         state.get("mechanical_strike_count", 0) >= 3
         or state.get("semantic_strike_count", 0) >= 3
-        or state.get("gate_status") in ("merge_failed", "verification_inconclusive")
+        or state.get("gate_status") in ("merge_failed", "verification_inconclusive", "human_approval_required")
         or state.get("status") == "escalated"
     ):
         return "escalate"

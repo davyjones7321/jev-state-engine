@@ -406,3 +406,188 @@ def test_jev_engine_defaults_to_require_tests_off():
         engine.execute("Ticket test", "thread-1")
         initial_state = mock_invoke.call_args[0][0]
         assert initial_state.get("require_tests") == "off"
+
+
+# --- Step 2 Tests: Sensitive UNMEASURED outcomes must not merge on Jev's word alone ---
+
+@pytest.mark.parametrize("reason", [
+    MechReason.TEST_SURFACE_CHANGED,
+    MechReason.COMMAND_IDENTITY_CHANGED,
+])
+def test_declared_test_or_recipe_edit_requires_human_approval_when_require_tests_off(reason):
+    """(Step 2a) A declared test/recipe edit (mech_ev.verifier_modified=True) must NOT be merged
+    by Jev when require_tests is off. It must escalate with gate_status='human_approval_required',
+    status='escalated', tear down worktree, and never call gatekeeper to validate or merge.
+    """
+    subgoal = Subgoal(id="sg-sensitive", description="declared test modification", expects_tests=True)
+    ev = MechanicalEvidence(
+        mech_status=MechStatus.UNMEASURED,
+        reason=reason,
+        evidence_level=EvidenceLevel.NONE,
+        verifier_modified=True,
+        mechanically_unverified=True,
+    )
+    mech_res = MechanicalCheckResult(
+        passed=False,
+        failed_check="test_surface_changed" if reason == MechReason.TEST_SURFACE_CHANGED else "tests",
+        detail=f"Declared test change: {reason.value}",
+        mech_evidence=ev,
+        checks_run=["build", "compile", "tests"],
+        checks={"build": {"ran": True, "passed": True}, "compile": {"ran": True, "passed": True}, "tests": {"ran": True, "passed": False}},
+    )
+
+    ws = MagicMock()
+    ws.get_staged_diff.return_value = "+modified test code\n"
+    ws.worktree_dir = Path("/tmp/mock_wt")
+    ws.repo_dir = Path("/tmp/mock_repo")
+    ws.run_mechanical_checks.return_value = mech_res
+    ws.merge_subgoal_worktree = MagicMock()
+    ws.discard_subgoal_worktree = MagicMock()
+
+    gk = MagicMock()
+    gk.validate_subgoal.return_value = ValidationVerdict(valid=True, probability=0.99)
+
+    state: State = {
+        "ticket": "Ticket sensitive edit",
+        "current_subgoal": subgoal,
+        "require_tests": "off",
+        "current_worktree_path": "/tmp/mock_wt",
+        "current_worktree_branch": "jev-subgoal-sg-sensitive",
+        "integration_branch": "main",
+        "mechanical_strike_count": 0,
+        "semantic_strike_count": 0,
+        "unmeasured_retry_count": 0,
+        "committed_subgoals": [],
+        "mechanically_unverified_subgoals": [],
+        "trajectory": [],
+    }
+
+    out = node_gate(state, workspace=ws, gatekeeper=gk)
+
+    assert out.get("status") == "escalated"
+    assert out.get("gate_status") == "human_approval_required"
+    assert "human approval required" in out.get("last_feedback", "").lower()
+    gk.validate_subgoal.assert_not_called()
+    ws.merge_subgoal_worktree.assert_not_called()
+    ws.discard_subgoal_worktree.assert_called_once()
+    assert out.get("current_worktree_path") is None
+
+
+def test_timeout_takes_strict_retry_path_even_when_require_tests_off():
+    """(Step 2b) TIMEOUT must not merge on Jev's word alone under require_tests off;
+    it must take the strict retry path (retries up to 3, then verification_inconclusive).
+    """
+    subgoal = Subgoal(id="sg-timeout", description="timeout subgoal", expects_tests=True)
+    ev = MechanicalEvidence(
+        mech_status=MechStatus.UNMEASURED,
+        reason=MechReason.TIMEOUT,
+        evidence_level=EvidenceLevel.NONE,
+        mechanically_unverified=True,
+    )
+    mech_res = MechanicalCheckResult(
+        passed=False,
+        failed_check="tests_unmeasured",
+        detail="Command timed out after 30s",
+        mech_evidence=ev,
+        checks_run=["build", "compile", "tests"],
+        checks={"build": {"ran": True, "passed": True}, "compile": {"ran": True, "passed": True}, "tests": {"ran": True, "passed": False}},
+    )
+
+    ws = MagicMock()
+    ws.get_staged_diff.return_value = "+diff\n"
+    ws.worktree_dir = Path("/tmp/mock_wt")
+    ws.repo_dir = Path("/tmp/mock_repo")
+    ws.run_mechanical_checks.return_value = mech_res
+    ws.merge_subgoal_worktree = MagicMock()
+    ws.discard_subgoal_worktree = MagicMock()
+
+    gk = MagicMock()
+    gk.validate_subgoal.return_value = ValidationVerdict(valid=True)
+
+    # Attempt 1: retry with gate_status='unmeasured'
+    state1: State = {
+        "ticket": "Ticket timeout",
+        "current_subgoal": subgoal,
+        "require_tests": "off",
+        "current_worktree_path": "/tmp/mock_wt",
+        "current_worktree_branch": "jev-subgoal-timeout",
+        "integration_branch": "main",
+        "mechanical_strike_count": 0,
+        "semantic_strike_count": 0,
+        "unmeasured_retry_count": 0,
+        "trajectory": [],
+    }
+    out1 = node_gate(state1, workspace=ws, gatekeeper=gk)
+    assert out1.get("gate_status") == "unmeasured"
+    assert out1.get("unmeasured_retry_count") == 1
+    gk.validate_subgoal.assert_not_called()
+    ws.merge_subgoal_worktree.assert_not_called()
+
+    # Attempt 2
+    state2: State = {**out1, "current_worktree_path": "/tmp/mock_wt", "current_worktree_branch": "jev-subgoal-timeout"}
+    out2 = node_gate(state2, workspace=ws, gatekeeper=gk)
+    assert out2.get("gate_status") == "unmeasured"
+    assert out2.get("unmeasured_retry_count") == 2
+    gk.validate_subgoal.assert_not_called()
+
+    # Attempt 3: escalates with verification_inconclusive
+    state3: State = {**out2, "current_worktree_path": "/tmp/mock_wt", "current_worktree_branch": "jev-subgoal-timeout"}
+    out3 = node_gate(state3, workspace=ws, gatekeeper=gk)
+    assert out3.get("status") == "escalated"
+    assert out3.get("gate_status") == "verification_inconclusive"
+    assert out3.get("unmeasured_retry_count") == 3
+    gk.validate_subgoal.assert_not_called()
+    ws.merge_subgoal_worktree.assert_not_called()
+
+
+def test_undeclared_shared_test_surface_takes_strict_retry_path_even_when_require_tests_off():
+    """(Step 2b) TEST_SURFACE_CHANGED without verifier_modified (e.g. undeclared shared
+    test fixture change) must take the strict retry path even when require_tests is off.
+    """
+    subgoal = Subgoal(id="sg-shared", description="shared test fixture change", expects_tests=True)
+    ev = MechanicalEvidence(
+        mech_status=MechStatus.UNMEASURED,
+        reason=MechReason.TEST_SURFACE_CHANGED,
+        evidence_level=EvidenceLevel.NONE,
+        verifier_modified=False,
+        test_surface_changed=True,
+        mechanically_unverified=True,
+    )
+    mech_res = MechanicalCheckResult(
+        passed=False,
+        failed_check="test_surface_changed",
+        detail="Shared test surface modified without declaration",
+        mech_evidence=ev,
+        checks_run=["build", "compile", "tests"],
+        checks={"build": {"ran": True, "passed": True}, "compile": {"ran": True, "passed": True}, "tests": {"ran": True, "passed": False}},
+    )
+
+    ws = MagicMock()
+    ws.get_staged_diff.return_value = "+diff\n"
+    ws.worktree_dir = Path("/tmp/mock_wt")
+    ws.repo_dir = Path("/tmp/mock_repo")
+    ws.run_mechanical_checks.return_value = mech_res
+    ws.merge_subgoal_worktree = MagicMock()
+    ws.discard_subgoal_worktree = MagicMock()
+
+    gk = MagicMock()
+    gk.validate_subgoal.return_value = ValidationVerdict(valid=True)
+
+    state1: State = {
+        "ticket": "Ticket shared surface",
+        "current_subgoal": subgoal,
+        "require_tests": "off",
+        "current_worktree_path": "/tmp/mock_wt",
+        "current_worktree_branch": "jev-subgoal-shared",
+        "integration_branch": "main",
+        "mechanical_strike_count": 0,
+        "semantic_strike_count": 0,
+        "unmeasured_retry_count": 0,
+        "trajectory": [],
+    }
+    out1 = node_gate(state1, workspace=ws, gatekeeper=gk)
+    assert out1.get("gate_status") == "unmeasured"
+    assert out1.get("unmeasured_retry_count") == 1
+    gk.validate_subgoal.assert_not_called()
+    ws.merge_subgoal_worktree.assert_not_called()
+
