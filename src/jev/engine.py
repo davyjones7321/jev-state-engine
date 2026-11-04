@@ -5484,9 +5484,6 @@ class JevEngine:
         subgoal_timeout: int = 600,
         ticket_timeout: int = 2700,
         process_cleanup_grace_period: float = 2.0,
-        registry_resolution: str = "off",
-        approved_proposals: str = "off",
-        same_command_authority: str = "off",
         require_tests: str = "off",
     ):
         if subgoal_timeout <= 0:
@@ -5515,9 +5512,6 @@ class JevEngine:
         self.replan_enabled = replan_enabled
         self.replan_planner = replan_planner
         self.replan_validator = replan_validator
-        self.registry_resolution = registry_resolution
-        self.approved_proposals = approved_proposals
-        self.same_command_authority = same_command_authority
         self.require_tests = require_tests
         if recorder is None:
             self.recorder = SafeRecorder(NullRecorder())
@@ -5711,12 +5705,6 @@ class JevEngine:
             self.workspace.subgoal_start_time = None
             self.workspace.subgoal_timeout = self.subgoal_timeout
             self.workspace.ticket_timeout = self.ticket_timeout
-            if hasattr(self.workspace, "registry_resolution"):
-                self.workspace.registry_resolution = (self.registry_resolution == "on")
-            if hasattr(self.workspace, "approved_proposals"):
-                self.workspace.approved_proposals = (self.approved_proposals == "on")
-            if hasattr(self.workspace, "same_command_authority"):
-                self.workspace.same_command_authority = (self.same_command_authority == "on")
             if hasattr(self.workspace, "require_tests"):
                 self.workspace.require_tests = (self.require_tests == "on")
 
@@ -5749,9 +5737,6 @@ class JevEngine:
             "last_feedback": None,
             "status": None,
             "role_provenance": self.role_provenance,
-            "registry_resolution": self.registry_resolution,
-            "approved_proposals": self.approved_proposals,
-            "same_command_authority": self.same_command_authority,
             "require_tests": self.require_tests,
         }
 
