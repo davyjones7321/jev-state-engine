@@ -48,6 +48,7 @@ class Subgoal(BaseModel):
     scope: List[str] = Field(default_factory=list)
     expects_tests: bool = True
     status: str = "pending"
+    no_tests_reason: Optional[str] = None
 
 
 class MechanicalCheckResult(BaseModel):

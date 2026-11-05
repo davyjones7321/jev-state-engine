@@ -47,6 +47,7 @@ from jev.mech_evidence import (
     MechStatus,
 )
 
+from jev.test_scope import validate_subgoal_test_scope
 from jev.models import (
     CompileOutcome,
     JevFeedback,
@@ -2307,7 +2308,7 @@ def node_plan(
         "2. For each Subgoal, specify:",
         "   - 'description': Clear, atomic, and objective description of the functional change (e.g. 'Create the About page component at src/app/about/page.tsx for Smash Arena').",
         "     CRITICAL: Do NOT include subjective meta-qualifiers, styling instructions, or cross-file comparison clauses in 'description' (e.g. do NOT say 'following dark theme', 'using Tailwind v4 styling', 'consistent with existing pages like contact and home', or 'adhering to glassmorphism conventions'). Architectural and styling conventions belong in Investigation Notes, not in the subgoal description, because the gatekeeper evaluates the diff strictly against every clause in the description.",
-        "   - 'scope': Non-empty list of exact file paths to touch or create. No placeholder or empty scopes allowed.",
+        "   - 'scope': Non-empty list of exact file paths to touch or create. When expects_tests is true, relevant test file paths MUST be included in scope alongside source files. No placeholder or empty scopes allowed.",
         "   - 'expects_tests': Boolean (true/false) indicating whether automated tests are expected to pass/run for this step.",
         "3. GROUNDING REQUIREMENTS (CRITICAL):",
         "   - If modifying, extending, or documenting existing code, every file path in 'scope' MUST be grounded strictly in the files discovered in 'Investigation Notes' or explicitly named in the 'Ticket Description'.",
@@ -2372,7 +2373,13 @@ def node_plan(
                 investigation_notes,
                 state.get("investigated_directories"),
             )
-            subgoals = parsed_subgoals
+            worktree_dir = getattr(workspace, "repo_dir", None)
+            amended_subgoals, test_scope_problems = validate_subgoal_test_scope(parsed_subgoals, worktree_dir)
+            if test_scope_problems:
+                prob_msgs = [p["message"] for p in test_scope_problems]
+                last_error_type = test_scope_problems[0].get("type", "missing_test_scope")
+                raise ValueError("; ".join(prob_msgs))
+            subgoals = amended_subgoals
             break
 
         except Exception as exc:
@@ -2428,13 +2435,27 @@ def node_plan(
         }
         if retries_used > 0:
             traj_entry["retries"] = retries_used
+        for sg in subgoals:
+            if not getattr(sg, "expects_tests", True):
+                state["trajectory"].append({
+                    "event": "no_tests_declared",
+                    "subgoal_id": sg.id,
+                    "reason": getattr(sg, "no_tests_reason", None),
+                })
         state["trajectory"].append(traj_entry)
         return state
 
     # Hard failure: planning failed after retry
     state["plan_queue"] = []
     state["current_subgoal"] = None
-    state["gate_status"] = "planning_failed"
+    if locals().get("last_error_type") in ("missing_test_scope", "ambiguous_test_candidates", "invalid_scope_item"):
+        state["gate_status"] = "missing_test_scope"
+        state["trajectory"].append({
+            "event": "missing_test_scope",
+            "error": str(last_error),
+        })
+    else:
+        state["gate_status"] = "planning_failed"
     state["status"] = "escalated"
     state["last_feedback"] = f"Planning failed after retry: {last_error}"
 

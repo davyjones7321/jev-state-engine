@@ -17,6 +17,7 @@ Tests cover:
 
 import os
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -46,8 +47,8 @@ def test_1_exact_test_scope_added_for_subgoal(temp_repo):
     A subgoal changing src/calc.py with expects_tests=True and scope ['src/calc.py']
     gets the existing tests/test_calc.py added to scope.
     """
-    (temp_repo / "src").mkdir(parents=True)
-    (temp_repo / "tests").mkdir(parents=True)
+    (temp_repo / "src").mkdir(parents=True, exist_ok=True)
+    (temp_repo / "tests").mkdir(parents=True, exist_ok=True)
     (temp_repo / "src" / "calc.py").write_text("def add(a, b): return a + b\n")
     (temp_repo / "tests" / "test_calc.py").write_text("def test_add(): pass\n")
 
@@ -69,8 +70,8 @@ def test_1_exact_test_scope_added_for_subgoal(temp_repo):
 
 def test_2_unrelated_test_files_never_added(temp_repo):
     """2. Unrelated test files (e.g. tests/test_auth.py, tests/test_db.py) are never added."""
-    (temp_repo / "src").mkdir(parents=True)
-    (temp_repo / "tests").mkdir(parents=True)
+    (temp_repo / "src").mkdir(parents=True, exist_ok=True)
+    (temp_repo / "tests").mkdir(parents=True, exist_ok=True)
     (temp_repo / "src" / "calc.py").write_text("def add(a, b): return a + b\n")
     (temp_repo / "tests" / "test_calc.py").write_text("def test_add(): pass\n")
     (temp_repo / "tests" / "test_auth.py").write_text("def test_auth(): pass\n")
@@ -98,8 +99,8 @@ def test_3_planner_names_new_test_file_keeps_it(temp_repo):
     A subgoal whose planner scope names a new test file keeps it; the worker
     may create it, and writes to any other test file stay rejected.
     """
-    (temp_repo / "src").mkdir(parents=True)
-    (temp_repo / "tests").mkdir(parents=True)
+    (temp_repo / "src").mkdir(parents=True, exist_ok=True)
+    (temp_repo / "tests").mkdir(parents=True, exist_ok=True)
     (temp_repo / "src" / "feature.py").write_text("# new feature\n")
     # Note: tests/test_feature.py does not yet exist on disk!
 
@@ -128,14 +129,12 @@ def test_4_missing_test_scope_escalates_before_implementation(temp_repo):
     from langchain_core.messages import AIMessage
     from jev.engine import node_plan
 
-    (temp_repo / "src").mkdir(parents=True)
+    (temp_repo / "src").mkdir(parents=True, exist_ok=True)
     (temp_repo / "src" / "orphan.py").write_text("def orphan(): pass\n")
 
-    # Mock workspace
     ws = MagicMock()
     ws.repo_dir = temp_repo
 
-    # LLM always returns a plan missing test files
     plan_json = '[{"description": "Orphan change", "scope": ["src/orphan.py"], "expects_tests": true}]'
     mock_llm = MagicMock()
     mock_llm.invoke.return_value = AIMessage(content=plan_json)
@@ -151,17 +150,15 @@ def test_4_missing_test_scope_escalates_before_implementation(temp_repo):
     assert res_state.get("gate_status") == "missing_test_scope"
     assert res_state.get("status") == "escalated"
     assert "plan_queue" in res_state and len(res_state["plan_queue"]) == 0
-    # Confirm retry was attempted
     assert mock_llm.invoke.call_count == 2
-    # Confirm trajectory event
     events = [e for e in res_state.get("trajectory", []) if e.get("event") == "missing_test_scope"]
     assert len(events) >= 1
 
 
 def test_5_scope_entries_as_directories_or_globs_rejected(temp_repo):
     """5. Scope entries that are directories or globs (tests, tests/, **, tests/*) are rejected."""
-    (temp_repo / "tests").mkdir(parents=True)
-    (temp_repo / "src").mkdir(parents=True)
+    (temp_repo / "tests").mkdir(parents=True, exist_ok=True)
+    (temp_repo / "src").mkdir(parents=True, exist_ok=True)
 
     invalid_scopes = [
         ["tests"],
@@ -195,11 +192,10 @@ def test_6_ambiguous_and_many_candidates_never_silently_added(temp_repo):
     - Candidate set never silently truncated.
     - Filename similarity alone never adds a test when > 1 candidate exists.
     """
-    (temp_repo / "src").mkdir(parents=True)
-    (temp_repo / "tests").mkdir(parents=True)
+    (temp_repo / "src").mkdir(parents=True, exist_ok=True)
+    (temp_repo / "tests").mkdir(parents=True, exist_ok=True)
     (temp_repo / "src" / "service.py").write_text("# service\n")
 
-    # Create 6 candidate test files (none exact 'test_service.py')
     for i in range(6):
         (temp_repo / "tests" / f"test_service_extra_{i}.py").write_text("pass\n")
 
@@ -216,7 +212,7 @@ def test_6_ambiguous_and_many_candidates_never_silently_added(temp_repo):
     assert len(problems) == 1
     prob = problems[0]
     assert prob["type"] == "ambiguous_test_candidates"
-    assert len(prob["candidates"]) >= 6  # never silently truncated
+    assert len(prob["candidates"]) >= 6
 
 
 def test_7_expects_tests_false_accepted_with_trajectory_warning(temp_repo):
@@ -225,7 +221,7 @@ def test_7_expects_tests_false_accepted_with_trajectory_warning(temp_repo):
     expects_tests=False plans are not rejected (a trajectory warning event
     no_tests_declared is recorded, with the reason if given).
     """
-    (temp_repo / "src").mkdir(parents=True)
+    (temp_repo / "src").mkdir(parents=True, exist_ok=True)
     (temp_repo / "src" / "docs.py").write_text("# docstrings\n")
 
     subgoals = [
@@ -258,30 +254,29 @@ def test_8_multi_ecosystem_naming_conventions(temp_repo):
     - Elixir: test/*_test.exs
     """
     # 1. Python
-    (temp_repo / "py_src").mkdir(parents=True)
-    (temp_repo / "tests").mkdir(parents=True)
+    (temp_repo / "py_src").mkdir(parents=True, exist_ok=True)
+    (temp_repo / "tests").mkdir(parents=True, exist_ok=True)
     (temp_repo / "py_src" / "calc.py").write_text("")
     (temp_repo / "tests" / "test_calc.py").write_text("")
     res_py = discover_related_tests(temp_repo, ["py_src/calc.py"])
     assert "tests/test_calc.py" in res_py.exact
 
     # 2. JS / TS
-    (temp_repo / "src" / "components").mkdir(parents=True)
+    (temp_repo / "src" / "components").mkdir(parents=True, exist_ok=True)
     (temp_repo / "src" / "components" / "button.tsx").write_text("")
     (temp_repo / "src" / "components" / "button.test.tsx").write_text("")
     res_ts = discover_related_tests(temp_repo, ["src/components/button.tsx"])
     assert "src/components/button.test.tsx" in res_ts.exact
 
     # 3. Go (same directory *_test.go)
-    (temp_repo / "pkg" / "math").mkdir(parents=True)
+    (temp_repo / "pkg" / "math").mkdir(parents=True, exist_ok=True)
     (temp_repo / "pkg" / "math" / "calc.go").write_text("")
     (temp_repo / "pkg" / "math" / "calc_test.go").write_text("")
     res_go = discover_related_tests(temp_repo, ["pkg/math/calc.go"])
     assert "pkg/math/calc_test.go" in res_go.exact
 
     # 4. Rust (tests/*.rs and inline #[cfg(test)])
-    (temp_repo / "rust_src").mkdir(parents=True)
-    (temp_repo / "tests").mkdir(parents=True)
+    (temp_repo / "rust_src").mkdir(parents=True, exist_ok=True)
     (temp_repo / "rust_src" / "lib.rs").write_text("#[cfg(test)]\nmod tests { }\n")
     res_rs_inline = discover_related_tests(temp_repo, ["rust_src/lib.rs"])
     assert "rust_src/lib.rs" in res_rs_inline.exact
@@ -292,39 +287,39 @@ def test_8_multi_ecosystem_naming_conventions(temp_repo):
     assert "tests/parser.rs" in res_rs_file.exact
 
     # 5. Java/Kotlin (src/test mirror)
-    (temp_repo / "src" / "main" / "java" / "com" / "calc").mkdir(parents=True)
-    (temp_repo / "src" / "test" / "java" / "com" / "calc").mkdir(parents=True)
+    (temp_repo / "src" / "main" / "java" / "com" / "calc").mkdir(parents=True, exist_ok=True)
+    (temp_repo / "src" / "test" / "java" / "com" / "calc").mkdir(parents=True, exist_ok=True)
     (temp_repo / "src" / "main" / "java" / "com" / "calc" / "Calculator.java").write_text("")
     (temp_repo / "src" / "test" / "java" / "com" / "calc" / "CalculatorTest.java").write_text("")
     res_java = discover_related_tests(temp_repo, ["src/main/java/com/calc/Calculator.java"])
     assert "src/test/java/com/calc/CalculatorTest.java" in res_java.exact
 
     # 6. .NET (*Tests.cs)
-    (temp_repo / "src" / "Orders").mkdir(parents=True)
-    (temp_repo / "tests" / "Orders.Tests").mkdir(parents=True)
+    (temp_repo / "src" / "Orders").mkdir(parents=True, exist_ok=True)
+    (temp_repo / "tests" / "Orders.Tests").mkdir(parents=True, exist_ok=True)
     (temp_repo / "src" / "Orders" / "OrderService.cs").write_text("")
     (temp_repo / "tests" / "Orders.Tests" / "OrderServiceTests.cs").write_text("")
     res_dotnet = discover_related_tests(temp_repo, ["src/Orders/OrderService.cs"])
     assert any("OrderServiceTests.cs" in p for p in res_dotnet.exact)
 
     # 7. Ruby (spec/*_spec.rb)
-    (temp_repo / "lib").mkdir(parents=True)
-    (temp_repo / "spec").mkdir(parents=True)
+    (temp_repo / "lib").mkdir(parents=True, exist_ok=True)
+    (temp_repo / "spec").mkdir(parents=True, exist_ok=True)
     (temp_repo / "lib" / "widget.rb").write_text("")
     (temp_repo / "spec" / "widget_spec.rb").write_text("")
     res_rb = discover_related_tests(temp_repo, ["lib/widget.rb"])
     assert "spec/widget_spec.rb" in res_rb.exact
 
     # 8. PHP (tests/*Test.php)
-    (temp_repo / "php_src").mkdir(parents=True)
-    (temp_repo / "php_src" / "Invoice.php").write_text("")
+    (temp_repo / "php_src").mkdir(parents=True, exist_ok=True)
     (temp_repo / "tests" / "InvoiceTest.php").write_text("")
+    (temp_repo / "php_src" / "Invoice.php").write_text("")
     res_php = discover_related_tests(temp_repo, ["php_src/Invoice.php"])
     assert "tests/InvoiceTest.php" in res_php.exact
 
     # 9. Elixir (test/*_test.exs)
-    (temp_repo / "lib_ex").mkdir(parents=True)
-    (temp_repo / "test").mkdir(parents=True)
+    (temp_repo / "lib_ex").mkdir(parents=True, exist_ok=True)
+    (temp_repo / "test").mkdir(parents=True, exist_ok=True)
     (temp_repo / "lib_ex" / "account.ex").write_text("")
     (temp_repo / "test" / "account_test.exs").write_text("")
     res_ex = discover_related_tests(temp_repo, ["lib_ex/account.ex"])
@@ -339,14 +334,12 @@ def test_9_worker_cannot_write_outside_amended_scope(temp_repo):
     """
     from jev.workspace import Workspace
 
-    (temp_repo / "src").mkdir(parents=True)
-    (temp_repo / "tests").mkdir(parents=True)
+    (temp_repo / "src").mkdir(parents=True, exist_ok=True)
+    (temp_repo / "tests").mkdir(parents=True, exist_ok=True)
     (temp_repo / "src" / "calc.py").write_text("def add(a, b): return a + b\n")
     (temp_repo / "tests" / "test_calc.py").write_text("def test_add(): pass\n")
     (temp_repo / "tests" / "test_auth.py").write_text("def test_auth(): pass\n")
 
-    # Git init
-    import subprocess
     subprocess.run(["git", "init"], cwd=temp_repo, check=True, capture_output=True)
     subprocess.run(["git", "config", "user.name", "Tester"], cwd=temp_repo, check=True, capture_output=True)
     subprocess.run(["git", "config", "user.email", "tester@example.com"], cwd=temp_repo, check=True, capture_output=True)
@@ -371,12 +364,14 @@ def test_9_worker_cannot_write_outside_amended_scope(temp_repo):
     # Writing to approved scope files succeeds
     assert "src/calc.py" in final_scope
     assert "tests/test_calc.py" in final_scope
-    res1 = ws.stage_file_mutation("src/calc.py", "def add(a, b): return a + b + 0\n")
-    assert res1.get("status") == "success"
-    res2 = ws.stage_file_mutation("tests/test_calc.py", "def test_add(): assert True\n")
-    assert res2.get("status") == "success"
+    ws.stage_file_mutation("src/calc.py", "def add(a, b): return a + b + 0\n")
+    ws.stage_file_mutation("tests/test_calc.py", "def test_add(): assert True\n")
+    assert "src/calc.py" in ws.worker_staged_paths
+    assert "tests/test_calc.py" in ws.worker_staged_paths
 
-    # Writing to unauthorized test file is rejected by check_scope in engine / workspace
+    # Writing to unauthorized test file is detected as out of scope by check_scope
     assert "tests/test_auth.py" not in final_scope
-    res_unauth = ws.check_scope(["tests/test_auth.py"], final_scope)
-    assert not res_unauth["in_scope"]
+    diff_str = "diff --git a/tests/test_auth.py b/tests/test_auth.py\n--- a/tests/test_auth.py\n+++ b/tests/test_auth.py\n"
+    res_unauth = ws.check_scope(diff=diff_str, scope=final_scope)
+    assert not res_unauth.passed
+    assert "tests/test_auth.py" in res_unauth.out_of_scope
