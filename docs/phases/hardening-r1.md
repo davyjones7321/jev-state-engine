@@ -156,3 +156,40 @@ tests\test_fix7_weakened_deleted_tests.py .....                          [100%]
 
 1. **Worktree base test caching**: Base runs in detached worktrees (`_run_original_tests_in_scratch`) reuse results for identical commands against the same base commit via `_base_test_cache`. While `_base_run_counts` is now correctly isolated per attempt, identical base runs across subgoals share cache entries to avoid redundant git worktree checkouts.
 2. **Windows File Locking & Subprocess Latency**: On Windows (`win32`), launching test subprocesses in temporary git repositories takes noticeably longer (~15 seconds per test) due to directory cleanup and file handle releases.
+
+---
+
+## 7. Audit & Verification of Execution Cache and Phase Identity (Targeted Correction Review)
+
+Following owner review, the execution cache and phase identity architecture was audited against eight specific integrity invariants:
+
+1. **Distinction between Initial and Flaky Rerun Phases**:
+   - Every individual test subprocess execution is captured via `create_execution_record` and recorded in `workspace.test_executions` with its full 4-part identity: `(run_id, subgoal_id, attempt, phase)` where `phase ∈ {"initial", "flaky_rerun"}`.
+   - The initial execution record and flaky rerun record have distinct `execution_id`s, distinct `phase` strings, distinct start/end timestamps, and distinct exit codes.
+2. **Initial Execution Cannot Be Mistaken for Flaky Rerun**:
+   - `_evaluate_tests_internal` runs the initial candidate test first (`phase="initial"`).
+   - If that initial run exits with non-zero, it does not populate the cache or return; it explicitly transitions into the flaky rerun phase (`phase="flaky_rerun"`).
+3. **Flaky Rerun Cannot Be Mistaken for Initial Execution**:
+   - The flaky rerun is guarded by `if cand_runs_rerun >= 2` and strictly logs `phase="flaky_rerun"` with event `flaky_rerun_launched`.
+4. **Execution Cap of 2 Executions per `(run_id, subgoal_id, attempt)`**:
+   - Keyed by `f"{run_id}#{subgoal_id}#{attempt}"`. Initial run increments counter from 0 to 1; flaky rerun increments counter from 1 to 2.
+   - Any further execution request within that same attempt sees counter >= 2 and returns `TOOLING_ERROR` to guarantee termination.
+5. **Exact Duplicate Requests Return Cached Results**:
+   - When an attempt has completed (counter >= 2) and `attempt_key` exists in `_attempt_result_cache`:
+     - Re-requesting `evaluate_tests` returns the recorded `MechanicalEvidence` immediately.
+     - Launches 0 subprocesses (`process_launched=False`).
+     - Emits `retry_skipped_exact_duplicate`.
+     - Tested by `test_9_exact_duplicate_request_returns_recorded_result_and_no_process_and_not_tooling_error`.
+6. **Legitimate Executions with Identical Commands Never Deduplicated Prematurely**:
+   - Flaky rerun re-executes the exact same test command as the initial run, but because it is an explicit retry phase within the attempt, it runs as a fresh process and is recorded independently.
+   - Tested by `test_2_flaky_rerun_launches_second_process_and_recorded_independently`.
+7. **Engine Retries with Different Attempt Numbers Always Receive Distinct Identities**:
+   - Attempt 2 produces `attempt_key = f"{run_id}#{subgoal_id}#2"`. Attempt 3 produces `attempt_key = f"{run_id}#{subgoal_id}#3"`.
+   - Counters start at 0, no cache collision occurs, and subprocesses launch for every engine retry attempt.
+   - Tested by `test_3`, `test_4`, `test_10`, and `test_12`.
+8. **Separate Runs and Subgoals Never Share Cached Results**:
+   - Distinct `run_id` (ticket runs) and distinct `subgoal_id` partition both `_candidate_run_counts` and `_attempt_result_cache`.
+   - Tested by `test_5_two_different_subgoals_never_share_counters` and `test_6_two_ticket_runs_never_share_counters`.
+
+All 12 tests in `tests/test_hardening_r1_retry_identity.py` pass cleanly (12 passed in 193.23s).
+
