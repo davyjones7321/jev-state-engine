@@ -10,6 +10,7 @@ import signal
 import stat
 import subprocess
 import sys
+import time
 import uuid
 from collections import Counter
 from dataclasses import dataclass
@@ -1135,12 +1136,17 @@ class Workspace:
         self.subgoal_timeout: int = 600
         self.base_commit: Optional[str] = self._get_head_commit()
         self.last_test_run: Optional[dict] = None
+        self.last_base_run: Optional[dict] = None
         self.last_compile_run: Optional[dict] = None
         self.last_preflight: Optional[Any] = None
         self._baseline_test_cache: Dict[str, Dict[str, Any]] = {}
         self._base_test_cache: Dict[Any, Dict[str, Any]] = {}
         self._base_run_counts: Dict[str, int] = {}
         self._candidate_run_counts: Dict[str, int] = {}
+        self.run_id: str = str(uuid.uuid4())
+        self.test_executions: List[Dict[str, Any]] = []
+        self.events: List[Dict[str, Any]] = []
+        self._attempt_result_cache: Dict[str, Any] = {}
         self.worker_staged_paths = StagedPathsList()
         self.worker_staged_hashes = self.worker_staged_paths._hashes
         self.engine_touched_paths: List[str] = []
@@ -1282,6 +1288,60 @@ class Workspace:
             "tool_path": c_tool_path,
         }
         return outcome
+
+    def _emit_event(self, event_name: str, subgoal_id: str, attempt: int = 1, phase: Optional[str] = None, **kwargs: Any) -> Dict[str, Any]:
+        from jev.retry_identity import create_event
+        ev = create_event(event_name, subgoal_id, attempt, phase=phase, **kwargs)
+        if not hasattr(self, "events") or self.events is None:
+            self.events = []
+        self.events.append(ev)
+        return ev
+
+    def _record_execution_item(
+        self,
+        subgoal_id: str,
+        attempt: int,
+        phase: str,
+        started_at: float,
+        ended_at: float,
+        last_run: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        from jev.retry_identity import create_execution_record
+        exit_code = last_run.get("exit_code")
+        argv = last_run.get("argv")
+        timed_out = bool(last_run.get("timed_out"))
+        launch_failed = bool(last_run.get("launch_failed"))
+        process_launched = not (launch_failed or (exit_code is None and not argv))
+        reason = "timeout" if timed_out else (last_run.get("reason") or ("launch_failed" if launch_failed else None))
+
+        rec = create_execution_record(
+            subgoal_id=subgoal_id,
+            attempt=attempt,
+            phase=phase,
+            process_launched=process_launched,
+            argv=argv,
+            exit_code=exit_code,
+            started_at=started_at,
+            ended_at=ended_at,
+            duration_s=round(max(0.0, ended_at - started_at), 4),
+            reason=reason,
+            run_id=getattr(self, "run_id", None),
+        )
+        if not hasattr(self, "test_executions") or self.test_executions is None:
+            self.test_executions = []
+        self.test_executions.append(rec)
+
+        if isinstance(last_run, dict):
+            last_run.update(rec)
+            last_run["process_launched"] = process_launched
+            last_run["execution_record"] = rec
+
+        if timed_out:
+            self._emit_event("test_process_timed_out", subgoal_id=subgoal_id, attempt=attempt, phase=phase)
+        elif exit_code is not None and exit_code != 0:
+            self._emit_event("test_process_failed", subgoal_id=subgoal_id, attempt=attempt, phase=phase, exit_code=exit_code)
+
+        return rec
 
     def _get_head_commit(self) -> Optional[str]:
         res = self._run_repo_git(["rev-parse", "HEAD"])
@@ -2540,6 +2600,7 @@ class Workspace:
         base_commit_ref: str,
         cmd: List[str],
         subgoal_id: str,
+        attempt: int = 1,
     ) -> Dict[str, Any]:
         """Creates detached worktree at base_commit, links deps, and runs cmd (with 1 retry on timeout/start failure)."""
         worktree_base = self.repo_dir / ".jev-worktrees"
@@ -2549,7 +2610,9 @@ class Workspace:
         res_data = {"base_status": BaseStatus.UNMEASURED, "failing_ids": None, "valid_cache": False, "disagreed": False}
         prior_status = None
 
-        for attempt in range(2):
+        base_key = f"{getattr(self, 'run_id', 'default')}#{subgoal_id}#{attempt}"
+        for base_try in range(2):
+            self._base_run_counts[base_key] = self._base_run_counts.get(base_key, 0) + 1
             self._base_run_counts[subgoal_id] = self._base_run_counts.get(subgoal_id, 0) + 1
             if base_wt_path.exists():
                 self._unlink_node_modules(base_wt_path)
@@ -2592,7 +2655,7 @@ class Workspace:
                     "valid_cache": True,
                     "disagreed": res_data.get("disagreed", False),
                 }
-                if attempt == 0 and status == BaseStatus.FAIL:
+                if base_try == 0 and status == BaseStatus.FAIL:
                     continue
                 break
             except Exception:
@@ -2896,6 +2959,58 @@ class Workspace:
         ticket_scope: Optional[Sequence[str]] = None,
     ) -> Optional[MechanicalEvidence]:
         """Evaluates tests using same-command comparison between base and candidate."""
+        subgoal_id = getattr(subgoal, "id", "default")
+        attempt_key = f"{getattr(self, 'run_id', 'default')}#{subgoal_id}#{attempt}"
+        legacy_attempt_key = f"{subgoal_id}#{attempt}"
+        cand_runs = max(
+            self._candidate_run_counts.get(attempt_key, 0),
+            self._candidate_run_counts.get(legacy_attempt_key, 0),
+        )
+        if (
+            cand_runs >= 2
+            and hasattr(self, "_attempt_result_cache")
+            and (attempt_key in self._attempt_result_cache or legacy_attempt_key in self._attempt_result_cache)
+        ):
+            cached_data = self._attempt_result_cache.get(attempt_key) or self._attempt_result_cache.get(legacy_attempt_key)
+            cached_ev, cached_test_run, cached_base_run = cached_data
+            if cached_test_run is not None:
+                self.last_test_run = dict(cached_test_run)
+            if cached_base_run is not None:
+                self.last_base_run = dict(cached_base_run)
+            self._emit_event("retry_skipped_exact_duplicate", subgoal_id=subgoal_id, attempt=attempt)
+            return cached_ev
+
+        ev = self._evaluate_tests_internal(
+            subgoal=subgoal,
+            base_commit=base_commit,
+            test_policy=test_policy,
+            test_targets=test_targets,
+            compile_res=compile_res,
+            attempt=attempt,
+            rerun_mode=rerun_mode,
+            ticket=ticket,
+            ticket_scope=ticket_scope,
+        )
+        if ev is not None and hasattr(self, "_attempt_result_cache"):
+            self._attempt_result_cache[attempt_key] = (
+                ev,
+                dict(self.last_test_run) if isinstance(self.last_test_run, dict) else None,
+                dict(getattr(self, "last_base_run", None)) if isinstance(getattr(self, "last_base_run", None), dict) else None,
+            )
+        return ev
+
+    def _evaluate_tests_internal(
+        self,
+        subgoal: Subgoal,
+        base_commit: Optional[str] = None,
+        test_policy: str = "auto",
+        test_targets: Optional[Sequence[Union[str, Path]]] = None,
+        compile_res: Optional[Dict[str, Any]] = None,
+        attempt: int = 1,
+        rerun_mode: Optional[str] = None,
+        ticket: Optional[Union[str, Any]] = None,
+        ticket_scope: Optional[Sequence[str]] = None,
+    ) -> Optional[MechanicalEvidence]:
         if test_policy == "never":
             return None
 
@@ -3155,8 +3270,22 @@ class Workspace:
 
         # 2b. Candidate run 1
         subgoal_id = getattr(subgoal, "id", "default")
-        attempt_key = f"{subgoal_id}#{attempt}"
-        if self._candidate_run_counts.get(attempt_key, 0) >= 2:
+        attempt_key = f"{getattr(self, 'run_id', 'default')}#{subgoal_id}#{attempt}"
+        legacy_attempt_key = f"{subgoal_id}#{attempt}"
+        cand_runs = max(
+            self._candidate_run_counts.get(attempt_key, 0),
+            self._candidate_run_counts.get(legacy_attempt_key, 0),
+        )
+        if cand_runs >= 2:
+            if hasattr(self, "_attempt_result_cache") and (attempt_key in self._attempt_result_cache or legacy_attempt_key in self._attempt_result_cache):
+                cached_data = self._attempt_result_cache.get(attempt_key) or self._attempt_result_cache.get(legacy_attempt_key)
+                cached_ev, cached_test_run, cached_base_run = cached_data
+                if cached_test_run is not None:
+                    self.last_test_run = dict(cached_test_run)
+                if cached_base_run is not None:
+                    self.last_base_run = dict(cached_base_run)
+                self._emit_event("retry_skipped_exact_duplicate", subgoal_id=subgoal_id, attempt=attempt)
+                return cached_ev
             return MechanicalEvidence(
                 mech_status=MechStatus.UNMEASURED,
                 reason=MechReason.TOOLING_ERROR,
@@ -3167,8 +3296,21 @@ class Workspace:
                 target_confidence=target_confidence,
             )
         self._candidate_run_counts[attempt_key] = self._candidate_run_counts.get(attempt_key, 0) + 1
+        if attempt > 1:
+            self._emit_event("retry_launched", subgoal_id=subgoal_id, attempt=attempt)
+
+        cand_start = time.time()
         cand_outcome = self.run_tests(targets=effective_targets)
+        cand_end = time.time()
         last_run = self.last_test_run or {}
+        self._record_execution_item(
+            subgoal_id=subgoal_id,
+            attempt=attempt,
+            phase="initial",
+            started_at=cand_start,
+            ended_at=cand_end,
+            last_run=last_run,
+        )
 
         registry_version = last_run.get("registry_version") or reg.registry_version
         runner_profile_id = last_run.get("runner_profile_id")
@@ -3599,7 +3741,11 @@ class Workspace:
                 target_rule=target_rule,
                 target_confidence=target_confidence,
             )
-        if self._candidate_run_counts.get(attempt_key, 0) >= 2:
+        cand_runs_rerun = max(
+            self._candidate_run_counts.get(attempt_key, 0),
+            self._candidate_run_counts.get(legacy_attempt_key, 0),
+        )
+        if cand_runs_rerun >= 2:
             return MechanicalEvidence(
                 mech_status=MechStatus.UNMEASURED,
                 reason=MechReason.TOOLING_ERROR,
@@ -3610,11 +3756,13 @@ class Workspace:
                 target_confidence=target_confidence,
             )
         self._candidate_run_counts[attempt_key] = self._candidate_run_counts.get(attempt_key, 0) + 1
+        self._emit_event("flaky_rerun_launched", subgoal_id=subgoal_id, attempt=attempt, phase="flaky_rerun")
 
         actual_rerun_mode = "same_worktree"
         effective_rerun_mode = rerun_mode or getattr(self, "candidate_rerun_mode", "same_worktree")
         rerun_details = {}
         rerun_outcome = None
+        rerun_start = time.time()
 
         if effective_rerun_mode == "fresh_worktree":
             try:
@@ -3634,6 +3782,16 @@ class Workspace:
             rerun_outcome = self.run_tests(targets=effective_targets)
             rerun_details = self.last_test_run or {}
             actual_rerun_mode = "same_worktree"
+
+        rerun_end = time.time()
+        self._record_execution_item(
+            subgoal_id=subgoal_id,
+            attempt=attempt,
+            phase="flaky_rerun",
+            started_at=rerun_start,
+            ended_at=rerun_end,
+            last_run=rerun_details,
+        )
 
         rerun_details["rerun_mode"] = actual_rerun_mode
         rerun_details["rerun_context"] = actual_rerun_mode if actual_rerun_mode == "fresh_worktree" else "same_worktree_cleaned"
@@ -3797,7 +3955,12 @@ class Workspace:
 
         if base_res_data is None:
             subgoal_id = getattr(subgoal, "id", "default")
-            if self._base_run_counts.get(subgoal_id, 0) >= 3:
+            base_key = f"{getattr(self, 'run_id', 'default')}#{subgoal_id}#{attempt}"
+            base_runs = max(
+                self._base_run_counts.get(base_key, 0),
+                self._base_run_counts.get(subgoal_id, 0),
+            )
+            if base_runs >= 3:
                 return MechanicalEvidence(
                     mech_status=MechStatus.UNMEASURED,
                     reason=MechReason.TOOLING_ERROR,
@@ -3814,6 +3977,7 @@ class Workspace:
                 base_commit_ref=base_commit_ref,
                 cmd=test_cmd,
                 subgoal_id=subgoal_id,
+                attempt=attempt,
             )
             if base_res_data.get("valid_cache"):
                 self._base_test_cache[cache_key] = base_res_data
@@ -5257,6 +5421,7 @@ class Workspace:
         test_targets: Optional[Sequence[Union[str, Path]]] = None,
         ticket: Optional[Union[str, Any]] = None,
         ticket_scope: Optional[Sequence[str]] = None,
+        attempt: int = 1,
     ) -> MechanicalCheckResult:
         self.last_test_run = None
         self.last_compile_run = None
@@ -5442,6 +5607,7 @@ class Workspace:
                 compile_res=compile_res,
                 ticket=ticket,
                 ticket_scope=ticket_scope,
+                attempt=attempt,
             )
             test_run_details = getattr(self, "last_test_run", None)
             if isinstance(test_run_details, dict):

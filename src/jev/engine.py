@@ -2491,6 +2491,8 @@ def node_implement(
             state["failed_attempts"] = []
             if workspace is not None:
                 workspace.subgoal_start_time = time.time()
+                if hasattr(workspace, "run_id") and state.get("thread_id"):
+                    workspace.run_id = str(state.get("thread_id"))
 
     if workspace is not None and getattr(workspace, "subgoal_start_time", None) is None:
         workspace.subgoal_start_time = time.time()
@@ -3839,6 +3841,17 @@ def node_gate(
         kwargs["ticket"] = state.get("ticket")
     if _accepts_param(workspace.run_mechanical_checks, "ticket_scope"):
         kwargs["ticket_scope"] = state.get("ticket_scope")
+
+    prev_attempts = state.get("failed_attempts") or []
+    current_attempt = (prev_attempts[-1].get("attempt_no", 0) + 1) if prev_attempts else 1
+    strikes_attempt = 1 + int(state.get("mechanical_strike_count") or 0) + int(state.get("unmeasured_retry_count") or 0) + int(state.get("semantic_strike_count") or 0)
+    current_attempt = max(current_attempt, strikes_attempt)
+
+    if hasattr(workspace, "run_id") and state.get("thread_id"):
+        workspace.run_id = str(state.get("thread_id"))
+    if _accepts_param(workspace.run_mechanical_checks, "attempt"):
+        kwargs["attempt"] = current_attempt
+
     targets = _test_targets(workspace, diff, subgoal.scope)
     should_target = bool(targets and (test_policy == "always" or
                                       (test_policy == "auto" and subgoal.expects_tests)))
@@ -3858,6 +3871,13 @@ def node_gate(
             workspace.run_tests = full_runner
     if not targeted_run:
         mech_result = workspace.run_mechanical_checks(subgoal, **kwargs)
+
+    if hasattr(workspace, "events") and workspace.events:
+        traj = state.get("trajectory")
+        if isinstance(traj, list):
+            for ev in workspace.events:
+                if ev not in traj:
+                    traj.append(ev)
 
     classification = getattr(mech_result, "test_classification", None)
     full_suite_clean = getattr(mech_result, "full_suite_clean", None)
