@@ -115,6 +115,14 @@ PROFILE_SPECS = {
             "src/lib.rs": "#[cfg(test)]\nmod tests {\n    #[test]\n    fn real_repository() { assert_eq!(2 + 2, 4); }\n}\n",
         },
     },
+    "deno-test": {
+        "tool": "deno",
+        "command": lambda: ["deno", "test"],
+        "files": {
+            "deno.json": "{}\n",
+            "real_test.js": "Deno.test('real repository', () => { if (2 + 2 !== 4) throw new Error('arithmetic'); });\n",
+        },
+    },
 }
 
 ALL_PROFILE_TOOLS = {
@@ -343,8 +351,10 @@ def _pid_is_alive(pid: int) -> bool:
         return str(pid) in result.stdout
     try:
         os.kill(pid, 0)
-    except (ProcessLookupError, PermissionError):
+    except ProcessLookupError:
         return False
+    except PermissionError:
+        return True
     return True
 
 
@@ -407,6 +417,84 @@ def test_real_npm_profile_zero_test_variant_is_not_positive(tmp_path, profile_id
     repo = tmp_path / f"zero-{profile_id}"
     _write_repo(repo, spec["zero_files"])
     _npm_install(repo)
+    result = _run(repo, spec["command"]())
+    output = _combined(result)
+    profile = load_registry().get_profile(profile_id)
+    assert profile is not None
+    parsed = parse_test_counts_summary(profile, output, exit_code=result.returncode)
+    assert parsed["has_positive_pass"] is False, (
+        f"Zero-test variant parsed positive for {profile_id}: {parsed}; output: {output}"
+    )
+
+
+DEPENDENCY_FREE_VARIANTS = {
+    "deno-test": {
+        "tool": "deno",
+        "command": lambda: ["deno", "test"],
+        "fail_files": {
+            "deno.json": "{}\n",
+            "real_test.js": "Deno.test('real repository', () => { if (2 + 2 !== 5) throw new Error('arithmetic'); });\n",
+        },
+        "zero_files": {
+            "deno.json": "{}\n",
+        },
+    },
+    "go-test": {
+        "tool": "go",
+        "command": lambda: ["go", "test", "./..."],
+        "fail_files": {
+            "go.mod": "module phase12b.example\n\ngo 1.18\n",
+            "real_test.go": "package phase12b\n\nimport \"testing\"\n\nfunc TestRealRepository(t *testing.T) {\n\tif 2+2 != 5 { t.Fatal(\"arithmetic\") }\n}\n",
+        },
+        "zero_files": {
+            "go.mod": "module phase12b.example\n\ngo 1.18\n",
+            "real.go": "package phase12b\n",
+        },
+    },
+    "cargo-test": {
+        "tool": "cargo",
+        "command": lambda: ["cargo", "test"],
+        "fail_files": {
+            "Cargo.toml": "[package]\nname = \"phase12b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            "src/lib.rs": "#[cfg(test)]\nmod tests {\n    #[test]\n    fn real_repository() { assert_eq!(2 + 2, 5); }\n}\n",
+        },
+        "zero_files": {
+            "Cargo.toml": "[package]\nname = \"phase12b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            "src/lib.rs": "pub fn add(a: i32, b: i32) -> i32 { a + b }\n",
+        },
+    },
+}
+
+
+@pytest.mark.parametrize("profile_id", sorted(DEPENDENCY_FREE_VARIANTS))
+def test_real_dependency_free_profile_failing_variant_is_not_positive(tmp_path, profile_id):
+    """Failing variant of dependency-free profile is not positive."""
+    tool = ALL_PROFILE_TOOLS[profile_id]
+    if tool and shutil.which(tool) is None:
+        pytest.skip(f"Toolchain '{tool}' not found for profile '{profile_id}'")
+    spec = DEPENDENCY_FREE_VARIANTS[profile_id]
+    repo = tmp_path / f"fail-{profile_id}"
+    _write_repo(repo, spec["fail_files"])
+    result = _run(repo, spec["command"]())
+    output = _combined(result)
+    assert result.returncode != 0, f"Expected failing exit code for {profile_id}, got 0: {output}"
+    profile = load_registry().get_profile(profile_id)
+    assert profile is not None
+    parsed = parse_test_counts_summary(profile, output, exit_code=result.returncode)
+    assert parsed["has_positive_pass"] is False, (
+        f"Failing variant parsed positive for {profile_id}: {parsed}; output: {output}"
+    )
+
+
+@pytest.mark.parametrize("profile_id", sorted(DEPENDENCY_FREE_VARIANTS))
+def test_real_dependency_free_profile_zero_test_variant_is_not_positive(tmp_path, profile_id):
+    """Zero-test variant of dependency-free profile is not positive."""
+    tool = ALL_PROFILE_TOOLS[profile_id]
+    if tool and shutil.which(tool) is None:
+        pytest.skip(f"Toolchain '{tool}' not found for profile '{profile_id}'")
+    spec = DEPENDENCY_FREE_VARIANTS[profile_id]
+    repo = tmp_path / f"zero-{profile_id}"
+    _write_repo(repo, spec["zero_files"])
     result = _run(repo, spec["command"]())
     output = _combined(result)
     profile = load_registry().get_profile(profile_id)
