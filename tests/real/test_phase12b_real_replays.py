@@ -7,6 +7,7 @@ They do not modify the repository containing this test suite.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -22,6 +23,56 @@ from jev.process_runner import run_command
 from jev.runner_registry import is_zero_test_marker_match, load_registry, parse_test_counts_summary
 from jev.workspace import Workspace
 
+
+
+# Pinned exact versions for dependency-backed templates (stable releases as of Phase 12B):
+# jest: 29.7.0 (v29 stable text reporter)
+# mocha: 10.8.2 (v10 stable spec reporter)
+# vitest: 1.6.0 (v1 stable reporter)
+NPM_RUNNER_SPECS = {
+    "jest": {
+        "command": lambda: [shutil.which("npx") or "npx", "jest"],
+        "pass_files": {
+            "package.json": json.dumps({"name": "phase12b-jest", "private": True, "devDependencies": {"jest": "29.7.0"}}, indent=2) + "\n",
+            "real.test.js": "test('real repository', () => { expect(2 + 2).toBe(4); });\n",
+        },
+        "fail_files": {
+            "package.json": json.dumps({"name": "phase12b-jest", "private": True, "devDependencies": {"jest": "29.7.0"}}, indent=2) + "\n",
+            "real.test.js": "test('real repository', () => { expect(2 + 2).toBe(5); });\n",
+        },
+        "zero_files": {
+            "package.json": json.dumps({"name": "phase12b-jest", "private": True, "devDependencies": {"jest": "29.7.0"}}, indent=2) + "\n",
+        },
+    },
+    "mocha": {
+        "command": lambda: [shutil.which("npx") or "npx", "mocha"],
+        "pass_files": {
+            "package.json": json.dumps({"name": "phase12b-mocha", "private": True, "devDependencies": {"mocha": "10.8.2"}}, indent=2) + "\n",
+            "test/real.test.js": "const assert = require('assert'); it('real repository', () => { assert.equal(2 + 2, 4); });\n",
+        },
+        "fail_files": {
+            "package.json": json.dumps({"name": "phase12b-mocha", "private": True, "devDependencies": {"mocha": "10.8.2"}}, indent=2) + "\n",
+            "test/real.test.js": "const assert = require('assert'); it('real repository', () => { assert.equal(2 + 2, 5); });\n",
+        },
+        "zero_files": {
+            "package.json": json.dumps({"name": "phase12b-mocha", "private": True, "devDependencies": {"mocha": "10.8.2"}}, indent=2) + "\n",
+        },
+    },
+    "vitest": {
+        "command": lambda: [shutil.which("npx") or "npx", "vitest", "run"],
+        "pass_files": {
+            "package.json": json.dumps({"name": "phase12b-vitest", "private": True, "devDependencies": {"vitest": "1.6.0"}}, indent=2) + "\n",
+            "real.test.js": "import { test, expect } from 'vitest'; test('real repository', () => { expect(2 + 2).toBe(4); });\n",
+        },
+        "fail_files": {
+            "package.json": json.dumps({"name": "phase12b-vitest", "private": True, "devDependencies": {"vitest": "1.6.0"}}, indent=2) + "\n",
+            "real.test.js": "import { test, expect } from 'vitest'; test('real repository', () => { expect(2 + 2).toBe(5); });\n",
+        },
+        "zero_files": {
+            "package.json": json.dumps({"name": "phase12b-vitest", "private": True, "devDependencies": {"vitest": "1.6.0"}}, indent=2) + "\n",
+        },
+    },
+}
 
 PROFILE_SPECS = {
     "pytest": {
@@ -108,7 +159,36 @@ def _write_repo(repo: Path, files: dict[str, str]) -> str:
 
 
 def _run(repo: Path, argv: list[str], timeout: float = 120.0) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(argv, cwd=repo, capture_output=True, text=True, timeout=timeout)
+    executable = shutil.which(argv[0]) if argv else None
+    resolved_argv = [executable, *argv[1:]] if executable else argv
+    return subprocess.run(
+        resolved_argv,
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+    )
+
+
+def _npm_install(repo: Path) -> subprocess.CompletedProcess[str]:
+    npm = shutil.which("npm")
+    if npm is None:
+        pytest.skip("Toolchain 'npm' not found for npm-backed profile")
+    result = subprocess.run(
+        [npm, "install", "--no-audit", "--no-fund"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=180.0,
+    )
+    if result.returncode != 0:
+        tail = (result.stderr or result.stdout)[-300:].strip()
+        pytest.skip(f"npm install failed for profile: {tail}")
+    return result
 
 
 def _combined(result: subprocess.CompletedProcess[str]) -> str:
@@ -127,6 +207,9 @@ def test_real_profile_repository_passes_or_skips_with_reason(tmp_path, profile_i
     elif profile_id in PROFILE_SPECS:
         command = PROFILE_SPECS[profile_id]["command"]()
         files = PROFILE_SPECS[profile_id]["files"]
+    elif profile_id in NPM_RUNNER_SPECS:
+        command = NPM_RUNNER_SPECS[profile_id]["command"]()
+        files = NPM_RUNNER_SPECS[profile_id]["pass_files"]
     else:
         pytest.skip(
             f"Profile '{profile_id}' has no dependency-free repository template; real CI fixture is deferred"
@@ -134,6 +217,8 @@ def test_real_profile_repository_passes_or_skips_with_reason(tmp_path, profile_i
 
     repo = tmp_path / profile_id
     _write_repo(repo, files)
+    if profile_id in NPM_RUNNER_SPECS:
+        _npm_install(repo)
     result = _run(repo, command)
     assert result.returncode == 0, _combined(result)
 
@@ -141,6 +226,9 @@ def test_real_profile_repository_passes_or_skips_with_reason(tmp_path, profile_i
     assert profile is not None
     parsed = parse_test_counts_summary(profile, _combined(result), exit_code=result.returncode)
     assert parsed["has_positive_pass"] is True, _combined(result)
+    assert parsed["passed"] == 1, (
+        f"Profile '{profile_id}': expected 1 passed test, got {parsed['passed']}; parsed: {parsed}; output: {_combined(result)}"
+    )
 
 
 @pytest.mark.parametrize(
@@ -286,3 +374,44 @@ def test_timeout_descendants_are_absent_after_twenty_real_replays(tmp_path):
         while time.monotonic() < deadline and _pid_is_alive(child_pid):
             time.sleep(0.05)
         assert _pid_is_alive(child_pid) is False, f"replay {index}: child {child_pid} survived"
+
+
+@pytest.mark.parametrize("profile_id", sorted(NPM_RUNNER_SPECS))
+def test_real_npm_profile_failing_variant_is_not_positive(tmp_path, profile_id):
+    """Failing variant of npm-backed profile is not positive."""
+    tool = ALL_PROFILE_TOOLS[profile_id]
+    if tool and shutil.which(tool) is None:
+        pytest.skip(f"Toolchain '{tool}' not found for profile '{profile_id}'")
+    spec = NPM_RUNNER_SPECS[profile_id]
+    repo = tmp_path / f"fail-{profile_id}"
+    _write_repo(repo, spec["fail_files"])
+    _npm_install(repo)
+    result = _run(repo, spec["command"]())
+    output = _combined(result)
+    assert result.returncode != 0, f"Expected failing exit code for {profile_id}, got 0: {output}"
+    profile = load_registry().get_profile(profile_id)
+    assert profile is not None
+    parsed = parse_test_counts_summary(profile, output, exit_code=result.returncode)
+    assert parsed["has_positive_pass"] is False, (
+        f"Failing variant parsed positive for {profile_id}: {parsed}; output: {output}"
+    )
+
+
+@pytest.mark.parametrize("profile_id", sorted(NPM_RUNNER_SPECS))
+def test_real_npm_profile_zero_test_variant_is_not_positive(tmp_path, profile_id):
+    """Zero-test variant of npm-backed profile is not positive."""
+    tool = ALL_PROFILE_TOOLS[profile_id]
+    if tool and shutil.which(tool) is None:
+        pytest.skip(f"Toolchain '{tool}' not found for profile '{profile_id}'")
+    spec = NPM_RUNNER_SPECS[profile_id]
+    repo = tmp_path / f"zero-{profile_id}"
+    _write_repo(repo, spec["zero_files"])
+    _npm_install(repo)
+    result = _run(repo, spec["command"]())
+    output = _combined(result)
+    profile = load_registry().get_profile(profile_id)
+    assert profile is not None
+    parsed = parse_test_counts_summary(profile, output, exit_code=result.returncode)
+    assert parsed["has_positive_pass"] is False, (
+        f"Zero-test variant parsed positive for {profile_id}: {parsed}; output: {output}"
+    )
