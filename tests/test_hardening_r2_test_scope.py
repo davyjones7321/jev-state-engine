@@ -375,3 +375,162 @@ def test_9_worker_cannot_write_outside_amended_scope(temp_repo):
     res_unauth = ws.check_scope(diff=diff_str, scope=final_scope)
     assert not res_unauth.passed
     assert "tests/test_auth.py" in res_unauth.out_of_scope
+
+def test_10_two_source_files_one_test_declared_discovers_second_test(temp_repo):
+    """10.
+    Two source files with two corresponding tests on disk, but only one test declared
+    in scope. The validator must evaluate the second source file independently and add
+    its exact test match to scope.
+    """
+    (temp_repo / "src").mkdir(parents=True, exist_ok=True)
+    (temp_repo / "tests").mkdir(parents=True, exist_ok=True)
+    (temp_repo / "src" / "a.py").write_text("def a(): pass\n")
+    (temp_repo / "src" / "b.py").write_text("def b(): pass\n")
+    (temp_repo / "tests" / "test_a.py").write_text("def test_a(): pass\n")
+    (temp_repo / "tests" / "test_b.py").write_text("def test_b(): pass\n")
+
+    subgoals = [
+        Subgoal(
+            id="sg-1",
+            description="Update a and b",
+            scope=["src/a.py", "src/b.py", "tests/test_a.py"],
+            expects_tests=True,
+        )
+    ]
+    amended, problems = validate_subgoal_test_scope(subgoals, temp_repo)
+    assert not problems
+    assert "tests/test_a.py" in amended[0].scope
+    assert "tests/test_b.py" in amended[0].scope
+
+
+def test_11_two_source_files_both_tests_declared(temp_repo):
+    """11.
+    Two source files with both tests explicitly declared in scope.
+    Accepted cleanly without modification or problems.
+    """
+    (temp_repo / "src").mkdir(parents=True, exist_ok=True)
+    (temp_repo / "tests").mkdir(parents=True, exist_ok=True)
+    (temp_repo / "src" / "a.py").write_text("def a(): pass\n")
+    (temp_repo / "src" / "b.py").write_text("def b(): pass\n")
+    (temp_repo / "tests" / "test_a.py").write_text("def test_a(): pass\n")
+    (temp_repo / "tests" / "test_b.py").write_text("def test_b(): pass\n")
+
+    subgoals = [
+        Subgoal(
+            id="sg-1",
+            description="Update a and b with tests",
+            scope=["src/a.py", "src/b.py", "tests/test_a.py", "tests/test_b.py"],
+            expects_tests=True,
+        )
+    ]
+    amended, problems = validate_subgoal_test_scope(subgoals, temp_repo)
+    assert not problems
+    assert sorted(amended[0].scope) == sorted(["src/a.py", "src/b.py", "tests/test_a.py", "tests/test_b.py"])
+
+
+def test_12_single_source_file_explicitly_declared_new_test_preserved(temp_repo):
+    """12.
+    One source file with an explicitly declared new test file that does not yet exist.
+    Preserved in scope cleanly.
+    """
+    subgoals = [
+        Subgoal(
+            id="sg-1",
+            description="Implement new feature",
+            scope=["src/new_feature.py", "tests/test_new_feature.py"],
+            expects_tests=True,
+        )
+    ]
+    amended, problems = validate_subgoal_test_scope(subgoals, temp_repo)
+    assert not problems
+    assert "tests/test_new_feature.py" in amended[0].scope
+
+
+def test_13_multiple_source_files_ambiguous_test_candidate_rejected(temp_repo):
+    """13.
+    Multiple source files where one file has an ambiguous test candidate on disk.
+    Must reject with ambiguous_test_candidates rather than silently accepting.
+    """
+    (temp_repo / "src").mkdir(parents=True, exist_ok=True)
+    (temp_repo / "tests").mkdir(parents=True, exist_ok=True)
+    (temp_repo / "src" / "a.py").write_text("def a(): pass\n")
+    (temp_repo / "src" / "b.py").write_text("def b(): pass\n")
+    (temp_repo / "tests" / "test_a.py").write_text("def test_a(): pass\n")
+    (temp_repo / "tests" / "test_b_unit.py").write_text("def test_b_unit(): pass\n")
+    (temp_repo / "tests" / "test_b_integration.py").write_text("def test_b_integration(): pass\n")
+
+    subgoals = [
+        Subgoal(
+            id="sg-1",
+            description="Update a and b",
+            scope=["src/a.py", "src/b.py", "tests/test_a.py"],
+            expects_tests=True,
+        )
+    ]
+    amended, problems = validate_subgoal_test_scope(subgoals, temp_repo)
+    assert len(problems) >= 1
+    assert any(p["type"] == "ambiguous_test_candidates" for p in problems)
+
+
+def test_14_source_file_with_no_discoverable_test_reports_missing_test_scope(temp_repo):
+    """14.
+    Multiple source files where one has a declared test and the other has no discoverable test.
+    Must return missing_test_scope problem for planner feedback.
+    """
+    (temp_repo / "src").mkdir(parents=True, exist_ok=True)
+    (temp_repo / "tests").mkdir(parents=True, exist_ok=True)
+    (temp_repo / "src" / "a.py").write_text("def a(): pass\n")
+    (temp_repo / "src" / "orphan.py").write_text("def orphan(): pass\n")
+    (temp_repo / "tests" / "test_a.py").write_text("def test_a(): pass\n")
+
+    subgoals = [
+        Subgoal(
+            id="sg-1",
+            description="Update a and orphan",
+            scope=["src/a.py", "src/orphan.py", "tests/test_a.py"],
+            expects_tests=True,
+        )
+    ]
+    amended, problems = validate_subgoal_test_scope(subgoals, temp_repo)
+    assert len(problems) >= 1
+    assert any(p["type"] == "missing_test_scope" for p in problems)
+
+
+def test_15_no_implementation_starts_before_missing_test_scope_resolved(temp_repo):
+    """15.
+    Integration check: If a plan with multiple source files is missing a test for one file
+    and fails on both planning attempts, the engine escalates with gate_status='missing_test_scope'
+    and plan_queue=[] BEFORE implementation starts.
+    """
+    from langchain_core.messages import AIMessage
+    from jev.engine import node_plan
+
+    (temp_repo / "src").mkdir(parents=True, exist_ok=True)
+    (temp_repo / "tests").mkdir(parents=True, exist_ok=True)
+    (temp_repo / "src" / "a.py").write_text("def a(): pass\n")
+    (temp_repo / "src" / "b.py").write_text("def b(): pass\n")
+    (temp_repo / "tests" / "test_a.py").write_text("def test_a(): pass\n")
+
+    ws = MagicMock()
+    ws.repo_dir = temp_repo
+
+    # Plan proposes a and b with only test_a.py declared
+    plan_json = '[{"description": "Partial test scope", "scope": ["src/a.py", "src/b.py", "tests/test_a.py"], "expects_tests": true}]'
+    mock_llm = MagicMock()
+    mock_llm.invoke.return_value = AIMessage(content=plan_json)
+
+    state: State = {
+        "ticket": "Update a and b",
+        "investigation_notes": "Found src/a.py, src/b.py, tests/test_a.py",
+        "trajectory": [],
+    }
+
+    res_state = node_plan(state, workspace=ws, llm=mock_llm)
+
+    assert res_state.get("gate_status") == "missing_test_scope"
+    assert res_state.get("status") == "escalated"
+    assert len(res_state.get("plan_queue", [])) == 0
+    assert mock_llm.invoke.call_count == 2
+    events = [e for e in res_state.get("trajectory", []) if e.get("event") == "missing_test_scope"]
+    assert len(events) >= 1
+

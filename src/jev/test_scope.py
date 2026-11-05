@@ -199,11 +199,73 @@ def discover_related_tests(
     )
 
 
+CODE_EXTENSIONS: Set[str] = {
+    ".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs",
+    ".java", ".kt", ".cs", ".rb", ".php", ".ex", ".exs",
+}
+
+
+def matches_test_file(src_path_str: str, test_path_str: str) -> bool:
+    """Check if test_path_str corresponds to src_path_str based on naming conventions."""
+    src_norm = src_path_str.replace("\\", "/").strip().lstrip("./")
+    test_norm = test_path_str.replace("\\", "/").strip().lstrip("./")
+
+    src_stem = Path(src_norm).stem.lower()
+    src_ext = Path(src_norm).suffix.lower()
+    test_stem = Path(test_norm).stem.lower()
+    test_name = Path(test_norm).name.lower()
+
+    # Python
+    if src_ext == ".py":
+        if test_stem in (f"test_{src_stem}", f"{src_stem}_test", src_stem):
+            return True
+    # JS/TS
+    elif src_ext in (".ts", ".tsx", ".js", ".jsx"):
+        if test_name.startswith(f"{src_stem}.test.") or test_name.startswith(f"{src_stem}.spec."):
+            return True
+        if test_stem in (f"test_{src_stem}", f"{src_stem}_test", f"{src_stem}test", f"{src_stem}tests", src_stem):
+            return True
+    # Go
+    elif src_ext == ".go":
+        if test_name == f"{src_stem}_test.go":
+            return True
+    # Rust
+    elif src_ext == ".rs":
+        if test_stem in (src_stem, f"test_{src_stem}", f"{src_stem}_test"):
+            return True
+    # Java / Kotlin
+    elif src_ext in (".java", ".kt"):
+        if test_stem in (f"{src_stem}test", f"{src_stem}tests", f"test{src_stem}", src_stem):
+            return True
+    # .NET
+    elif src_ext == ".cs":
+        if test_stem in (f"{src_stem}tests", f"{src_stem}test", src_stem):
+            return True
+    # Ruby
+    elif src_ext == ".rb":
+        if test_stem in (f"{src_stem}_spec", f"{src_stem}_test", f"test_{src_stem}", src_stem):
+            return True
+    # PHP
+    elif src_ext == ".php":
+        if test_stem in (f"{src_stem}test", f"test{src_stem}", src_stem):
+            return True
+    # Elixir
+    elif src_ext == ".ex":
+        if test_stem == f"{src_stem}_test":
+            return True
+
+    # Generic convention fallback
+    if test_stem == f"test_{src_stem}" or test_stem == f"{src_stem}_test":
+        return True
+
+    return False
+
+
 def validate_subgoal_test_scope(
     subgoals: List[Subgoal],
     worktree_dir: Optional[Path],
 ) -> Tuple[List[Subgoal], List[Dict[str, Any]]]:
-    """Validate and mechanically amend subgoal scopes with test files."""
+    """Validate and mechanically amend subgoal scopes with test files, evaluating every source file independently."""
     problems: List[Dict[str, Any]] = []
     amended_subgoals: List[Subgoal] = []
     root = Path(worktree_dir).resolve() if worktree_dir else None
@@ -243,45 +305,66 @@ def validate_subgoal_test_scope(
             amended_subgoals.append(sg_copy)
             continue
 
-        # Check if scope already names a test file (existing or new)
         test_files_in_scope = [f for f in scope if is_test_path(f)]
+        source_files_in_scope = [f for f in scope if not is_test_path(f)]
 
-        if test_files_in_scope:
-            # Already names at least one test file
+        # If scope contains only test files, it satisfies test scope
+        if not source_files_in_scope:
             amended_subgoals.append(sg_copy)
             continue
 
-        # If no test file in scope, discover related tests
-        discovery = discover_related_tests(root, scope)
+        # Filter for code files that require tests
+        code_sources = [
+            f for f in source_files_in_scope
+            if Path(f).suffix.lower() in CODE_EXTENSIONS
+        ]
+        target_sources = code_sources if code_sources else source_files_in_scope
 
-        if len(discovery.ambiguous) > 0 or len(discovery.exact) > 5:
-            all_cands = sorted(list(set(discovery.ambiguous + discovery.exact)))
-            problems.append({
-                "subgoal_id": sg_copy.id,
-                "type": "ambiguous_test_candidates",
-                "candidates": all_cands,
-                "message": (
-                    f"Ambiguous test candidates found for scope {scope}: {all_cands}. "
-                    "Please explicitly name the intended test file in the subgoal scope."
-                ),
-            })
+        # If single source file and at least one test file in scope, they correspond
+        if len(target_sources) == 1 and len(test_files_in_scope) >= 1:
             amended_subgoals.append(sg_copy)
-        elif len(discovery.exact) >= 1:
-            for test_path in discovery.exact:
-                if test_path not in scope:
-                    scope.append(test_path)
-            sg_copy.scope = scope
-            amended_subgoals.append(sg_copy)
-        else:
-            problems.append({
-                "subgoal_id": sg_copy.id,
-                "type": "missing_test_scope",
-                "message": (
-                    f"Subgoal '{sg_copy.id}' expects tests, but scope {scope} contains no test files "
-                    "and no matching existing test files could be discovered. "
-                    "Either add the test file to scope or set expects_tests=false if tests are exempt."
-                ),
-            })
-            amended_subgoals.append(sg_copy)
+            continue
+
+        # Validate every source file independently
+        for src_file in target_sources:
+            # Check if this source file is already covered by a matching test in scope
+            covered = any(matches_test_file(src_file, tf) for tf in test_files_in_scope)
+            if covered:
+                continue
+
+            # Run discovery for this individual source file
+            discovery = discover_related_tests(root, [src_file])
+
+            if len(discovery.ambiguous) > 0 or len(discovery.exact) > 5:
+                all_cands = sorted(list(set(discovery.ambiguous + discovery.exact)))
+                problems.append({
+                    "subgoal_id": sg_copy.id,
+                    "type": "ambiguous_test_candidates",
+                    "candidates": all_cands,
+                    "source_file": src_file,
+                    "message": (
+                        f"Ambiguous test candidates found for source file '{src_file}' in scope: {all_cands}. "
+                        "Please explicitly name the intended test file in the subgoal scope."
+                    ),
+                })
+            elif len(discovery.exact) == 1:
+                # Add unambiguous exact match to scope
+                for test_path in discovery.exact:
+                    if test_path not in scope:
+                        scope.append(test_path)
+            else:
+                problems.append({
+                    "subgoal_id": sg_copy.id,
+                    "type": "missing_test_scope",
+                    "source_file": src_file,
+                    "message": (
+                        f"Subgoal '{sg_copy.id}' expects tests, but source file '{src_file}' has no corresponding test files in scope "
+                        "and no matching existing test files could be discovered on disk. "
+                        "Either add the test file to scope or set expects_tests=false if tests are exempt."
+                    ),
+                })
+
+        sg_copy.scope = scope
+        amended_subgoals.append(sg_copy)
 
     return amended_subgoals, problems
