@@ -2256,7 +2256,36 @@ def node_plan(
                 if not sg.status:
                     sg.status = "pending"
                 normalized_queue.append(sg)
-            state["plan_queue"] = normalized_queue
+
+            worktree_dir = getattr(workspace, "repo_dir", None)
+            has_scoped_files = any(getattr(sg, "scope", None) for sg in normalized_queue)
+            if has_scoped_files or worktree_dir is not None:
+                amended_subgoals, test_scope_problems = validate_subgoal_test_scope(normalized_queue, worktree_dir)
+                if test_scope_problems:
+                    prob_msgs = [p["message"] for p in test_scope_problems]
+                    last_error = "; ".join(prob_msgs)
+                    state["plan_queue"] = []
+                    state["current_subgoal"] = None
+                    state["gate_status"] = "missing_test_scope"
+                    state["status"] = "escalated"
+                    state["last_feedback"] = f"Planning failed test scope validation: {last_error}"
+                    state["trajectory"].append({
+                        "node": "plan",
+                        "event": "missing_test_scope",
+                        "error_type": "validation_failure",
+                        "error": last_error,
+                        "subgoals": [],
+                    })
+                    _safe_escalate_deadlock(
+                        gatekeeper,
+                        trajectory=state["trajectory"],
+                        triggering_tier="planning",
+                        thread_id=state.get("thread_id"),
+                    )
+                    return state
+                state["plan_queue"] = amended_subgoals
+            else:
+                state["plan_queue"] = normalized_queue
 
         if recorder and state.get("plan_queue"):
             safe_rec = recorder if isinstance(recorder, SafeRecorder) else SafeRecorder(recorder)
