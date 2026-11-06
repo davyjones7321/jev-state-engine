@@ -13,18 +13,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-PROTECTED_UNTRACKED = {
-    "session-1-v2.md",
-    "HARDENING_PLAN (1).md",
-    "hash-ticket.txt",
-}
-
-
-def is_protected_line(line: str) -> bool:
-    """Check if a porcelain line corresponds to an explicitly protected untracked file."""
-    path_part = line[3:].strip().strip('"').strip("'") if len(line) > 3 else line.strip()
-    return path_part in PROTECTED_UNTRACKED or any(path_part.endswith(p) for p in PROTECTED_UNTRACKED)
-
 
 def run_cmd(cmd, check=True, env=None):
     res = subprocess.run(cmd, capture_output=True, text=True, env=env)
@@ -43,14 +31,9 @@ def main(argv=None):
 
     # Check for dirty working tree
     status_res = run_cmd(["git", "status", "--porcelain"])
-    dirty_lines = [
-        l for l in status_res.stdout.splitlines()
-        if not is_protected_line(l)
-    ]
+    dirty_lines = [l for l in status_res.stdout.splitlines() if not l.strip().endswith("session-1-v2.md")]
     if dirty_lines:
         print("WARNING: Working tree is dirty!")
-        for dl in dirty_lines:
-            print(f"  {dl}")
         print()
 
     # 1. Branch & Commit
