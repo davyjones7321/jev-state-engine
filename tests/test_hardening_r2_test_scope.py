@@ -534,3 +534,105 @@ def test_15_no_implementation_starts_before_missing_test_scope_resolved(temp_rep
     events = [e for e in res_state.get("trajectory", []) if e.get("event") == "missing_test_scope"]
     assert len(events) >= 1
 
+
+
+def test_16_case_a_single_source_related_existing_test_accepted(temp_repo):
+    """Case A: Single source file with a related existing test in scope -> accepted."""
+    (temp_repo / "src").mkdir(parents=True, exist_ok=True)
+    (temp_repo / "tests").mkdir(parents=True, exist_ok=True)
+    (temp_repo / "src" / "calc.py").write_text("def add(a, b): return a + b\n")
+    (temp_repo / "tests" / "test_calc.py").write_text("def test_add(): pass\n")
+
+    subgoals = [
+        Subgoal(
+            id="sg-case-a",
+            description="Update calc",
+            scope=["src/calc.py", "tests/test_calc.py"],
+            expects_tests=True,
+        )
+    ]
+    amended, problems = validate_subgoal_test_scope(subgoals, temp_repo)
+    assert not problems
+    assert amended[0].scope == ["src/calc.py", "tests/test_calc.py"]
+
+
+def test_17_case_b1_single_source_unrelated_test_discovers_correct_test_on_disk(temp_repo):
+    """Case B1: Single source with unrelated test in scope -> amends scope to include correct test."""
+    (temp_repo / "src").mkdir(parents=True, exist_ok=True)
+    (temp_repo / "tests").mkdir(parents=True, exist_ok=True)
+    (temp_repo / "src" / "calc.py").write_text("def add(a, b): return a + b\n")
+    (temp_repo / "tests" / "test_calc.py").write_text("def test_add(): pass\n")
+    (temp_repo / "tests" / "test_auth.py").write_text("def test_auth(): pass\n")
+
+    # Scope only contains src/calc.py and unrelated tests/test_auth.py
+    subgoals = [
+        Subgoal(
+            id="sg-case-b1",
+            description="Update calc",
+            scope=["src/calc.py", "tests/test_auth.py"],
+            expects_tests=True,
+        )
+    ]
+    amended, problems = validate_subgoal_test_scope(subgoals, temp_repo)
+    assert not problems
+    # tests/test_calc.py must be discovered and added
+    assert "tests/test_calc.py" in amended[0].scope
+
+
+def test_18_case_b2_single_source_unrelated_test_reports_missing_test_scope_when_none_on_disk(temp_repo):
+    """Case B2: Single source with unrelated test and no matching test on disk -> missing_test_scope."""
+    (temp_repo / "src").mkdir(parents=True, exist_ok=True)
+    (temp_repo / "tests").mkdir(parents=True, exist_ok=True)
+    (temp_repo / "src" / "calc.py").write_text("def add(a, b): return a + b\n")
+    (temp_repo / "tests" / "test_auth.py").write_text("def test_auth(): pass\n")
+    # Note: no test_calc.py on disk
+
+    subgoals = [
+        Subgoal(
+            id="sg-case-b2",
+            description="Update calc",
+            scope=["src/calc.py", "tests/test_auth.py"],
+            expects_tests=True,
+        )
+    ]
+    amended, problems = validate_subgoal_test_scope(subgoals, temp_repo)
+    assert len(problems) >= 1
+    assert any(p["type"] == "missing_test_scope" for p in problems)
+
+
+def test_19_case_c_single_source_declared_new_test_preserved(temp_repo):
+    """Case C: Single source file with an explicitly declared new test file -> preserved."""
+    subgoals = [
+        Subgoal(
+            id="sg-case-c",
+            description="Add payment gateway",
+            scope=["src/payment.py", "tests/test_payment.py"],
+            expects_tests=True,
+        )
+    ]
+    amended, problems = validate_subgoal_test_scope(subgoals, temp_repo)
+    assert not problems
+    assert "tests/test_payment.py" in amended[0].scope
+
+
+def test_20_case_d_multiple_sources_unrelated_test_validated_per_source(temp_repo):
+    """Case D: Multiple source files with unrelated test in scope -> validated independently."""
+    (temp_repo / "src").mkdir(parents=True, exist_ok=True)
+    (temp_repo / "tests").mkdir(parents=True, exist_ok=True)
+    (temp_repo / "src" / "a.py").write_text("def a(): pass\n")
+    (temp_repo / "src" / "b.py").write_text("def b(): pass\n")
+    (temp_repo / "tests" / "test_a.py").write_text("def test_a(): pass\n")
+    (temp_repo / "tests" / "test_unrelated.py").write_text("def test_unrelated(): pass\n")
+
+    # a has test_a, but b has only test_unrelated and no test_b on disk
+    subgoals = [
+        Subgoal(
+            id="sg-case-d",
+            description="Update a and b",
+            scope=["src/a.py", "src/b.py", "tests/test_a.py", "tests/test_unrelated.py"],
+            expects_tests=True,
+        )
+    ]
+    amended, problems = validate_subgoal_test_scope(subgoals, temp_repo)
+    assert len(problems) >= 1
+    assert any(p["type"] == "missing_test_scope" and p.get("source_file") == "src/b.py" for p in problems)

@@ -320,11 +320,6 @@ def validate_subgoal_test_scope(
         ]
         target_sources = code_sources if code_sources else source_files_in_scope
 
-        # If single source file and at least one test file in scope, they correspond
-        if len(target_sources) == 1 and len(test_files_in_scope) >= 1:
-            amended_subgoals.append(sg_copy)
-            continue
-
         # Validate every source file independently
         for src_file in target_sources:
             # Check if this source file is already covered by a matching test in scope
