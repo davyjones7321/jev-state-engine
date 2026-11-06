@@ -13,6 +13,18 @@ import subprocess
 import sys
 from pathlib import Path
 
+PROTECTED_UNTRACKED = {
+    "session-1-v2.md",
+    "HARDENING_PLAN (1).md",
+    "hash-ticket.txt",
+}
+
+
+def is_protected_line(line: str) -> bool:
+    """Check if a porcelain line corresponds to an explicitly protected untracked file."""
+    path_part = line[3:].strip().strip('"').strip("'") if len(line) > 3 else line.strip()
+    return path_part in PROTECTED_UNTRACKED or any(path_part.endswith(p) for p in PROTECTED_UNTRACKED)
+
 
 def run_cmd(cmd, check=True, env=None):
     res = subprocess.run(cmd, capture_output=True, text=True, env=env)
@@ -21,17 +33,24 @@ def run_cmd(cmd, check=True, env=None):
     return res
 
 
-def main():
-    base_ref = sys.argv[1] if len(sys.argv) > 1 else "HEAD~1"
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv
+    base_ref = argv[1] if len(argv) > 1 else "HEAD~1"
     repo_root = Path(__file__).resolve().parent.parent
 
     print(f"=== Verification Report for base: {base_ref} ===")
 
     # Check for dirty working tree
     status_res = run_cmd(["git", "status", "--porcelain"])
-    dirty_lines = [l for l in status_res.stdout.splitlines() if not l.strip().endswith("session-1-v2.md")]
+    dirty_lines = [
+        l for l in status_res.stdout.splitlines()
+        if not is_protected_line(l)
+    ]
     if dirty_lines:
         print("WARNING: Working tree is dirty!")
+        for dl in dirty_lines:
+            print(f"  {dl}")
         print()
 
     # 1. Branch & Commit
@@ -125,10 +144,25 @@ def main():
     )
     lines = [l for l in pytest_res.stdout.splitlines() if l.strip()]
     if lines:
+        if pytest_res.returncode != 0:
+            print("--- Pytest Failure Diagnostics ---")
+            for line in lines:
+                if any(kw in line for kw in ("FAIL", "FAILED", "ERROR", "short test summary")):
+                    print(line)
+            print("--- Summary Lines ---")
         for l in lines[-12:]:
             print(l)
     else:
         print(pytest_res.stderr.strip() or "(no pytest output)")
+    print()
+
+    # Final status banner and returncode enforcement
+    if pytest_res.returncode != 0:
+        print(f"=== VERIFICATION FAILED (pytest exited with code {pytest_res.returncode}) ===")
+        sys.exit(pytest_res.returncode)
+    else:
+        print("=== VERIFICATION PASSED ===")
+        sys.exit(0)
 
 
 if __name__ == "__main__":
