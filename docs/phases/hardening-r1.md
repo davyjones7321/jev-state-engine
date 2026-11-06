@@ -193,3 +193,14 @@ Following owner review, the execution cache and phase identity architecture was 
 
 All 12 tests in `tests/test_hardening_r1_retry_identity.py` pass cleanly (12 passed in 193.23s).
 
+
+
+---
+
+## 8. Final Audit Correction (Exact Duplicate Passing Attempt Deduplication)
+
+### Defect Identified During Final Security & Correctness Audit
+- **Defect**: In `Workspace.evaluate_tests` (and `_evaluate_tests_internal`), checking `cand_runs >= 2` before looking up `_attempt_result_cache` prevented exact duplicate requests from being deduplicated when an attempt completed successfully on its initial run (`cand_runs == 1`). Consequently, duplicate requests for passing attempts bypassed the cache and accidentally executed a redundant test subprocess.
+- **Correction Applied**: Removed `cand_runs >= 2` requirement from the `_attempt_result_cache` check in `evaluate_tests` and `_evaluate_tests_internal`. Completed attempt results cached in `_attempt_result_cache` now return immediately with 0 process launches regardless of whether candidate run count was 1 (passing initial run) or 2 (flaky rerun).
+- **Regression Test Added**: `test_13_exact_duplicate_request_for_passing_attempt_launches_no_process` in `tests/test_hardening_r1_retry_identity.py`.
+- **Result**: All 13 tests in `tests/test_hardening_r1_retry_identity.py` and all 5 tests in `tests/test_hardening_r1_engine_attempt.py` pass (18 passed in total).
