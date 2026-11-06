@@ -199,3 +199,90 @@ Following these adjustments, `pytest tests/test_plan.py` executes **39 passed in
 - **Exit Code**: `0`
 - **Failures**: `0`
 
+---
+
+## 8. Final Phase Verification (`scripts/verify_phase.py origin/master`)
+
+```text
+=== Verification Report for base: origin/master ===
+WARNING: Working tree is dirty!
+
+Branch: hardening-run-a
+Commit: c6f451549151050e45e4e2cb00897cea852732b9
+
+--- Diff stat vs origin/master ---
+docs/phases/hardening-r1.md               | 195 +++++++++++
+ docs/phases/hardening-r2.md               | 201 +++++++++++
+ src/jev/engine.py                         |  47 ++-
+ src/jev/models.py                         |   1 +
+ src/jev/retry_identity.py                 |  67 ++++
+ src/jev/test_scope.py                     | 370 +++++++++++++++++++++
+ src/jev/workspace.py                      | 178 +++++++++-
+ tests/test_hardening_r1_retry_identity.py | 372 +++++++++++++++++++++
+ tests/test_hardening_r2_test_scope.py     | 536 ++++++++++++++++++++++++++++++
+ tests/test_plan.py                        |  66 ++--
+ 10 files changed, 1997 insertions(+), 36 deletions(-)
+
+--- Test Changes ---
+Added tests:
+  + test_1_original_execution_launches_one_process_and_records_it
+  + test_2_flaky_rerun_launches_second_process_with_distinct_phase
+  + test_3_engine_retry_1_after_failing_attempt_launches_at_least_1_process
+  + test_4_engine_retry_2_launches_at_least_1_process_sequence_gives_fail_fail_pass
+  + test_5_two_different_subgoals_never_share_counters
+  + test_6_two_ticket_runs_never_share_counters
+  + test_7_runner_raises_exception_recorded_and_next_retry_runs
+  + test_8_timeout_recorded_as_timeout_and_next_retry_runs
+  + test_9_exact_duplicate_request_returns_recorded_result_and_no_process_and_not_tooling_error
+  + test_10_legitimate_retry_identical_test_command_and_subgoal_still_launches
+  + test_11_one_attempt_never_exceeds_two_executions
+  + test_12_identity_never_silently_falls_back_to_attempt_1
+  + test_1_exact_test_scope_added_for_subgoal
+  + test_2_unrelated_test_files_never_added
+  + test_3_planner_names_new_test_file_keeps_it
+  + test_4_missing_test_scope_escalates_before_implementation
+  + test_5_scope_entries_as_directories_or_globs_rejected
+  + test_6_ambiguous_and_many_candidates_never_silently_added
+  + test_7_expects_tests_false_accepted_with_trajectory_warning
+  + test_8_multi_ecosystem_naming_conventions
+  + test_9_worker_cannot_write_outside_amended_scope
+  + test_10_two_source_files_one_test_declared_discovers_second_test
+  + test_11_two_source_files_both_tests_declared
+  + test_12_single_source_file_explicitly_declared_new_test_preserved
+  + test_13_multiple_source_files_ambiguous_test_candidate_rejected
+  + test_14_source_file_with_no_discoverable_test_reports_missing_test_scope
+  + test_15_no_implementation_starts_before_missing_test_scope_resolved
+
+--- Collected Test Counts ---
+  tests/test_hardening_r1_retry_identity.py: 12 tests collected in 0.87s
+  tests/test_hardening_r2_test_scope.py: 15 tests collected in 0.88s
+  tests/test_plan.py: 39 tests collected in 2.02s
+
+--- Grep Checks ---
+Pattern 'git add -A' in src/jev/:
+  None found (clean)
+Pattern 'run_baseline_tests(' in src/jev/engine.py:
+  None found in engine.py (clean)
+Occurrences of 'FULL_SUITE_PASSED' in workspace.py and engine.py:
+  src/jev/engine.py:5150:                verify_classification = "FULL_SUITE_PASSED"
+  src/jev/workspace.py:2509:                    "outcome": TestOutcome.FULL_SUITE_PASSED.value,
+  src/jev/workspace.py:5725:                        test_classification = TestOutcome.FULL_SUITE_PASSED.value
+Occurrences of 'worktree_dir == self.repo_dir' in workspace.py (guard check):
+  src/jev/workspace.py:1722:        if self.worktree_dir == self.repo_dir:
+  src/jev/workspace.py:1759:        if self.worktree_dir == self.repo_dir:
+
+--- Pytest Offline Suite Summary ---
+SKIPPED [1] tests\test_runner_fixtures.py:361: gradle not found
+SKIPPED [1] tests\test_runner_fixtures.py:361: dotnet not found
+SKIPPED [1] tests\test_runner_fixtures.py:361: ctest not found
+SKIPPED [1] tests\test_runner_fixtures.py:361: ruby not found
+SKIPPED [1] tests\test_runner_fixtures.py:361: php not found
+SKIPPED [1] tests\test_runner_fixtures.py:325: Profile 'swiftpm-test' not supported on win32 (platforms: ['linux', 'darwin'])
+SKIPPED [1] tests\test_runner_fixtures.py:361: mix not found
+SKIPPED [1] tests\test_runner_fixtures.py:325: Profile 'xcode-test' not supported on win32 (platforms: ['darwin'])
+SKIPPED [1] tests\test_runner_fixtures.py:361: terraform not found
+SKIPPED [1] tests\test_runner_fixtures.py:361: ansible-lint not found
+SKIPPED [1] tests\test_runner_fixtures.py:361: helm not found
+1 failed, 1296 passed, 42 skipped, 2 deselected, 2 warnings in 2132.19s (0:35:32)
+```
+
