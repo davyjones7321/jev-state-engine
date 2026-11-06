@@ -2967,7 +2967,8 @@ class Workspace:
             self._candidate_run_counts.get(legacy_attempt_key, 0),
         )
         if (
-            hasattr(self, "_attempt_result_cache")
+            cand_runs >= 2
+            and hasattr(self, "_attempt_result_cache")
             and (attempt_key in self._attempt_result_cache or legacy_attempt_key in self._attempt_result_cache)
         ):
             cached_data = self._attempt_result_cache.get(attempt_key) or self._attempt_result_cache.get(legacy_attempt_key)
@@ -3275,19 +3276,16 @@ class Workspace:
             self._candidate_run_counts.get(attempt_key, 0),
             self._candidate_run_counts.get(legacy_attempt_key, 0),
         )
-        if (
-            hasattr(self, "_attempt_result_cache")
-            and (attempt_key in self._attempt_result_cache or legacy_attempt_key in self._attempt_result_cache)
-        ):
-            cached_data = self._attempt_result_cache.get(attempt_key) or self._attempt_result_cache.get(legacy_attempt_key)
-            cached_ev, cached_test_run, cached_base_run = cached_data
-            if cached_test_run is not None:
-                self.last_test_run = dict(cached_test_run)
-            if cached_base_run is not None:
-                self.last_base_run = dict(cached_base_run)
-            self._emit_event("retry_skipped_exact_duplicate", subgoal_id=subgoal_id, attempt=attempt)
-            return cached_ev
         if cand_runs >= 2:
+            if hasattr(self, "_attempt_result_cache") and (attempt_key in self._attempt_result_cache or legacy_attempt_key in self._attempt_result_cache):
+                cached_data = self._attempt_result_cache.get(attempt_key) or self._attempt_result_cache.get(legacy_attempt_key)
+                cached_ev, cached_test_run, cached_base_run = cached_data
+                if cached_test_run is not None:
+                    self.last_test_run = dict(cached_test_run)
+                if cached_base_run is not None:
+                    self.last_base_run = dict(cached_base_run)
+                self._emit_event("retry_skipped_exact_duplicate", subgoal_id=subgoal_id, attempt=attempt)
+                return cached_ev
             return MechanicalEvidence(
                 mech_status=MechStatus.UNMEASURED,
                 reason=MechReason.TOOLING_ERROR,

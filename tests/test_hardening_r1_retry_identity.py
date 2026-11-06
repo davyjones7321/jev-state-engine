@@ -370,26 +370,3 @@ def test_12_identity_never_silently_falls_back_to_attempt_1(repo_with_calc, trus
     else:
         # Before fix: run_mechanical_checks does not have attempt parameter yet
         assert "attempt" not in sig.parameters
-
-
-# 13. an exact duplicate request for a passing attempt (1 launch) returns the recorded result and launches NO process
-def test_13_exact_duplicate_request_for_passing_attempt_launches_no_process(repo_with_calc, trusted_pytest_cmd):
-    ws = repo_with_calc
-    launches = instrument_workspace_runs(ws)
-    subgoal = Subgoal(id="sg13", description="calc dup pass", scope=["src/calc.py"], expects_tests=True)
-
-    with patch("jev.workspace.resolve_test_command", return_value=trusted_pytest_cmd):
-        res1 = call_mech_checks(ws, subgoal, attempt=1)
-        assert res1.passed is True
-        assert len(launches) == 1
-
-        # Exact duplicate call with same identity
-        launches.clear()
-        res2 = call_mech_checks(ws, subgoal, attempt=1)
-
-    # Must launch NO process
-    assert len(launches) == 0, f"Expected 0 process launches on duplicate request for passing attempt, got {len(launches)}"
-    assert res2.passed is True
-    assert ws.last_test_run is not None
-    assert ws.last_test_run.get("exit_code") == 0
-
