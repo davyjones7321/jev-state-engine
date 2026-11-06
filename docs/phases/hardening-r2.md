@@ -126,12 +126,10 @@ tests\test_hardening_r2_test_scope.py .........                          [100%]
 
 ## 5. Unrequested Changes
 
-- None. Only the following files were modified or created:
-  - `src/jev/test_scope.py` (new)
-  - `src/jev/models.py` (added optional `no_tests_reason` on `Subgoal`)
-  - `src/jev/engine.py` (prompt instruction, validator call, retry/escalate logic, trajectory events)
-  - `tests/test_hardening_r2_test_scope.py` (new test suite)
-  - `docs/phases/hardening-r2.md` (this report)
+The following changes were made outside the original strictly minimal scope:
+- `scripts/verify_phase.py`: Exit-code enforcement (captures `pytest_res.returncode` and exits with non-zero exit code on pytest test failures, with failure diagnostic reporting and status banner; the temporary untracked allowlist was removed in Step 1 to preserve the original dirty-tree rule).
+- `tests/test_verify_phase.py`: New focused unit test suite asserting verifier exit code enforcement (exit 0 on success, exit non-zero on failure) and dirty-tree reporting behavior.
+- `tests/test_plan.py`: 12 test fixtures updated under explicit owner authorization (Global Rule 5 exception) to declare matching test paths in scope alongside source files and align investigation notes for grounding. No assertions were weakened or removed.
 
 ---
 
@@ -403,3 +401,19 @@ SKIPPED [1] tests\test_runner_fixtures.py:361: helm not found
 
 === VERIFICATION PASSED ===
 ```
+
+
+---
+
+## 10. Correction Note (Run A Closeout)
+
+### Verification and Documentation Corrections:
+1. **Verifier Script (`scripts/verify_phase.py`)**:
+   - The untracked file allowlist (`PROTECTED_UNTRACKED`, `is_protected_line()`) was removed in Step 1, restoring the verifier's original dirty-tree rule: only `session-1-v2.md` is ignored from dirty status. Pytest return-code enforcement, failure diagnostics, and status banners remain active.
+   - `tests/test_verify_phase.py` was updated to assert that `session-1-v2.md` alone is not reported dirty, any other untracked file triggers a dirty-tree warning without failing the script, and failing test runs exit with a non-zero exit code.
+2. **Attempt Derivation Unit Test (`tests/test_hardening_r1_engine_attempt.py`)**:
+   - Added unit test suite verifying attempt derivation inside `node_gate` with a mocked workspace across 4 sequences (`FAIL,FAIL,FAIL`, `UNMEASURED x3`, `FAIL,UNMEASURED,FAIL`, `UNMEASURED,FAIL,UNMEASURED`), asserting attempt kwargs `[1, 2, 3]`, as well as verifying that duplicate state calls execute without silent skipping.
+3. **Repository Cleanliness**:
+   - The untracked file `HARDENING_PLAN (1).md` was moved out of the repository directory to `..\HARDENING_PLAN (1).md` (not deleted, not staged, preserved intact), ensuring the working tree is clean under the restored dirty-tree rule.
+4. **Full History Preserved**:
+   - All previous commits and reports remain intact in Git history.
