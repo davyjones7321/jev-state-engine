@@ -22,7 +22,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 yaml = importlib.import_module("yaml")
 
@@ -157,11 +157,30 @@ def compute_proposal_identity_hash(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+
+PROPOSAL_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_\-]+$")
+
+
+def validate_proposal_id(val: str) -> str:
+    """Validates that proposal id contains only alphanumeric, hyphen, and underscore characters and no path traversal."""
+    if not isinstance(val, str) or not val:
+        raise ValueError("Proposal id must be a non-empty string.")
+    if ".." in val or "/" in val or "\\" in val or "\x00" in val:
+        raise ValueError(f"Proposal id contains invalid path traversal characters: '{val}'")
+    if not PROPOSAL_ID_PATTERN.match(val):
+        raise ValueError(f"Proposal id contains invalid characters: '{val}'. Only alphanumeric, '-', and '_' are allowed.")
+    return val
+
 class Proposal(BaseModel):
     """Schema for a test command proposal generated for unknown ecosystems."""
     model_config = ConfigDict(extra="ignore")
 
     id: str
+
+    @field_validator("id")
+    @classmethod
+    def check_id_format(cls, v: str) -> str:
+        return validate_proposal_id(v)
     repo_id: str
     exact_argv: List[str]
     cwd: str = "."
@@ -254,8 +273,12 @@ def save_proposal(
         recipe_text=proposal.recipe_text,
     )
 
-    pdir = get_proposals_dir(repo_dir)
-    target = pdir / f"{proposal.id}.json"
+    validate_proposal_id(proposal.id)
+    pdir = get_proposals_dir(repo_dir).resolve()
+    clean_id = proposal.id.removesuffix(".json")
+    target = (pdir / f"{clean_id}.json").resolve()
+    if target.parent != pdir:
+        raise ValueError(f"Proposal id '{proposal.id}' escapes proposals directory.")
     target.write_text(proposal.model_dump_json(indent=2), encoding="utf-8")
     return target
 

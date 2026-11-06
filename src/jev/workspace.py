@@ -1470,6 +1470,11 @@ class Workspace:
 
     ALLOWED_READ_TOOLS = {"cat", "head", "tail", "git"}
     ALLOWED_READ_GIT_SUBCOMMANDS = {"status", "grep", "log", "diff", "show", "branch", "rev-parse"}
+    FORBIDDEN_GIT_OPTIONS = {
+        "-c", "-C", "--config", "--git-dir", "--work-tree", "--exec-path",
+        "--ext-diff", "--textconv", "--no-index", "--paginate",
+        "--open-files-in-pager",
+    }
 
     def run_read_tool(self, cmd: str, args: Optional[List[str]] = None) -> str:
         """Executes read-only CLI commands in worktree_dir and returns stdout or stderr."""
@@ -1478,57 +1483,158 @@ class Workspace:
 
         args_list = args or []
 
+        # ------------------------------------------------------------------
+        # 1. Strict Git Policy
+        # ------------------------------------------------------------------
         if cmd == "git":
-            subcmd = None
-            i = 0
-            while i < len(args_list):
-                arg = args_list[i]
-                if arg in ("-C", "-c"):
-                    i += 2
-                    continue
-                if arg.startswith("-"):
-                    i += 1
-                    continue
-                subcmd = arg.lower()
-                break
+            if not args_list:
+                return "Error: Access denied: git invocation requires a subcommand."
 
-            if not subcmd or subcmd not in self.ALLOWED_READ_GIT_SUBCOMMANDS:
-                return f"Error: Access denied: 'git {subcmd or ""}' is not an authorized read-only git command."
+            subcmd = args_list[0]
+            if subcmd.startswith("-"):
+                return f"Error: Access denied: global git options like '{subcmd}' are not permitted."
 
+            if subcmd.lower() not in self.ALLOWED_READ_GIT_SUBCOMMANDS:
+                return f"Error: Access denied: 'git {subcmd}' is not an authorized read-only git command."
+
+            # Inspect all remaining arguments
+            for arg in args_list[1:]:
+                # Check forbidden dangerous options
+                if arg in self.FORBIDDEN_GIT_OPTIONS or any(
+                    arg.startswith(f"{opt}=") or (arg.startswith(opt) and len(opt) > 2)
+                    for opt in ("-c", "-C", "--config", "--git-dir", "--work-tree", "--exec-path", "--output", "--exec")
+                ) or arg.startswith("-c") or arg.startswith("-C"):
+                    return f"Error: Access denied: dangerous git option '{arg}' is not permitted."
+                if arg in ("--ext-diff", "--textconv", "--no-index", "--paginate", "--open-files-in-pager"):
+                    return f"Error: Access denied: dangerous git option '{arg}' is not permitted."
+
+                # Check path traversal in non-flags or paths after --
+                norm_arg = arg.replace("\\", "/").strip()
+                if not arg.startswith("-"):
+                    parts = norm_arg.split("/")
+                    if ".." in parts or norm_arg == ".." or norm_arg.startswith("../") or norm_arg.startswith("/") or re.match(r"^[a-zA-Z]:", arg):
+                        return f"Error: Access denied: outside-workspace path '{arg}' is not allowed in git command."
+                    if is_secret_path(arg):
+                        return f"git: {arg}: Access denied to protected secret file: {arg}"
+
+            safe_git_cmd = ["git", "--no-pager", subcmd]
+            if subcmd.lower() in ("diff", "log"):
+                safe_git_cmd.append("--no-ext-diff")
+                safe_git_cmd.append("--no-textconv")
+            safe_git_cmd.extend(args_list[1:])
+
+            git_env = dict(os.environ)
+            git_env["GIT_PAGER"] = "cat"
+            git_env["PAGER"] = "cat"
+            git_env["GIT_EXTERNAL_DIFF"] = ""
+            git_env["GIT_DIFF_EXTERNAL"] = ""
+
+            try:
+                res = subprocess.run(
+                    safe_git_cmd,
+                    cwd=self.worktree_dir,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    env=git_env,
+                )
+                return res.stdout if res.returncode == 0 else res.stderr
+            except FileNotFoundError:
+                return "Command not found: git"
+
+        # ------------------------------------------------------------------
+        # 2. File Reading Commands: cat, head, tail
+        # ------------------------------------------------------------------
         for arg in args_list:
             if not arg.startswith("-") and is_secret_path(arg):
                 return f"{cmd}: {arg}: Access denied to protected secret file: {arg}"
-        full_cmd = [cmd] + args_list
 
-        resolved_target: Optional[Path] = None
-        # Enforce path containment on file reading commands (e.g. cat) across all platforms
-        if cmd == "cat" and args_list:
-            resolved_args: List[str] = []
-            for arg in args_list:
-                if not arg.startswith("-"):
+        resolved_args: List[str] = []
+        file_operands: List[Tuple[str, Path]] = []
+        skip_next = False
+
+        for arg in args_list:
+            if skip_next:
+                skip_next = False
+                resolved_args.append(arg)
+                continue
+
+            if arg in ("-n", "-c", "--lines", "--bytes"):
+                skip_next = True
+                resolved_args.append(arg)
+                continue
+
+            if arg.startswith("-"):
+                resolved_args.append(arg)
+                continue
+
+            # It is a file operand
+            try:
+                resolved_target = self._resolve_for_read(arg)
+                file_operands.append((arg, resolved_target))
+                resolved_args.append(str(resolved_target))
+            except (ValueError, PermissionError) as e:
+                if is_secret_path(arg):
+                    return f"{cmd}: {arg}: Access denied to protected secret file: {arg}"
+                return f"{cmd}: {arg}: Access denied outside workspace: {e}"
+
+        def _execute_fallback(c: str, target: Path, original_arg: str) -> str:
+            if target.is_dir():
+                return f"{c}: {original_arg}: Is a directory"
+            if not target.exists() or not target.is_file():
+                return f"{c}: {original_arg}: No such file or directory"
+            try:
+                text_content = target.read_text(encoding="utf-8", errors="replace")
+            except Exception as exc:
+                return str(exc)
+
+            if c == "cat":
+                return _cap_read_text(text_content)
+
+            lines_count = 10
+            i = 0
+            while i < len(args_list):
+                a = args_list[i]
+                if a in ("-n", "--lines") and i + 1 < len(args_list):
                     try:
-                        resolved_target = self._resolve_for_read(arg)
-                        resolved_args.append(str(resolved_target))
-                    except (ValueError, PermissionError) as e:
-                        if is_secret_path(arg):
-                            return f"cat: {arg}: Access denied to protected secret file: {arg}"
-                        return f"cat: {arg}: Access denied outside workspace: {e}"
-                else:
-                    resolved_args.append(arg)
-
-            if not shutil.which("cat"):
-                target = resolved_target if resolved_target is not None else (self.worktree_dir / args_list[0])
-                if target.is_dir():
-                    return f"cat: {args_list[0]}: Is a directory"
-                if target.exists() and target.is_file():
+                        lines_count = int(args_list[i + 1])
+                    except ValueError:
+                        pass
+                    i += 2
+                    continue
+                if a.startswith("-n") and len(a) > 2:
                     try:
-                        return _cap_read_text(target.read_text(encoding="utf-8", errors="replace"))
-                    except Exception as e:
-                        return str(e)
-                return f"cat: {args_list[0]}: No such file or directory"
+                        lines_count = int(a[2:])
+                    except ValueError:
+                        pass
+                elif a.startswith("--lines="):
+                    try:
+                        lines_count = int(a.split("=", 1)[1])
+                    except ValueError:
+                        pass
+                elif re.match(r"^-\d+$", a):
+                    try:
+                        lines_count = int(a[1:])
+                    except ValueError:
+                        pass
+                i += 1
 
-            full_cmd = [cmd] + resolved_args
+            all_lines = text_content.splitlines(keepends=True)
+            if c == "head":
+                selected = all_lines[:lines_count]
+            else:
+                selected = all_lines[-lines_count:] if lines_count > 0 else []
+            return "".join(selected)
 
+        # If executable is not on PATH, run built-in fallback
+        if not shutil.which(cmd):
+            if file_operands:
+                orig_name, tgt_path = file_operands[0]
+                return _execute_fallback(cmd, tgt_path, orig_name)
+            return f"Command not found: {cmd}"
+
+        full_cmd = [cmd] + resolved_args
         try:
             res = subprocess.run(
                 full_cmd,
@@ -1540,18 +1646,10 @@ class Workspace:
             )
             out = res.stdout if res.returncode == 0 else res.stderr
             return _cap_read_text(out) if cmd == "cat" else out
-
         except FileNotFoundError:
-            if cmd == "cat" and args_list:
-                target = resolved_target if resolved_target is not None else (self.worktree_dir / args_list[0])
-                if target.is_dir():
-                    return f"cat: {args_list[0]}: Is a directory"
-                if target.exists() and target.is_file():
-                    try:
-                        return _cap_read_text(target.read_text(encoding="utf-8", errors="replace"))
-                    except Exception as e:
-                        return str(e)
-                return f"cat: {args_list[0]}: No such file or directory"
+            if file_operands:
+                orig_name, tgt_path = file_operands[0]
+                return _execute_fallback(cmd, tgt_path, orig_name)
             return f"Command not found: {cmd}"
 
     def stage_file_mutation(self, path: Union[str, Path], content: str) -> None:
