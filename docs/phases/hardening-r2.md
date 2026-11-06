@@ -417,3 +417,49 @@ SKIPPED [1] tests\test_runner_fixtures.py:361: helm not found
    - The untracked file `HARDENING_PLAN (1).md` was moved out of the repository directory to `..\HARDENING_PLAN (1).md` (not deleted, not staged, preserved intact), ensuring the working tree is clean under the restored dirty-tree rule.
 4. **Full History Preserved**:
    - All previous commits and reports remain intact in Git history.
+
+
+---
+
+## 11. Run B Independent Audit and Hardening (Single-Pass Sign-Off)
+
+**Working Branch**: `hardening-run-b`  
+**Baseline**: `origin/master` (`177b11a12900c884af8dc23f816b26a3e323a205`)  
+**Scope**: Mechanical test scope validation in planning, monorepo isolation, path traversal safety, vendor directory exclusion, and worker boundary enforcement.
+
+### 1. Defect Findings and Hardening Fixes
+
+1. **Area A: `llm=None` Planning Path Validation Bypass**
+   - *Issue*: `node_plan(llm=None)` normalized pre-populated plans and returned immediately without calling `validate_subgoal_test_scope`, allowing subgoals with missing or invalid test scopes to enter `node_implement`.
+   - *Fix*: In `src/jev/engine.py`, added mechanical `validate_subgoal_test_scope` execution for pre-populated subgoals under `llm=None`. If test scope problems are found, `gate_status` is set to `"missing_test_scope"`, `status` is set to `"escalated"`, `_safe_escalate_deadlock` is triggered, and `plan_queue` is cleared. If valid, discovered test files are amended to the subgoal scope.
+
+2. **Area B: Monorepo Package Isolation and False Matches**
+   - *Issue*: `matches_test_file` only matched base file stems, ignoring directory and package boundaries. A test in `packages/pkg_b/tests/test_client.py` would falsely satisfy a source file in `packages/pkg_a/src/client.py`. In addition, having tests with the same name across separate packages would trigger false ambiguity errors.
+   - *Fix*: Added `_is_compatible_package_path` in `src/jev/test_scope.py` to verify that test files share the common package root with the target source file. Cross-package test matches are rejected, and package-local tests are discovered unambiguously.
+
+3. **Area C: Scope Path Safety (Directory Traversal and Absolute Paths)**
+   - *Issue*: `is_directory_or_glob` did not check for directory traversal segments (`..`), leading root slashes (`/`, `\`), or Windows drive letters (`C:`), allowing out-of-bounds paths to pass scope validation.
+   - *Fix*: Updated `is_directory_or_glob` and `validate_subgoal_test_scope` in `src/jev/test_scope.py` to identify traversal and absolute paths, classifying them as `invalid_scope_item` and rejecting the plan before execution.
+
+4. **Area D: Vendored and Dependency Directory Exclusion**
+   - *Issue*: `discover_related_tests` used unbounded `rglob("*")`, descending into `.git`, `node_modules`, `.venv`, `venv`, `build`, and `dist`, erroneously discovering vendored/dependency test files.
+   - *Fix*: Replaced `rglob("*")` with `os.walk` pruned against `EXCLUDED_DISCOVERY_DIRS` (`.git`, `.venv`, `venv`, `node_modules`, `build`, `dist`, `target`, `__pycache__`, etc.).
+
+5. **Areas E & F: Test Classification & Worker Enforcement**
+   - Verified that multi-ecosystem test heuristics (Python, TS/JS, Go, Rust, Java/Kotlin, .NET, Ruby, PHP, Elixir) correctly identify tests, and verified that `enforce_subgoal_scope` in `src/jev/workspace.py` prevents workers from modifying files outside the amended test scope.
+
+### 2. Regression Test Suite
+- `tests/test_hardening_r2_audit_corrections.py` (new, 11 tests):
+  - `test_llm_none_plan_missing_test_scope_escalates`: PASSED
+  - `test_llm_none_plan_exact_test_discovered_and_amended`: PASSED
+  - `test_monorepo_test_in_package_b_does_not_satisfy_package_a`: PASSED
+  - `test_monorepo_single_test_cannot_satisfy_multiple_unrelated_packages`: PASSED
+  - `test_monorepo_exact_tests_in_both_packages_discovered_unambiguously`: PASSED
+  - `test_path_safety_traversal_and_absolute_paths_rejected` (5 cases): PASSED
+  - `test_vendor_directories_excluded_from_discovery`: PASSED
+
+### 3. Verification Commands and Exit Codes
+- `pytest -q tests/test_hardening_r2_audit_corrections.py`: Exit code 0 (11 passed).
+- `pytest -q tests/test_hardening_r2_test_scope.py`: Exit code 0 (20 passed).
+- `pytest -q tests/test_plan.py`: Exit code 0 (39 passed).
+- `python scripts/verify_phase.py origin/master`: Exit code 0 (1323 passed, 42 skipped, 2 deselected).
