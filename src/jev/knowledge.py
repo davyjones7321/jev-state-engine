@@ -22,7 +22,13 @@ logger = logging.getLogger(__name__)
 
 def get_knowledge_db_path(repo_key: str) -> Path:
     """Returns the default knowledge.db path for a repository key: <JEV_HOME>/repos/<repo_key>/knowledge.db."""
-    return get_jev_home() / "repos" / repo_key / "knowledge.db"
+    if not repo_key or ".." in repo_key or "/" in repo_key or "\\" in repo_key:
+        raise ValueError(f"Invalid repo_key with path traversal: '{repo_key}'")
+    repos_dir = (get_jev_home() / "repos").resolve()
+    target = (repos_dir / repo_key / "knowledge.db").resolve()
+    if target.parent.parent != repos_dir:
+        raise ValueError(f"Invalid repo_key with path traversal: '{repo_key}'")
+    return target
 
 
 def is_env_file(basename: str) -> bool:

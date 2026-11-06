@@ -262,14 +262,20 @@ def save_proposal(
 
 def load_proposal(proposal_id: str, repo_dir: Union[str, Path]) -> Optional[Proposal]:
     """Loads a proposal by id from .jev/proposals/<id>.json."""
-    pdir = get_proposals_dir(repo_dir)
+    if not proposal_id or ".." in proposal_id or "/" in proposal_id or "\\" in proposal_id:
+        return None
+    pdir = get_proposals_dir(repo_dir).resolve()
     clean_id = proposal_id.removesuffix(".json")
-    path = pdir / f"{clean_id}.json"
+    path = (pdir / f"{clean_id}.json").resolve()
+    if path.parent != pdir:
+        return None
     if not path.exists():
         # Also check without prefix if user passed short hash
         matches = list(pdir.glob(f"*{clean_id}*.json"))
         if matches:
-            path = matches[0]
+            path = matches[0].resolve()
+            if path.parent != pdir:
+                return None
         else:
             return None
     try:

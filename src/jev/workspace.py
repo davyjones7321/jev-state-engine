@@ -1468,9 +1468,33 @@ class Workspace:
             except ValueError:
                 raise original_err
 
+    ALLOWED_READ_TOOLS = {"cat", "head", "tail", "git"}
+    ALLOWED_READ_GIT_SUBCOMMANDS = {"status", "grep", "log", "diff", "show", "branch", "rev-parse"}
+
     def run_read_tool(self, cmd: str, args: Optional[List[str]] = None) -> str:
         """Executes read-only CLI commands in worktree_dir and returns stdout or stderr."""
+        if cmd not in self.ALLOWED_READ_TOOLS:
+            return f"Error: Access denied: command '{cmd}' is not an authorized read-only tool."
+
         args_list = args or []
+
+        if cmd == "git":
+            subcmd = None
+            i = 0
+            while i < len(args_list):
+                arg = args_list[i]
+                if arg in ("-C", "-c"):
+                    i += 2
+                    continue
+                if arg.startswith("-"):
+                    i += 1
+                    continue
+                subcmd = arg.lower()
+                break
+
+            if not subcmd or subcmd not in self.ALLOWED_READ_GIT_SUBCOMMANDS:
+                return f"Error: Access denied: 'git {subcmd or ""}' is not an authorized read-only git command."
+
         for arg in args_list:
             if not arg.startswith("-") and is_secret_path(arg):
                 return f"{cmd}: {arg}: Access denied to protected secret file: {arg}"
@@ -1575,6 +1599,9 @@ class Workspace:
             raise PermissionError(f"Modifying protected secret path is blocked: '{path}'.")
         if is_protected_path(rel_posix):
             raise PermissionError(f"Modifying protected path is blocked: '{path}'.")
+
+        if target_path.is_symlink() or (self.worktree_dir / norm_str).is_symlink():
+            raise PermissionError(f"Modifying symlinks is blocked: '{path}'.")
 
         target_path.parent.mkdir(parents=True, exist_ok=True)
         content_bytes = content.encode("utf-8") if isinstance(content, str) else content
