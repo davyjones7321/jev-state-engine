@@ -52,7 +52,7 @@ def test_node_plan_valid_json_first_try():
     plan_data = [
         {
             "description": "Create database schema",
-            "scope": ["src/db/schema.py"],
+            "scope": ["src/db/schema.py", "tests/test_schema.py"],
             "expects_tests": True,
         },
         {
@@ -75,7 +75,7 @@ def test_node_plan_valid_json_first_try():
     assert len(result["plan_queue"]) == 2
     assert isinstance(result["plan_queue"][0], Subgoal)
     assert result["plan_queue"][0].description == "Create database schema"
-    assert result["plan_queue"][0].scope == ["src/db/schema.py"]
+    assert result["plan_queue"][0].scope == ["src/db/schema.py", "tests/test_schema.py"]
     assert result["plan_queue"][0].expects_tests is True
     assert result["plan_queue"][1].description == "Add user model API endpoints"
     assert result["plan_queue"][1].scope == ["src/api/users.py", "tests/test_users.py"]
@@ -92,7 +92,7 @@ def test_node_plan_malformed_json_retry_succeeds():
     valid_plan = [
         {
             "description": "Implement authentication handler",
-            "scope": ["src/auth.py"],
+            "scope": ["src/auth.py", "tests/test_auth.py"],
             "expects_tests": True,
         }
     ]
@@ -118,7 +118,7 @@ def test_node_plan_malformed_json_retry_succeeds():
     assert result.get("gate_status") != "planning_failed"
     assert len(result["plan_queue"]) == 1
     assert result["plan_queue"][0].description == "Implement authentication handler"
-    assert result["plan_queue"][0].scope == ["src/auth.py"]
+    assert result["plan_queue"][0].scope == ["src/auth.py", "tests/test_auth.py"]
 
 
 # 3. Malformed JSON on BOTH attempts -> hard failure path triggers
@@ -162,7 +162,7 @@ def test_node_plan_schema_violation_wrong_type_retries_and_succeeds():
     valid_plan = [
         {
             "description": "Modify settings",
-            "scope": ["settings.py"],
+            "scope": ["settings.py", "tests/test_settings.py"],
             "expects_tests": True,
         }
     ]
@@ -181,7 +181,7 @@ def test_node_plan_schema_violation_wrong_type_retries_and_succeeds():
     assert "your previous output failed validation because:" in retry_msg.lower()
 
     assert len(result["plan_queue"]) == 1
-    assert result["plan_queue"][0].scope == ["settings.py"]
+    assert result["plan_queue"][0].scope == ["settings.py", "tests/test_settings.py"]
 
 
 # 5. Valid JSON but violates Subgoal schema: missing required description
@@ -242,9 +242,9 @@ def test_node_plan_json_not_list_fails():
 
 # 8. investigation_notes from state is actually included in the prompt sent to LLM
 def test_node_plan_includes_investigation_notes_in_prompt():
-    valid_plan = [{"description": "Step 1", "scope": ["core.py"], "expects_tests": True}]
+    valid_plan = [{"description": "Step 1", "scope": ["core.py", "tests/test_core.py"], "expects_tests": True}]
     fake_llm = ScriptedChatModel([json.dumps(valid_plan)])
-    notes_content = "Discovered critical dependency in core.py on line 42."
+    notes_content = "Discovered critical dependency in core.py on line 42; tests in tests/test_core.py."
     state: State = {
         "ticket": "Fix core issue",
         "investigation_notes": notes_content,
@@ -333,7 +333,7 @@ def test_node_plan_markdown_code_fences_handled():
     plan_data = [
         {
             "description": "Markdown wrapped plan",
-            "scope": ["src/module.py"],
+            "scope": ["src/module.py", "tests/test_module.py"],
             "expects_tests": True,
         }
     ]
@@ -345,7 +345,7 @@ def test_node_plan_markdown_code_fences_handled():
 
     assert len(result["plan_queue"]) == 1
     assert result["plan_queue"][0].description == "Markdown wrapped plan"
-    assert result["plan_queue"][0].scope == ["src/module.py"]
+    assert result["plan_queue"][0].scope == ["src/module.py", "tests/test_module.py"]
 
 
 # 14. Conversational preamble and postscript surrounding code block
@@ -353,7 +353,7 @@ def test_node_plan_conversational_preamble_and_postscript():
     plan_data = [
         {
             "description": "Create api service",
-            "scope": ["src/service.py"],
+            "scope": ["src/service.py", "tests/test_service.py"],
             "expects_tests": True,
         }
     ]
@@ -372,7 +372,7 @@ def test_node_plan_conversational_preamble_and_postscript():
     assert result.get("gate_status") != "planning_failed"
     assert len(result["plan_queue"]) == 1
     assert result["plan_queue"][0].description == "Create api service"
-    assert result["plan_queue"][0].scope == ["src/service.py"]
+    assert result["plan_queue"][0].scope == ["src/service.py", "tests/test_service.py"]
 
 
 # 15. Raw JSON array with conversational text and uppercase ```JSON
@@ -400,7 +400,7 @@ def test_node_plan_raw_json_array_with_preamble():
     plan_data = [
         {
             "description": "Raw array with preamble",
-            "scope": ["src/raw.py"],
+            "scope": ["src/raw.py", "tests/test_raw.py"],
             "expects_tests": True,
         }
     ]
@@ -419,14 +419,14 @@ def test_node_plan_strict_validation_rejects_non_boolean_expects_tests():
     invalid_plan = [
         {
             "description": "Non boolean test",
-            "scope": ["src/test.py"],
+            "scope": ["src/validate.py", "tests/test_validate.py"],
             "expects_tests": "yes",  # String instead of boolean
         }
     ]
     valid_plan = [
         {
             "description": "Non boolean test",
-            "scope": ["src/test.py"],
+            "scope": ["src/validate.py", "tests/test_validate.py"],
             "expects_tests": True,
         }
     ]
@@ -477,15 +477,15 @@ def test_node_plan_clears_last_feedback_and_current_subgoal():
     valid_plan = [
         {
             "description": "Clean state plan",
-            "scope": ["src/clean.py"],
+            "scope": ["src/clean.py", "tests/test_clean.py"],
             "expects_tests": True,
         }
     ]
     fake_llm = ScriptedChatModel([json.dumps(valid_plan)])
     state: State = {
         "ticket": "Clean state ticket",
-        "investigation_notes": "Investigation discovered everything.",
-        "last_feedback": "Investigation discovered everything.",  # Leaked from node_investigate
+        "investigation_notes": "Investigation discovered src/clean.py and tests/test_clean.py.",
+        "last_feedback": "Investigation discovered src/clean.py and tests/test_clean.py.",  # Leaked from node_investigate
         "current_subgoal": Subgoal(description="Old stale subgoal", scope=["old.py"]),
         "gate_status": "passed",
         "trajectory": [],
@@ -668,6 +668,10 @@ def test_node_plan_ungrounded_scope_fails_validation_and_retries_successfully(tm
     auth_file.parent.mkdir(parents=True, exist_ok=True)
     auth_file.write_text("export function createSession() {}", encoding="utf-8")
 
+    test_file = tmp_path / "tests" / "test_auth.ts"
+    test_file.parent.mkdir(parents=True, exist_ok=True)
+    test_file.write_text("test('createSession', () => {});\n", encoding="utf-8")
+
     class TestWorkspace:
         def __init__(self, root):
             self.worktree_dir = root
@@ -684,14 +688,14 @@ def test_node_plan_ungrounded_scope_fails_validation_and_retries_successfully(tm
     grounded_plan = [
         {
             "description": "Add docstring to createSession",
-            "scope": ["src/lib/auth.ts"],
+            "scope": ["src/lib/auth.ts", "tests/test_auth.ts"],
             "expects_tests": True,
         }
     ]
     fake_llm = ScriptedChatModel([json.dumps(hallucinated_plan), json.dumps(grounded_plan)])
     state: State = {
         "ticket": "Add a docstring to one existing function in this project",
-        "investigation_notes": "Found undocumented functions: createSession in src/lib/auth.ts",
+        "investigation_notes": "Found undocumented functions: createSession in src/lib/auth.ts; tests in tests/test_auth.ts",
         "trajectory": [],
     }
 
@@ -707,7 +711,7 @@ def test_node_plan_ungrounded_scope_fails_validation_and_retries_successfully(tm
     # Plan queue is grounded after retry
     assert result.get("gate_status") != "planning_failed"
     assert len(result["plan_queue"]) == 1
-    assert result["plan_queue"][0].scope == ["src/lib/auth.ts"]
+    assert result["plan_queue"][0].scope == ["src/lib/auth.ts", "tests/test_auth.ts"]
 
 
 # 26. Ungrounded scope on both attempts escalates as planning_failed
@@ -788,6 +792,10 @@ def test_node_plan_rejects_existing_non_candidate_file_for_existing_function_tic
     auth_file.parent.mkdir(parents=True, exist_ok=True)
     auth_file.write_text("export function createSession() {}", encoding="utf-8")
 
+    test_file = tmp_path / "tests" / "test_auth.ts"
+    test_file.parent.mkdir(parents=True, exist_ok=True)
+    test_file.write_text("test('createSession', () => {});\n", encoding="utf-8")
+
     booking_file = tmp_path / "src" / "lib" / "booking.ts"
     booking_file.write_text("export function getBooking() {}", encoding="utf-8")
 
@@ -813,7 +821,7 @@ def test_node_plan_rejects_existing_non_candidate_file_for_existing_function_tic
     grounded_plan = [
         {
             "description": "Add docstring to createSession",
-            "scope": ["src/lib/auth.ts"],
+            "scope": ["src/lib/auth.ts", "tests/test_auth.ts"],
             "expects_tests": True,
         }
     ]
@@ -822,7 +830,7 @@ def test_node_plan_rejects_existing_non_candidate_file_for_existing_function_tic
         "ticket": "Add a docstring to one existing function in this project",
         "investigation_notes": (
             "Found undocumented functions: createSession/getSession/destroySession in src/lib/auth.ts, "
-            "getPaymentProvider in src/lib/payment.ts, and others in src/lib/booking.ts."
+            "getPaymentProvider in src/lib/payment.ts, and others in src/lib/booking.ts; tests in tests/test_auth.ts."
         ),
         "trajectory": [],
     }
@@ -840,7 +848,7 @@ def test_node_plan_rejects_existing_non_candidate_file_for_existing_function_tic
     # Plan queue is populated with the grounded candidate file after retry
     assert result.get("gate_status") != "planning_failed"
     assert len(result["plan_queue"]) == 1
-    assert result["plan_queue"][0].scope == ["src/lib/auth.ts"]
+    assert result["plan_queue"][0].scope == ["src/lib/auth.ts", "tests/test_auth.ts"]
 
 
 # 29. Correctly grounded plan matching investigation candidate passes on first try
@@ -848,6 +856,10 @@ def test_node_plan_accepts_valid_candidate_on_first_try(tmp_path):
     auth_file = tmp_path / "src" / "lib" / "auth.ts"
     auth_file.parent.mkdir(parents=True, exist_ok=True)
     auth_file.write_text("export function createSession() {}", encoding="utf-8")
+
+    test_file = tmp_path / "tests" / "test_auth.ts"
+    test_file.parent.mkdir(parents=True, exist_ok=True)
+    test_file.write_text("test('createSession', () => {});\n", encoding="utf-8")
 
     class TestWorkspace:
         def __init__(self, root):
@@ -858,7 +870,7 @@ def test_node_plan_accepts_valid_candidate_on_first_try(tmp_path):
     grounded_plan = [
         {
             "description": "Add docstring to createSession",
-            "scope": ["src/lib/auth.ts"],
+            "scope": ["src/lib/auth.ts", "tests/test_auth.ts"],
             "expects_tests": True,
         }
     ]
@@ -867,7 +879,7 @@ def test_node_plan_accepts_valid_candidate_on_first_try(tmp_path):
         "ticket": "Add a docstring to one existing function in this project",
         "investigation_notes": (
             "Found undocumented functions: createSession in src/lib/auth.ts, "
-            "getPaymentProvider in src/lib/payment.ts."
+            "getPaymentProvider in src/lib/payment.ts; tests in tests/test_auth.ts."
         ),
         "trajectory": [],
     }
@@ -878,7 +890,7 @@ def test_node_plan_accepts_valid_candidate_on_first_try(tmp_path):
     assert len(fake_llm.invocations) == 1
     assert result.get("gate_status") != "planning_failed"
     assert len(result["plan_queue"]) == 1
-    assert result["plan_queue"][0].scope == ["src/lib/auth.ts"]
+    assert result["plan_queue"][0].scope == ["src/lib/auth.ts", "tests/test_auth.ts"]
 
 
 # 30. Proposing non-candidate file on both attempts escalates as planning_failed

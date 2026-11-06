@@ -21,8 +21,10 @@ def run_cmd(cmd, check=True, env=None):
     return res
 
 
-def main():
-    base_ref = sys.argv[1] if len(sys.argv) > 1 else "HEAD~1"
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv
+    base_ref = argv[1] if len(argv) > 1 else "HEAD~1"
     repo_root = Path(__file__).resolve().parent.parent
 
     print(f"=== Verification Report for base: {base_ref} ===")
@@ -125,10 +127,25 @@ def main():
     )
     lines = [l for l in pytest_res.stdout.splitlines() if l.strip()]
     if lines:
+        if pytest_res.returncode != 0:
+            print("--- Pytest Failure Diagnostics ---")
+            for line in lines:
+                if any(kw in line for kw in ("FAIL", "FAILED", "ERROR", "short test summary")):
+                    print(line)
+            print("--- Summary Lines ---")
         for l in lines[-12:]:
             print(l)
     else:
         print(pytest_res.stderr.strip() or "(no pytest output)")
+    print()
+
+    # Final status banner and returncode enforcement
+    if pytest_res.returncode != 0:
+        print(f"=== VERIFICATION FAILED (pytest exited with code {pytest_res.returncode}) ===")
+        sys.exit(pytest_res.returncode)
+    else:
+        print("=== VERIFICATION PASSED ===")
+        sys.exit(0)
 
 
 if __name__ == "__main__":
