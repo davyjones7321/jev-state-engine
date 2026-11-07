@@ -14,15 +14,17 @@
 
 Phase R4 was conducted as a systematic, evidence-driven adversarial security audit and boundary hardening pass across the `jev-state-engine` codebase. Following the completion and integration of Phase R3 (commit `6626d08`), which established read-tool containment and proposal directory symlink defenses, Phase R4 investigated the unresolved filesystem TOCTOU (Time-of-Check to Time-of-Use) window explicitly documented in the R3 report, as well as critical boundary controls across repository configuration, proposal lifecycles, persistent knowledge storage, and platform-specific OS device namespaces.
 
-Through test-first adversarial analysis, Phase R4 identified and remediated **6 demonstrable vulnerability classes**:
+Through test-first adversarial analysis, Phase R4 identified and remediated **8 demonstrable vulnerability and gap classes**:
 1. **Repository Configuration Symlink Escapes (`save_repo_config` & `load_repo_config`)**: A rogue pre-existing symlink at `.jev` or `.jev/config.json` allowed repository configuration writes to escape the repository root, overwriting host files or loading untrusted configurations.
-2. **Proposal Direct Write In-Place & TOCTOU Symlink Race (`save_proposal`)**: Direct in-place writes exposed proposals to partial reads on crash/interruption and created a race window between symlink verification and write operations.
-3. **Proposal Symlink Consumption (`load_proposal` & `list_proposals`)**: Symlinked proposal JSON files pointing outside the repository were accepted and loaded without symlink checks.
-4. **Persistent Knowledge Database Symlink Redirection & Unlink (`KnowledgeStore`)**: Symlinks pointing to host SQLite databases or sensitive target files could be opened or unlinked/deleted upon corrupt database recovery.
-5. **Windows Legacy DOS Reserved Device Names (`CON`, `PRN`, `AUX`, `NUL`, `COM1-9`, `LPT1-9`)**: Windows legacy device namespaces bypassed path containment and caused severe Denial of Service (indefinite process hangs when `git add CON` was invoked waiting on console stdin).
-6. **Workspace Non-Atomic File Mutation Staging (`stage_file_mutation`)**: In-place writes during worker file mutations risked partial file states and lacked atomic replacement semantics.
+2. **Upward Traversal Symlink Bypass in Worktree Config Discovery (`load_repo_config`)**: When discovering configuration in parent worktrees or via `gitdir:` pointers, unvalidated directory symlinks at parent `.jev` or `config.json` allowed loading external configurations.
+3. **Proposal Direct Write In-Place & TOCTOU Symlink Race (`save_proposal`)**: Direct in-place writes exposed proposals to partial reads on crash/interruption and created a race window between symlink verification and write operations.
+4. **Proposal Symlink Consumption & Internal Aliasing (`load_proposal` & `list_proposals`)**: Symlinked proposal JSON files pointing outside the repository were accepted and loaded without symlink checks, and evaluating `.is_symlink()` after `.resolve()` permitted internal symlink aliases to bypass rejection.
+5. **Persistent Knowledge Database Symlink Redirection & Unlink (`KnowledgeStore`)**: Symlinks pointing to host SQLite databases or sensitive target files could be opened or unlinked/deleted upon corrupt database recovery.
+6. **Windows Legacy DOS Reserved Device Names (`CON`, `PRN`, `AUX`, `NUL`, `COM0-9`, `LPT0-9`)**: Windows legacy device namespaces bypassed path containment and caused severe Denial of Service (indefinite process hangs when `git add CON` was invoked waiting on console stdin).
+7. **Extended Windows Special Character Devices (`CONIN$`, `CONOUT$`, `CLOCK$`)**: Win32 console input/output devices bypassed standard DOS stem filters and remained accessible in worktree containment.
+8. **Workspace Non-Atomic File Mutation Staging (`stage_file_mutation`)**: In-place writes during worker file mutations risked partial file states and lacked atomic replacement semantics.
 
-All vulnerabilities were proven with failing regression tests before production fixes were implemented. The full offline test suite of **1,355 tests** passed with zero failures and zero regressions (`=== VERIFICATION PASSED ===`).
+All vulnerabilities and gaps were proven with failing regression tests before production fixes were implemented. The full offline test suite passed with zero regressions.
 
 ---
 
@@ -169,9 +171,11 @@ KnowledgeStore(sym_db, repo_key="test")
 ## 7. Production Fixes Implemented
 
 ### Fix 1: Hardening `src/jev/repo_config.py`
-- Defined `DOS_DEVICE_NAMES` and `is_dos_device_name()` to recognize Windows legacy reserved names.
+- Expanded `DOS_DEVICE_NAMES` and `is_dos_device_name()` to recognize Windows legacy reserved names (`CON`, `PRN`, `AUX`, `NUL`, `COM0-9`, `LPT0-9`) as well as Windows NT special devices (`CONIN$`, `CONOUT$`, `CLOCK$`), trailing colons (`CON:`), and stripped whitespace/dot variations.
 - Hardened `get_trust_file_path()`: Rejects `\x00` and DOS device names in `repo_id`.
-- Hardened `load_repo_config()`: Returns `None` if `.jev` or `.jev/config.json` is a symlink.
+- Hardened `load_repo_config()`:
+  - Validates `_is_safe_repo_config_candidate()` across all discovery paths (direct root, parent directory traversal, and `gitdir:` worktree discovery).
+  - Enforces that neither `.jev` nor `config.json` is a symlink, and verifies strict lexical and resolved containment within the trusted repository root.
 - Hardened `save_repo_config()`:
   - Validates that `.jev` exists as a real directory, is not a symlink, and resolves strictly within `repo_dir`.
   - Validates that `config.json` is not a symlink and resolves strictly within `resolved_jev`.
@@ -180,7 +184,10 @@ KnowledgeStore(sym_db, repo_key="test")
 ### Fix 2: Hardening `src/jev/proposals.py`
 - Hardened `save_proposal()`:
   - Replaced direct `target.write_text` with atomic replacement: writes to temporary file (`.tmp_<id>_<uuid>.json`) in proposals directory, performs a final symlink check on `target`, and executes atomic `os.replace`.
-- Hardened `load_proposal()`: Returns `None` immediately if `path.is_symlink()`.
+  - Cleans up temporary files in `finally` block on error.
+- Hardened `load_proposal()`:
+  - Validates `target_file.is_symlink()` on the filesystem entry *before* calling `.resolve()`, properly rejecting internal symlink aliases within `.jev/proposals/` as well as external symlink targets.
+  - Rejects `\x00` in proposal identifiers.
 - Hardened `list_proposals()`: Skips symlinked files (`if f.is_symlink(): continue`).
 
 ### Fix 3: Hardening `src/jev/knowledge.py`
@@ -189,7 +196,7 @@ KnowledgeStore(sym_db, repo_key="test")
 - Hardened `_init_db()` and `_connect()`: Enforces symlink rejection prior to SQLite connection and unlinking.
 
 ### Fix 4: Hardening `src/jev/workspace.py`
-- Hardened `resolve_in_worktree()`: Rejects raw and normalized paths matching Windows DOS reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1-9`, `LPT1-9`, and device stems like `con.txt`). Rejects any path component containing a DOS device name.
+- Hardened `resolve_in_worktree()`: Rejects raw and normalized paths matching Windows DOS reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `CONIN$`, `CONOUT$`, `CLOCK$`, `COM0-9`, `LPT0-9`, and device stems like `con.txt`). Rejects any path component containing a DOS device name.
 - Hardened `stage_file_mutation()`:
   - Rejects DOS device names early before any filesystem or Git interaction.
   - Implements atomic file staging via temporary file (`.tmp_stage_<uuid>`) and `os.replace()`.
@@ -198,18 +205,21 @@ KnowledgeStore(sym_db, repo_key="test")
 
 ## 8. Regression Test Suite & Test Design
 
-The test suite in `tests/test_hardening_r4_security.py` contains 11 targeted tests:
+The test suite in `tests/test_hardening_r4_security.py` contains 14 targeted tests:
 1. `test_save_repo_config_rejects_jev_symlink_to_outside`: Proves `.jev` symlink pointing outside is rejected with `PermissionError`.
 2. `test_save_repo_config_rejects_target_symlink`: Proves symlinked `config.json` is rejected and host files are untouched.
 3. `test_save_repo_config_legitimate_save_works`: Proves normal repository configuration saves succeed cleanly.
-4. `test_save_proposal_atomic_write_replacement`: Proves atomic replacement prevents partial writes on interruption.
-5. `test_load_proposal_rejects_symlink`: Proves `load_proposal` returns `None` for symlinked proposals.
-6. `test_list_proposals_omits_symlinks`: Proves `list_proposals` filters out symlinked proposals.
-7. `test_knowledge_store_rejects_symlinked_db`: Proves `KnowledgeStore` raises `PermissionError` on symlinks.
-8. `test_get_knowledge_db_path_rejects_nul_and_dos_devices`: Proves `get_knowledge_db_path` rejects `\x00` and DOS devices.
-9. `test_get_trust_file_path_rejects_nul_and_dos_devices`: Proves `get_trust_file_path` rejects `\x00` and DOS devices.
-10. `test_workspace_resolve_in_worktree_rejects_dos_device_names`: Proves `resolve_in_worktree` rejects DOS device names across cases and extensions.
-11. `test_workspace_stage_file_mutation_rejects_dos_device_names`: Proves `stage_file_mutation` blocks DOS devices without hanging Git.
+4. `test_load_repo_config_upward_search_rejects_parent_symlinks`: Proves upward traversal in worktrees rejects symlinked parent `.jev` or `config.json`.
+5. `test_load_repo_config_parent_worktree_discovery_works`: Proves legitimate parent subdirectory and `gitdir:` worktree discovery succeeds.
+6. `test_save_proposal_atomic_write_replacement`: Proves atomic replacement prevents partial writes and cleans up temporary files on error.
+7. `test_save_proposal_atomic_concurrency`: Proves concurrent readers never observe corrupted or partial proposal states during atomic replacement.
+8. `test_load_proposal_rejects_symlink`: Proves `load_proposal` rejects both internal symlink aliases and external symlink targets.
+9. `test_list_proposals_omits_symlinks`: Proves `list_proposals` filters out symlinked proposals.
+10. `test_knowledge_store_rejects_symlinked_db`: Proves `KnowledgeStore` raises `PermissionError` on symlinks.
+11. `test_get_knowledge_db_path_rejects_nul_and_dos_devices`: Proves `get_knowledge_db_path` rejects `\x00` and DOS devices.
+12. `test_get_trust_file_path_rejects_nul_and_dos_devices`: Proves `get_trust_file_path` rejects `\x00` and DOS devices.
+13. `test_workspace_resolve_in_worktree_rejects_dos_device_names`: Proves `resolve_in_worktree` rejects DOS device names including `CONIN$`, `CONOUT$`, `CLOCK$` across cases and extensions.
+14. `test_workspace_stage_file_mutation_rejects_dos_device_names`: Proves `stage_file_mutation` blocks DOS devices without hanging Git.
 
 ---
 
@@ -219,21 +229,24 @@ The test suite in `tests/test_hardening_r4_security.py` contains 11 targeted tes
 ```
 ============================= test session starts =============================
 platform win32 -- Python 3.13.12, pytest-9.1.1, pluggy-1.5.0
-collected 11 items
+collected 14 items
 
-tests/test_hardening_r4_security.py::test_save_repo_config_rejects_jev_symlink_to_outside PASSED [  9%]
-tests/test_hardening_r4_security.py::test_save_repo_config_rejects_target_symlink PASSED [ 18%]
-tests/test_hardening_r4_security.py::test_save_repo_config_legitimate_save_works PASSED [ 27%]
-tests/test_hardening_r4_security.py::test_save_proposal_atomic_write_replacement PASSED [ 36%]
-tests/test_hardening_r4_security.py::test_load_proposal_rejects_symlink PASSED [ 45%]
-tests/test_hardening_r4_security.py::test_list_proposals_omits_symlinks PASSED [ 54%]
-tests/test_hardening_r4_security.py::test_knowledge_store_rejects_symlinked_db PASSED [ 63%]
-tests/test_hardening_r4_security.py::test_get_knowledge_db_path_rejects_nul_and_dos_devices PASSED [ 72%]
-tests/test_hardening_r4_security.py::test_get_trust_file_path_rejects_nul_and_dos_devices PASSED [ 81%]
-tests/test_hardening_r4_security.py::test_workspace_resolve_in_worktree_rejects_dos_device_names PASSED [ 90%]
+tests/test_hardening_r4_security.py::test_save_repo_config_rejects_jev_symlink_to_outside PASSED [  7%]
+tests/test_hardening_r4_security.py::test_save_repo_config_rejects_target_symlink PASSED [ 14%]
+tests/test_hardening_r4_security.py::test_save_repo_config_legitimate_save_works PASSED [ 21%]
+tests/test_hardening_r4_security.py::test_load_repo_config_upward_search_rejects_parent_symlinks PASSED [ 28%]
+tests/test_hardening_r4_security.py::test_load_repo_config_parent_worktree_discovery_works PASSED [ 35%]
+tests/test_hardening_r4_security.py::test_save_proposal_atomic_write_replacement PASSED [ 42%]
+tests/test_hardening_r4_security.py::test_save_proposal_atomic_concurrency PASSED [ 50%]
+tests/test_hardening_r4_security.py::test_load_proposal_rejects_symlink PASSED [ 57%]
+tests/test_hardening_r4_security.py::test_list_proposals_omits_symlinks PASSED [ 64%]
+tests/test_hardening_r4_security.py::test_knowledge_store_rejects_symlinked_db PASSED [ 71%]
+tests/test_hardening_r4_security.py::test_get_knowledge_db_path_rejects_nul_and_dos_devices PASSED [ 78%]
+tests/test_hardening_r4_security.py::test_get_trust_file_path_rejects_nul_and_dos_devices PASSED [ 85%]
+tests/test_hardening_r4_security.py::test_workspace_resolve_in_worktree_rejects_dos_device_names PASSED [ 92%]
 tests/test_hardening_r4_security.py::test_workspace_stage_file_mutation_rejects_dos_device_names PASSED [100%]
 
-============================= 11 passed in 1.81s ==============================
+============================= 14 passed in 2.25s ==============================
 ```
 
 ### Full Phase Verification (`python scripts/verify_phase.py origin/master`)
@@ -317,18 +330,22 @@ I attest that Phase R4 of the security audit and boundary hardening has been com
 - **Commit 4**: `Block Windows legacy DOS device names in worktree containment and use atomic file staging`
 - **Commit 5**: `Add comprehensive regression test suite for Phase R4 security hardening`
 - **Commit 6**: `Document Phase R4 security verification and boundary hardening audit report`
+- **Commit 7** (`5f94d61`): `fix(security): expand DOS device name validation to include CONIN$, CONOUT$, CLOCK$, and device suffixes`
+- **Commit 8** (`7daea59`): `fix(security): enforce symlink and containment validation during upward repo config discovery`
+- **Commit 9** (`d8a4850`): `fix(security): validate proposal symlink before resolution and strengthen atomic concurrency tests`
+- **Commit 10**: `docs(hardening-r4): update Phase R4 audit report with security gap remediation and re-verification evidence`
 
 ---
 
 ## 15. Appendix: Test Inventory
 
-- `tests/test_hardening_r4_security.py` (11 new tests)
+- `tests/test_hardening_r4_security.py` (14 targeted tests)
 - `tests/test_hardening_r3_security.py` (21 tests)
-- `tests/test_proposals.py` (22 tests)
+- `tests/test_proposals.py` (21 tests)
 - `tests/test_knowledge.py` (16 tests)
 - `tests/test_workspace.py` (38 tests)
-- `tests/test_repo_config.py` (19 tests)
-- Full test suite: 1,355 passed, 42 skipped (platform-dependent), 2 deselected.
+- `tests/test_repo_config.py` (28 tests)
+- Full test suite: 1,358 passed, 42 skipped (platform-dependent), 2 deselected.
 
 ---
 
