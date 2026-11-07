@@ -107,10 +107,33 @@ def get_trust_dir() -> Path:
     return td
 
 
+DOS_DEVICE_NAMES = frozenset({
+    "con", "prn", "aux", "nul",
+    "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
+    "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+})
+
+
+def is_dos_device_name(name: Union[str, Path]) -> bool:
+    """Checks if any segment in path or filename matches a Windows legacy DOS device name."""
+    if not name:
+        return False
+    raw = str(name).replace("\\", "/").strip()
+    for part in raw.split("/"):
+        if not part:
+            continue
+        stem = part.split(".")[0].strip().lower()
+        if stem in DOS_DEVICE_NAMES:
+            return True
+    return False
+
+
 def get_trust_file_path(repo_id: str) -> Path:
     """Returns the external path for a repository trust record: <JEV_HOME>/trust/<repo_id>.json."""
-    if not repo_id or ".." in repo_id or "/" in repo_id or "\\" in repo_id:
+    if not repo_id or ".." in repo_id or "/" in repo_id or "\\" in repo_id or "\x00" in repo_id:
         raise ValueError(f"Invalid repo_id with path traversal: '{repo_id}'")
+    if is_dos_device_name(repo_id):
+        raise ValueError(f"Invalid repo_id with DOS device name: '{repo_id}'")
     td = get_trust_dir().resolve()
     target = (td / f"{repo_id}.json").resolve()
     if target.parent != td:
@@ -583,7 +606,12 @@ def validate_trust(
 def load_repo_config(repo_dir: Union[str, Path]) -> Optional[RepoConfig]:
     """Loads and validates .jev/config.json if present in repo_dir or parent worktree repo."""
     p = Path(repo_dir).resolve()
-    cfg_file = p / ".jev" / "config.json"
+    jev_dir = p / ".jev"
+    if jev_dir.is_symlink():
+        return None
+    cfg_file = jev_dir / "config.json"
+    if cfg_file.is_symlink():
+        return None
     if not cfg_file.exists() or not cfg_file.is_file():
         curr = p
         while curr != curr.parent:
@@ -619,11 +647,45 @@ def load_repo_config(repo_dir: Union[str, Path]) -> Optional[RepoConfig]:
 
 def save_repo_config(config: RepoConfig, repo_dir: Union[str, Path]) -> Path:
     """Saves .jev/config.json inside the repository (declarations only, never trust)."""
-    p = Path(repo_dir).resolve()
-    target = p / ".jev" / "config.json"
-    target.parent.mkdir(parents=True, exist_ok=True)
+    trusted_repo = Path(repo_dir).resolve()
+    jev_dir = trusted_repo / ".jev"
+    if jev_dir.is_symlink():
+        raise PermissionError(f"Rejected symlinked .jev directory: {jev_dir}")
+    jev_dir.mkdir(parents=True, exist_ok=True)
+    if jev_dir.is_symlink():
+        raise PermissionError("Rejected symlinked directory component in config path.")
+
+    resolved_jev = jev_dir.resolve()
+    try:
+        resolved_jev.relative_to(trusted_repo)
+    except ValueError:
+        raise PermissionError(f"Config directory '{resolved_jev}' escapes repository root '{trusted_repo}'.")
+
+    target = jev_dir / "config.json"
+    if target.is_symlink():
+        raise PermissionError(f"Config target file '{target}' cannot be a symlink.")
+
+    resolved_target = target.resolve()
+    if resolved_target.parent != resolved_jev:
+        raise PermissionError(f"Config target '{resolved_target}' escapes config directory.")
+    try:
+        resolved_target.relative_to(trusted_repo)
+    except ValueError:
+        raise PermissionError(f"Config target '{resolved_target}' escapes repository root '{trusted_repo}'.")
 
     # Exclude internal ignored_embedded_trust flag
     data = config.model_dump(exclude={"ignored_embedded_trust"}, exclude_none=True)
-    target.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    import uuid
+    temp_target = jev_dir / f".tmp_config_{uuid.uuid4().hex}.json"
+    try:
+        temp_target.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        if target.is_symlink():
+            raise PermissionError(f"Config target file '{target}' cannot be a symlink.")
+        os.replace(temp_target, target)
+    finally:
+        if temp_target.exists():
+            try:
+                temp_target.unlink()
+            except OSError:
+                pass
     return target
