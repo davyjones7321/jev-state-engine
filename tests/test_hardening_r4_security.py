@@ -18,7 +18,6 @@ import json
 import os
 import subprocess
 import sys
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -359,7 +358,7 @@ def test_save_proposal_atomic_concurrency(tmp_path):
                 save_proposal(w_prop, repo)
                 with count_lock:
                     successful_writes[0] += 1
-            except PermissionError as e:
+            except PermissionError:
                 if sys.platform != "win32":
                     raise
                 # On Windows, os.replace can fail with WinError 5/32 if reader currently holds open handle
@@ -631,4 +630,4 @@ def test_workspace_stage_file_mutation_rejects_dos_device_names(tmp_path):
 
     # Verify staging legitimate near-miss does not trigger DOS device rejection
     ws.stage_file_mutation("COM10.txt", "legitimate content")
-    assert (repo / "COM10.txt").read_text(encoding="utf-8") == "legitimate content" 
+    assert (repo / "COM10.txt").read_text(encoding="utf-8") == "legitimate content"
