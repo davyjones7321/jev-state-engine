@@ -284,22 +284,29 @@ Occurrences of 'worktree_dir == self.repo_dir' in workspace.py (guard check):
 
 ## 10. Residual Risk Assessment & TOCTOU Analysis
 
-### Analysis of the R3 TOCTOU Limitation
-In Phase R3, the audit noted:
+### Analysis of Filesystem TOCTOU Mitigations and Scope of Guarantees
+In Phase R3, the security review documented an unresolved filesystem race condition:
 > "A concurrent host process swapping paths between check and write represents a known TOCTOU window absent OS-level openat2 RESOLVE_NO_SYMLINKS support."
 
-In Phase R4, this window was systematically mitigated across all critical state storage (`save_proposal`, `save_repo_config`, and `stage_file_mutation`) using atomic temporary file staging with `os.replace`:
-1. **Atomic Inode/Directory Entry Swaps**: By writing to a newly created temporary file within the same trusted directory and renaming via `os.replace`, the file content is guaranteed complete before publication.
-2. **Symlink Overwrite Resistance**: `os.replace` replaces the destination directory entry atomically rather than following it into target data. A symlink positioned at the target will have its link replaced by the new file, rather than having its external target written into.
-3. **OS-Level Limitations**: On operating systems lacking Linux 5.6+ `openat2(RESOLVE_NO_SYMLINKS)`, a process running with host administrative privileges concurrently swapping intermediate directory path components (`.jev` itself) during path traversal remains bounded by OS directory locks. In JEV state engine operation, worker sandboxes and LLM tool execution do not run with host administrative privileges capable of directory hierarchy renames.
+In Phase R4, this risk was investigated and addressed across all critical state storage (`save_proposal`, `save_repo_config`, and `stage_file_mutation`) using staging temporary files combined with `os.replace`. To prevent misinterpretation of these protections, the precise security guarantees and remaining limitations are formally scoped as follows:
+
+#### What `os.replace` Atomic Staging Guarantees
+1. **Atomic Directory Entry Replacement**: Staging mutations into a unique sibling temporary file (e.g. `.tmp_stage_<uuid>` or `.tmp_prop_<uuid>`) within the same directory followed by `os.replace(temp_file, target_path)` ensures the directory entry update is atomic at the filesystem metadata layer.
+2. **Elimination of Partial File Reads**: Concurrent readers never observe partially written, truncated, or inconsistent byte streams during publication. Readers observe either the complete previous version or the complete newly published version.
+3. **Target Symlink Overwrite Resistance (No Symlink Dereference)**: When `os.replace` replaces a target path that is a symlink, it overwrites and unlinks the symlink directory entry itself. It does *not* follow or dereference the symlink to overwrite external target content.
+
+#### What `os.replace` Does NOT Protect (Intermediate Parent-Directory TOCTOU)
+1. **Intermediate Parent Directory Swapping**: If a concurrent attacker or hostile process possesses filesystem write or rename privileges within ancestor directories (e.g., repository or worktree root), they could attempt to rename or swap an intermediate directory component (e.g., replacing `.jev` or `.jev/proposals` with a symlink pointing to an external target) in the microsecond window between initial path containment validation and `temp_file.write_bytes()` / `os.replace()`.
+2. **Inherent Cross-Platform Limitation**: Eliminating intermediate directory swapping races entirely requires OS-level directory file descriptors with strict symlink-resolution flags (e.g., Linux 5.6+ `openat2` with `RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH`). Standard cross-platform Python on POSIX and Windows NT lacks native path-resolution locks during path traversal without specialized kernel APIs.
+3. **Defense-in-Depth Mitigations**: The engine bounds this exposure by enforcing strict worktree directory containment, forbidding external tool processes from obtaining directory rename privileges over state directories, and validating symlink status before and immediately around state transitions.
 
 ---
 
 ## 11. Security Boundaries & Guarantees Established
 
-1. **Repository Configuration Containment**: All `.jev/config.json` operations strictly verify lexical and resolved containment within the trusted repository root. Symlinks at directory or file levels are rejected.
-2. **Atomic State Mutation**: Proposals, configurations, and staged mutations are written via temporary files and atomic replacement, guaranteeing zero partial writes and eliminating symlink overwrite races.
-3. **Platform Namespace Defense**: Windows legacy DOS device names are universally blocked across all worktree path resolutions, staging routines, trust file derivation, and knowledge store identifiers.
+1. **Repository Configuration Containment & Authenticity**: All `.jev/config.json` operations strictly verify lexical and resolved containment within the trusted repository root. Symlinks at directory or file levels are rejected. Upward worktree discovery requires authentic bidirectional Git worktree backlinks (`commondir` and `gitdir`), preventing forged `.git` pointers to untrusted external repositories.
+2. **Atomic State Mutation**: Proposals, configurations, and staged mutations are written via temporary files and atomic replacement, guaranteeing zero partial writes and eliminating target symlink overwrite races.
+3. **Platform Namespace Defense**: Windows legacy DOS device names—including base devices (`CON`, `PRN`, `AUX`, `NUL`), numbered communications/printer ports (`COM0-9`, `LPT0-9`), Win32 extended devices (`CONIN$`, `CONOUT$`, `CLOCK$`), and legacy code-page superscript variants (`COM¹-³`, `LPT¹-³`)—are comprehensively blocked across all worktree path resolutions, staging routines, trust file derivation, and knowledge store identifiers.
 4. **Knowledge Store Integrity**: External SQLite database targets cannot be redirected or deleted via symlinks.
 
 ---
@@ -333,7 +340,11 @@ I attest that Phase R4 of the security audit and boundary hardening has been com
 - **Commit 7** (`5f94d61`): `fix(security): expand DOS device name validation to include CONIN$, CONOUT$, CLOCK$, and device suffixes`
 - **Commit 8** (`7daea59`): `fix(security): enforce symlink and containment validation during upward repo config discovery`
 - **Commit 9** (`d8a4850`): `fix(security): validate proposal symlink before resolution and strengthen atomic concurrency tests`
-- **Commit 10**: `docs(hardening-r4): update Phase R4 audit report with security gap remediation and re-verification evidence`
+- **Commit 10** (`db5c072`): `docs(hardening-r4): update Phase R4 audit report with security gap remediation and re-verification evidence`
+- **Commit 11** (`4357334`): `fix(security): reject Windows superscript reserved device names COM¹-³ and LPT¹-³`
+- **Commit 12** (`dd0d300`): `test(security): strengthen proposal atomic concurrency verification with active read-write overlap`
+- **Commit 13** (`af2650d`): `fix(security): validate bidirectional gitdir linkage before trusting parent worktree repo config`
+- **Commit 14**: `docs(hardening-r4): accurately scope atomic replacement guarantees and intermediate parent directory TOCTOU limitations`
 
 ---
 
