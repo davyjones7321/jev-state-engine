@@ -607,40 +607,77 @@ def validate_trust(
     return True, None
 
 
+def _is_safe_repo_config_candidate(candidate: Path, repo_root: Path) -> bool:
+    """Verifies that candidate (.jev/config.json) and its parent .jev are not symlinks and reside strictly within repo_root."""
+    try:
+        resolved_root = repo_root.resolve()
+        candidate_jev = candidate.parent
+        if candidate_jev.name != ".jev":
+            return False
+        if candidate_jev.is_symlink() or candidate.is_symlink():
+            return False
+        resolved_jev = candidate_jev.resolve()
+        resolved_candidate = candidate.resolve()
+        if resolved_candidate.parent != resolved_jev:
+            return False
+        resolved_jev.relative_to(resolved_root)
+        resolved_candidate.relative_to(resolved_root)
+        return True
+    except (ValueError, OSError):
+        return False
+
+
 def load_repo_config(repo_dir: Union[str, Path]) -> Optional[RepoConfig]:
     """Loads and validates .jev/config.json if present in repo_dir or parent worktree repo."""
     p = Path(repo_dir).resolve()
     jev_dir = p / ".jev"
-    if jev_dir.is_symlink():
-        return None
-    cfg_file = jev_dir / "config.json"
-    if cfg_file.is_symlink():
-        return None
-    if not cfg_file.exists() or not cfg_file.is_file():
+    cfg_file: Optional[Path] = None
+
+    if jev_dir.exists():
+        if jev_dir.is_symlink():
+            return None
+        direct_cfg = jev_dir / "config.json"
+        if direct_cfg.exists() and direct_cfg.is_file():
+            if _is_safe_repo_config_candidate(direct_cfg, p):
+                cfg_file = direct_cfg
+            else:
+                return None
+
+    if cfg_file is None:
         curr = p
         while curr != curr.parent:
             candidate = curr / ".jev" / "config.json"
             if candidate.exists() and candidate.is_file():
-                cfg_file = candidate
-                break
+                if _is_safe_repo_config_candidate(candidate, curr):
+                    cfg_file = candidate
+                    break
+                else:
+                    return None
             git_file = curr / ".git"
             if git_file.exists() and git_file.is_file():
                 try:
                     gitdir_content = git_file.read_text(encoding="utf-8").strip()
                     if gitdir_content.startswith("gitdir:"):
-                        gitdir_path = Path(gitdir_content[7:].strip())
+                        raw_gitdir = gitdir_content[7:].strip()
+                        gitdir_path = Path(raw_gitdir)
                         if not gitdir_path.is_absolute():
                             gitdir_path = (curr / gitdir_path).resolve()
-                        main_repo = gitdir_path.parent.parent.parent
+                        else:
+                            gitdir_path = gitdir_path.resolve()
+                        main_repo = gitdir_path.parent.parent.parent.resolve()
                         candidate = main_repo / ".jev" / "config.json"
                         if candidate.exists() and candidate.is_file():
-                            cfg_file = candidate
-                            break
+                            if _is_safe_repo_config_candidate(candidate, main_repo):
+                                cfg_file = candidate
+                                break
+                            else:
+                                return None
                 except Exception:
                     pass
             curr = curr.parent
-        else:
-            return None
+
+    if cfg_file is None:
+        return None
 
     try:
         data = json.loads(cfg_file.read_text(encoding="utf-8"))

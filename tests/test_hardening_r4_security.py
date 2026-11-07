@@ -25,7 +25,7 @@ import pytest
 
 from jev.knowledge import KnowledgeStore, get_knowledge_db_path
 from jev.proposals import Proposal, list_proposals, load_proposal, save_proposal
-from jev.repo_config import RepoConfig, get_trust_file_path, save_repo_config
+from jev.repo_config import RepoConfig, get_trust_file_path, load_repo_config, save_repo_config
 from jev.workspace import Workspace
 
 
@@ -88,6 +88,65 @@ def test_save_repo_config_legitimate_save_works(tmp_path):
     data = json.loads(saved_path.read_text(encoding="utf-8"))
     assert data.get("runner_profile") == "pytest" or data.get("runner_profile_id") == "pytest"
     assert data["test_command"] == ["pytest"]
+
+
+def test_load_repo_config_upward_search_rejects_parent_symlinks(tmp_path):
+    """Verifies that load_repo_config rejects symlinks discovered during upward search."""
+    root = tmp_path / "root"
+    root.mkdir()
+    sub_worktree = root / "worktrees" / "wt1"
+    sub_worktree.mkdir(parents=True)
+
+    outside_jev = tmp_path / "outside_jev"
+    outside_jev.mkdir()
+    outside_cfg = outside_jev / "config.json"
+    outside_cfg.write_text(json.dumps({"runner_profile": "pytest", "test_command": ["pytest"]}), encoding="utf-8")
+
+    parent_jev = root / ".jev"
+    try:
+        os.symlink(str(outside_jev), str(parent_jev), target_is_directory=True)
+    except OSError as e:
+        pytest.skip(f"Symlinks not supported on this environment: {e}")
+
+    # load_repo_config from sub_worktree must not load the symlinked parent configuration
+    assert load_repo_config(sub_worktree) is None
+
+    # Also test symlinked config.json inside real parent .jev
+    parent_jev.unlink()
+    parent_jev.mkdir()
+    parent_cfg_symlink = parent_jev / "config.json"
+    os.symlink(str(outside_cfg), str(parent_cfg_symlink))
+
+    assert load_repo_config(sub_worktree) is None
+
+
+def test_load_repo_config_parent_worktree_discovery_works(tmp_path):
+    """Verifies legitimate parent and gitdir worktree configuration discovery."""
+    main_repo = tmp_path / "main_repo"
+    main_repo.mkdir()
+    main_jev = main_repo / ".jev"
+    main_jev.mkdir()
+    main_cfg = main_jev / "config.json"
+    main_cfg.write_text(json.dumps({"runner_profile": "pytest", "test_command": ["pytest"]}), encoding="utf-8")
+
+    # 1. Direct subdirectory
+    sub_dir = main_repo / "src" / "package"
+    sub_dir.mkdir(parents=True)
+    loaded_sub = load_repo_config(sub_dir)
+    assert loaded_sub is not None
+    assert loaded_sub.test_command == ["pytest"]
+
+    # 2. Git worktree with gitdir: pointer
+    worktree_dir = tmp_path / "worktree_wt"
+    worktree_dir.mkdir()
+    fake_gitdir = main_repo / ".git" / "worktrees" / "wt"
+    fake_gitdir.mkdir(parents=True)
+    git_file = worktree_dir / ".git"
+    git_file.write_text(f"gitdir: {fake_gitdir}\n", encoding="utf-8")
+
+    loaded_wt = load_repo_config(worktree_dir)
+    assert loaded_wt is not None
+    assert loaded_wt.test_command == ["pytest"]
 
 
 # -----------------------------------------------------------------------------
