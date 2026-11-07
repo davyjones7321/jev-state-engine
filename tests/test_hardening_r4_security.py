@@ -196,43 +196,96 @@ def test_save_proposal_atomic_concurrency(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
 
+    initial_evidence = "Evidence-initial-" + ("0" * 4000) + "-SNAPSHOT_END-initial"
+    initial_argv = ["pytest", "--snapshot=initial"]
     prop = Proposal(
         id="prop-concurrent",
         repo_id="test-repo",
-        exact_argv=["pytest"],
+        exact_argv=list(initial_argv),
         cwd=".",
-        source_evidence="Makefile",
+        source_evidence=initial_evidence,
         platform=sys.platform,
-        identity_hash="hash",
+        identity_hash="hash-initial",
         created_at="2026-10-30T00:00:00Z",
     )
     save_proposal(prop, repo)
 
+    valid_snapshots = {
+        "initial": (initial_evidence, initial_argv)
+    }
+    for i in range(25):
+        valid_snapshots[str(i)] = (
+            f"Evidence-{i}-" + ("#" * 8000) + f"-SNAPSHOT_END-{i}",
+            ["pytest", f"--snapshot={i}", "-v"],
+        )
+
+    start_barrier = threading.Barrier(3)
     stop_event = threading.Event()
     read_errors = []
     read_counts = [0]
+    successful_writes = [0]
+    failed_writes = [0]
 
-    def reader():
+    count_lock = threading.Lock()
+
+    def reader(reader_id: int):
+        start_barrier.wait()
         while not stop_event.is_set():
-            p = load_proposal("prop-concurrent", repo)
-            if p is not None:
-                if not p.exact_argv or not p.source_evidence:
-                    read_errors.append("Invalid or partial proposal read")
-                read_counts[0] += 1
+            try:
+                p = None
+                for _ in range(5):
+                    p = load_proposal("prop-concurrent", repo)
+                    if p is not None:
+                        break
+                    time.sleep(0.001)
+
+                if p is None:
+                    with count_lock:
+                        read_errors.append(f"Reader {reader_id}: load_proposal returned None during concurrent write")
+                else:
+                    matched = False
+                    for snap_key, (exp_ev, exp_argv) in valid_snapshots.items():
+                        if p.source_evidence == exp_ev and p.exact_argv == exp_argv:
+                            matched = True
+                            break
+                    if not matched:
+                        with count_lock:
+                            read_errors.append(f"Reader {reader_id}: Torn or invalid payload read: {p.source_evidence[:30]}... {p.exact_argv}")
+                    with count_lock:
+                        read_counts[0] += 1
+            except Exception as e:
+                with count_lock:
+                    read_errors.append(f"Reader {reader_id} exception: {e}")
             time.sleep(0.002)
 
     def writer():
-        for i in range(10):
-            prop.source_evidence = f"Evidence-{i}-" + ("x" * 1000)
+        start_barrier.wait()
+        for i in range(25):
+            exp_ev, exp_argv = valid_snapshots[str(i)]
+            w_prop = Proposal(
+                id="prop-concurrent",
+                repo_id="test-repo",
+                exact_argv=list(exp_argv),
+                cwd=".",
+                source_evidence=exp_ev,
+                platform=sys.platform,
+                identity_hash=f"hash-{i}",
+                created_at="2026-10-30T00:00:00Z",
+            )
             try:
-                save_proposal(prop, repo)
-            except PermissionError:
-                # On Windows, reader may briefly hold file handle during replace
-                pass
-            time.sleep(0.005)
+                save_proposal(w_prop, repo)
+                with count_lock:
+                    successful_writes[0] += 1
+            except PermissionError as e:
+                if sys.platform != "win32":
+                    raise
+                # On Windows, os.replace can fail with WinError 5/32 if reader currently holds open handle
+                with count_lock:
+                    failed_writes[0] += 1
+            time.sleep(0.01)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-        reader_futures = [executor.submit(reader) for _ in range(2)]
+        reader_futures = [executor.submit(reader, 1), executor.submit(reader, 2)]
         writer_future = executor.submit(writer)
         try:
             writer_future.result()
@@ -242,7 +295,8 @@ def test_save_proposal_atomic_concurrency(tmp_path):
             rf.result()
 
     assert read_errors == []
-    assert read_counts[0] > 0
+    assert read_counts[0] >= 10
+    assert successful_writes[0] >= 5
 
 
 def test_load_proposal_rejects_symlink(tmp_path):
