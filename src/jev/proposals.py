@@ -347,28 +347,39 @@ def save_proposal(
 
 def load_proposal(proposal_id: str, repo_dir: Union[str, Path]) -> Optional[Proposal]:
     """Loads a proposal by id from .jev/proposals/<id>.json."""
-    if not proposal_id or ".." in proposal_id or "/" in proposal_id or "\\" in proposal_id:
+    if not proposal_id or ".." in proposal_id or "/" in proposal_id or "\\" in proposal_id or "\x00" in proposal_id:
         return None
     try:
         trusted_repo = Path(repo_dir).resolve()
         pdir = get_proposals_dir(trusted_repo)
         expected_proposals_dir = (trusted_repo / ".jev" / "proposals").resolve()
         clean_id = proposal_id.removesuffix(".json")
-        path = (pdir / f"{clean_id}.json").resolve()
-        if path.parent != expected_proposals_dir:
+        target_file = pdir / f"{clean_id}.json"
+
+        # Check symlink on the filesystem entry BEFORE resolving
+        if target_file.is_symlink():
             return None
-        if path.is_symlink():
-            return None
-        if not path.exists():
+
+        if not target_file.exists():
             # Also check without prefix if user passed short hash
-            matches = list(pdir.glob(f"*{clean_id}*.json"))
+            matches = [m for m in pdir.glob(f"*{clean_id}*.json") if not m.is_symlink()]
             if matches:
-                path = matches[0].resolve()
-                if path.parent != expected_proposals_dir:
-                    return None
+                target_file = matches[0]
             else:
                 return None
-        data = json.loads(path.read_text(encoding="utf-8"))
+
+        if target_file.is_symlink():
+            return None
+
+        resolved_path = target_file.resolve()
+        if resolved_path.parent != expected_proposals_dir:
+            return None
+        try:
+            resolved_path.relative_to(trusted_repo)
+        except ValueError:
+            return None
+
+        data = json.loads(resolved_path.read_text(encoding="utf-8"))
         return Proposal(**data)
     except Exception:
         return None

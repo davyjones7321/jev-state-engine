@@ -154,7 +154,7 @@ def test_load_repo_config_parent_worktree_discovery_works(tmp_path):
 # -----------------------------------------------------------------------------
 
 def test_save_proposal_atomic_write_replacement(tmp_path):
-    """Verifies save_proposal writes atomically and leaves no corrupted destination on write failure."""
+    """Verifies save_proposal writes atomically, cleans up temp files on error, and prevents partial reads."""
     repo = tmp_path / "repo"
     repo.mkdir()
 
@@ -173,6 +173,7 @@ def test_save_proposal_atomic_write_replacement(tmp_path):
     saved = save_proposal(prop, repo)
     assert saved is not None and saved.exists()
     original_content = saved.read_text(encoding="utf-8")
+    pdir = repo / ".jev" / "proposals"
 
     # Simulate an error during atomic replacement / write
     with patch("os.replace", side_effect=OSError("Disk write failed")):
@@ -182,13 +183,75 @@ def test_save_proposal_atomic_write_replacement(tmp_path):
     # Original content should not be wiped or corrupted
     assert saved.read_text(encoding="utf-8") == original_content
 
+    # Verify no dangling temporary files remain
+    assert list(pdir.glob(".tmp_*")) == []
+
+
+def test_save_proposal_atomic_concurrency(tmp_path):
+    """Verifies that concurrent readers never observe partial or corrupted proposals during atomic replacement."""
+    import concurrent.futures
+    import threading
+    import time
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    prop = Proposal(
+        id="prop-concurrent",
+        repo_id="test-repo",
+        exact_argv=["pytest"],
+        cwd=".",
+        source_evidence="Makefile",
+        platform=sys.platform,
+        identity_hash="hash",
+        created_at="2026-10-30T00:00:00Z",
+    )
+    save_proposal(prop, repo)
+
+    stop_event = threading.Event()
+    read_errors = []
+    read_counts = [0]
+
+    def reader():
+        while not stop_event.is_set():
+            p = load_proposal("prop-concurrent", repo)
+            if p is not None:
+                if not p.exact_argv or not p.source_evidence:
+                    read_errors.append("Invalid or partial proposal read")
+                read_counts[0] += 1
+            time.sleep(0.002)
+
+    def writer():
+        for i in range(10):
+            prop.source_evidence = f"Evidence-{i}-" + ("x" * 1000)
+            try:
+                save_proposal(prop, repo)
+            except PermissionError:
+                # On Windows, reader may briefly hold file handle during replace
+                pass
+            time.sleep(0.005)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        reader_futures = [executor.submit(reader) for _ in range(2)]
+        writer_future = executor.submit(writer)
+        try:
+            writer_future.result()
+        finally:
+            stop_event.set()
+        for rf in reader_futures:
+            rf.result()
+
+    assert read_errors == []
+    assert read_counts[0] > 0
+
 
 def test_load_proposal_rejects_symlink(tmp_path):
-    """Verifies that load_proposal refuses to read proposals through a symlink."""
+    """Verifies that load_proposal refuses to read proposals through internal aliases or external symlinks."""
     repo = tmp_path / "repo"
     pdir = repo / ".jev" / "proposals"
     pdir.mkdir(parents=True)
 
+    # 1. External symlink target
     outside_file = tmp_path / "secret_proposal.json"
     prop_data = {
         "id": "prop-outside",
@@ -208,9 +271,27 @@ def test_load_proposal_rejects_symlink(tmp_path):
     except OSError as e:
         pytest.skip(f"Symlinks not supported on this environment: {e}")
 
-    # load_proposal should return None for symlinked proposal files
-    result = load_proposal("prop-outside", repo)
-    assert result is None
+    assert load_proposal("prop-outside", repo) is None
+
+    # 2. Internal symlink alias within .jev/proposals
+    legit = Proposal(
+        id="prop-legit",
+        repo_id="test-repo",
+        exact_argv=["pytest"],
+        cwd=".",
+        source_evidence="Makefile",
+        platform=sys.platform,
+        identity_hash="hash",
+        created_at="2026-10-30T00:00:00Z",
+    )
+    saved_legit = save_proposal(legit, repo)
+    assert saved_legit is not None
+
+    internal_alias = pdir / "prop-alias.json"
+    os.symlink(str(saved_legit), str(internal_alias))
+
+    # Proves the symlink check itself rejects internal aliases whose resolved parent is expected_proposals_dir
+    assert load_proposal("prop-alias", repo) is None
 
 
 def test_list_proposals_omits_symlinks(tmp_path):
