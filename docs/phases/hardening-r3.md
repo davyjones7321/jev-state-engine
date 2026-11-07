@@ -11,12 +11,13 @@ Phase: `R3` (Security Audit and Hardening)
 Phase R3 is the independent security-hardening verification pass of `jev-state-engine`.
 The goal of this run is to conduct an adversarial, evidence-driven security audit across the codebase, demonstrate any reproducible security vulnerabilities test-first, implement minimal and surgical production hardening fixes, and verify that the full test suite remains green without weakening any existing security controls.
 
-Following the initial R3 audit, an independent corrective security review identified 3 potential bypass vectors and consistency gaps:
+Following the initial R3 audit, corrective security reviews identified and resolved key bypass vectors and consistency gaps:
 1. Read-tool path containment inconsistency across `cat`, `head`, and `tail`.
 2. Git read-tool argument allowlist bypasses (global options, external diff helpers, traversal operands).
 3. Proposal save-path validation and `Proposal` model ID containment.
+4. Proposal directory symlink escape protection (`.jev` and `.jev/proposals` symlinks pointing outside the repository).
 
-All findings have been investigated, proven test-first, and remediated with full test coverage.
+All findings have been investigated, proven test-first with failing regression tests, and remediated with full test coverage.
 
 ---
 
@@ -58,12 +59,20 @@ A thorough examination was performed across the 10 core security dimensions of t
   If a subgoal had an empty scope (`norm_scope = set()`), the condition `if norm_scope` evaluated to `False`, bypassing the check entirely and allowing arbitrary files across the worktree to be modified.
 - **Resolution**: Changed condition to `if not norm_scope or norm_path not in norm_scope:`, strictly rejecting any file mutation when a subgoal has empty scope or when writing outside declared scope.
 
-### Dimension 5: Proposal Storage Path Traversal & Model Validation
-- **Inspected**: `load_proposal`, `save_proposal`, and `list_proposals` in `src/jev/proposals.py`.
+### Dimension 5: Proposal Storage Path Traversal, Model Validation, & Directory Symlink Escape Protection
+- **Inspected**: `load_proposal`, `save_proposal`, and `get_proposals_dir` in `src/jev/proposals.py`.
 - **Initial Finding (Vulnerability 4)**: `load_proposal(proposal_id, repo_dir)` constructed the target path via `pdir / f"{clean_id}.json"`. If `proposal_id` contained directory traversal components, it resolved outside `.jev/proposals/`.
 - **Initial Resolution**: Enforced input validation rejecting any `proposal_id` containing `..`, `/`, or `\\`.
 - **Corrective Review Finding 3 (Proposal Save Path & Model Validation)**: `save_proposal` wrote directly to `pdir / f"{proposal.id}.json"` without path containment verification. Furthermore, `Proposal` Pydantic model lacked ID schema validation.
-- **Corrective Review Resolution 3**: Added `validate_proposal_id()` ensuring ID matches `^[a-zA-Z0-9_\-]+$` and rejects any traversal sequences (`..`, `/`, `\\`, NUL). Added `@field_validator("id")` to `Proposal`. Hardened `save_proposal()` with strict ID validation and destination path containment checking (`dest.resolve().parent == pdir.resolve()`).
+- **Corrective Review Resolution 3**: Added `validate_proposal_id()` ensuring ID matches `^[a-zA-Z0-9_\-]+$` and rejects any traversal sequences (`..`, `/`, `\\`, NUL). Added `@field_validator("id")` to `Proposal`. Hardened `save_proposal()` with strict independent ID validation and destination path containment checking (`dest.resolve().parent == pdir.resolve()`).
+- **Corrective Review Finding 4 (Proposal Directory Symlink Escape)**: When `.jev` or `.jev/proposals` was a symlink pointing outside the repository, `pdir = get_proposals_dir(repo_dir).resolve()` resolved to the outside directory. The parent check `target.parent == pdir` compared two resolved paths that both pointed outside, thereby trusting the attacker-controlled symlink destination and saving proposals outside the repository.
+- **Corrective Review Resolution 4**:
+  - Established trusted lexical repository root: `trusted_repo = Path(repo_dir).resolve()`.
+  - In `get_proposals_dir()` and `save_proposal()`, verified that neither `(trusted_repo / ".jev")` nor `(trusted_repo / ".jev" / "proposals")` is a symlink, raising `PermissionError` if symlinked.
+  - Verified that `resolved_pdir` remains strictly inside `trusted_repo` (`resolved_pdir.relative_to(trusted_repo)`).
+  - Verified that the target proposal file is not a symlink and that `target.resolve().parent == (trusted_repo / ".jev" / "proposals").resolve()`.
+  - Re-verified that `target.resolve()` is strictly within `trusted_repo`.
+  - Documented known filesystem TOCTOU race limitation between check and file write.
 
 ### Dimension 6: Repository Configuration & Knowledge DB Path Traversal
 - **Inspected**: `get_trust_file_path` in `src/jev/repo_config.py` and `get_knowledge_db_path` in `src/jev/knowledge.py`.
@@ -111,9 +120,16 @@ A thorough examination was performed across the 10 core security dimensions of t
 - Lines 23–38:
   - Added `validate_proposal_id(val: str) -> str` enforcing alphanumeric, hyphen, underscore pattern `^[a-zA-Z0-9_\-]+$` and rejecting path traversal (`..`, `/`, `\\`, NUL).
   - Added `@field_validator("id")` to `Proposal` Pydantic model.
-- Lines 275–310:
-  - Hardened `save_proposal` with strict ID validation and destination path containment verification (`dest.resolve().parent == pdir.resolve()`).
-  - Hardened `load_proposal` against path traversal (`..`, `/`, `\\`) and verified parent directory confinement.
+- Lines 223–249:
+  - Hardened `get_proposals_dir` to reject symlinks at `.jev` and `.jev/proposals`, enforce post-creation non-symlink verification, and verify containment within repository root.
+- Lines 251–347:
+  - Hardened `save_proposal` with:
+    - Independent `validate_proposal_id()` call (protecting against mutated model instances).
+    - Verification that `.jev` and `proposals` are not symlinks.
+    - Path containment check against repository root and `expected_proposals_dir`.
+    - Verification that destination file is not a symlink.
+    - Explicit docstring note detailing the filesystem TOCTOU race window limitation.
+  - Hardened `load_proposal` to safely handle symlink rejections and verify containment.
 
 ### 4. `src/jev/repo_config.py`
 - Lines 111–118:
@@ -124,7 +140,7 @@ A thorough examination was performed across the 10 core security dimensions of t
   - Hardened `get_knowledge_db_path` against path traversal, raising `ValueError` on escaping `repo_key`.
 
 ### 6. `tests/test_hardening_r3_security.py`
-- Complete suite of 17 regression tests:
+- Complete suite of 21 regression tests:
   1. `test_syntax_self_check_isolates_python_execution`
   2. `test_node_implement_syntax_self_check_uses_isolated_python`
   3. `test_run_read_tool_restricts_to_allowed_read_commands`
@@ -142,6 +158,10 @@ A thorough examination was performed across the 10 core security dimensions of t
   15. `test_git_read_tool_blocks_traversal_and_outside_paths`
   16. `test_save_proposal_rejects_path_traversal_ids`
   17. `test_proposal_model_validates_id_format`
+  18. `test_save_proposal_rejects_proposals_dir_symlink_to_outside`
+  19. `test_save_proposal_rejects_jev_dir_symlink_to_outside`
+  20. `test_save_proposal_legitimate_storage_works`
+  21. `test_save_proposal_itself_rejects_malicious_proposal_id`
 
 ---
 
@@ -150,35 +170,41 @@ A thorough examination was performed across the 10 core security dimensions of t
 ### 1. Targeted R3 Hardening Test Suite
 ```
 pytest -v tests/test_hardening_r3_security.py
-======================= 17 passed, 1 warning in 10.32s ========================
+======================= 21 passed, 1 warning in 14.12s ========================
 ```
 
 ### 2. Consolidated Security and Proposal Suites
 ```
 pytest -v tests/test_phaseS_security_hardening.py tests/test_proposals.py tests/test_hardening_r2_test_scope.py tests/test_hardening_r3_security.py
-======================= 76 passed, 1 warning in 28.50s ========================
+======================= 80 passed, 1 warning in 32.10s ========================
 ```
 
 ### 3. Full Offline Suite Verification (`scripts/verify_phase.py origin/master`)
 ```
 --- Diff stat vs origin/master ---
- docs/phases/hardening-r3.md         | 150 ++++++++++++++++++++++++++++++++
+ docs/phases/hardening-r3.md         | 184 ++++++++++++++++++++++++++++++++
  src/jev/engine.py                   |   6 +-
  src/jev/knowledge.py                |   8 ++
- src/jev/proposals.py                |  32 ++++++-
+ src/jev/proposals.py                |  64 ++++++++++--
  src/jev/repo_config.py              |   8 ++
  src/jev/workspace.py                | 104 +++++++++++++++++++---
- tests/test_hardening_r3_security.py | 344 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
- 7 files changed, 638 insertions(+), 14 deletions(-)
+ tests/test_hardening_r3_security.py | 430 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 7 files changed, 786 insertions(+), 18 deletions(-)
 
 --- Pytest Offline Suite Summary ---
-1340 passed, 42 skipped, 2 deselected, 2 warnings in 1582.41s (0:26:22)
+1344 passed, 42 skipped, 2 deselected, 2 warnings in 1595.12s (0:26:35)
 
 === VERIFICATION PASSED ===
 ```
 
 ---
 
-## 5. Conclusion & Sign-Off
+## 5. Security & Threat Modeling Notes: Remaining TOCTOU Limitation
 
-All identified security weaknesses and corrective review findings were demonstrated test-first and remediated with targeted, minimal production fixes. No existing functionality or security controls were weakened. All tests pass with zero failures. Phase R3 hardening and corrective security review are complete and ready for PR review.
+Lexical validation and non-symlink verification ensure that neither `.jev` nor `.jev/proposals` nor the target file are symlinks pointing outside the repository. However, between the user-space check (`is_symlink()`) and the actual write operation (`target.write_text()`), an asynchronous process on the host could theoretically swap directory components or the file itself with a symlink (Time-of-Check to Time-of-Use race condition). Eliminating this race window completely requires kernel-level atomic path resolution flags (e.g., `openat2` with `RESOLVE_NO_SYMLINKS` on Linux), which are not universally available across operating systems (such as Windows) in Python's standard library.
+
+---
+
+## 6. Conclusion & Sign-Off
+
+All identified security weaknesses and corrective review findings were demonstrated test-first and remediated with targeted, minimal production fixes. No existing functionality or security controls were weakened. All tests pass with zero failures. Phase R3 hardening and all corrective reviews are complete and ready for PR review.

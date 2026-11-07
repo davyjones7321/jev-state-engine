@@ -23,7 +23,7 @@ import pytest
 from jev.engine import node_implement
 from jev.knowledge import get_knowledge_db_path
 from jev.models import State, Subgoal
-from jev.proposals import Proposal, load_proposal
+from jev.proposals import Proposal, load_proposal, save_proposal
 from jev.repo_config import get_trust_dir, get_trust_file_path
 from jev.workspace import Workspace
 
@@ -512,3 +512,125 @@ def test_proposal_model_validates_id_format():
                 identity_hash="hash",
                 created_at="2026-10-30T00:00:00Z",
             )
+
+
+# -----------------------------------------------------------------------------
+# 11. Proposal directory symlink escape protection
+# -----------------------------------------------------------------------------
+
+def test_save_proposal_rejects_proposals_dir_symlink_to_outside(tmp_path):
+    """Verifies that a .jev/proposals symlink pointing outside the repo cannot cause save_proposal to write outside."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    outside_dir = tmp_path / "outside_proposals"
+    outside_dir.mkdir()
+    jev_dir = repo / ".jev"
+    jev_dir.mkdir()
+    proposals_link = jev_dir / "proposals"
+    try:
+        os.symlink(str(outside_dir), str(proposals_link), target_is_directory=True)
+    except OSError as e:
+        pytest.skip(f"Symlinks not supported on this environment: {e}")
+
+    prop = Proposal(
+        id="prop-symlink-test",
+        repo_id="test-repo",
+        exact_argv=["pytest"],
+        cwd=".",
+        source_evidence="Makefile",
+        platform=sys.platform,
+        identity_hash="hash",
+        created_at="2026-10-30T00:00:00Z",
+    )
+
+    with pytest.raises((PermissionError, ValueError), match="symlink|escape|outside"):
+        save_proposal(prop, repo)
+
+    assert not (outside_dir / "prop-symlink-test.json").exists()
+
+
+def test_save_proposal_rejects_jev_dir_symlink_to_outside(tmp_path):
+    """Verifies that a .jev symlink pointing outside the repo cannot cause proposal storage outside."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    outside_jev = tmp_path / "outside_jev"
+    outside_jev.mkdir()
+    jev_link = repo / ".jev"
+    try:
+        os.symlink(str(outside_jev), str(jev_link), target_is_directory=True)
+    except OSError as e:
+        pytest.skip(f"Symlinks not supported on this environment: {e}")
+
+    prop = Proposal(
+        id="prop-jev-symlink-test",
+        repo_id="test-repo",
+        exact_argv=["pytest"],
+        cwd=".",
+        source_evidence="Makefile",
+        platform=sys.platform,
+        identity_hash="hash",
+        created_at="2026-10-30T00:00:00Z",
+    )
+
+    with pytest.raises((PermissionError, ValueError), match="symlink|escape|outside"):
+        save_proposal(prop, repo)
+
+    assert not (outside_jev / "proposals" / "prop-jev-symlink-test.json").exists()
+    assert not (outside_jev / "prop-jev-symlink-test.json").exists()
+
+
+def test_save_proposal_legitimate_storage_works(tmp_path):
+    """Verifies that normal, non-symlinked proposal storage and loading continue to work."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    prop = Proposal(
+        id="prop-legit-001",
+        repo_id="test-repo",
+        exact_argv=["pytest", "-v"],
+        cwd=".",
+        source_evidence="Makefile",
+        platform=sys.platform,
+        identity_hash="hash",
+        created_at="2026-10-30T00:00:00Z",
+    )
+
+    saved_path = save_proposal(prop, repo)
+    assert saved_path is not None
+    assert saved_path.exists()
+    assert saved_path.name == "prop-legit-001.json"
+
+    # Verify containment within repo/.jev/proposals
+    expected_dir = (repo / ".jev" / "proposals").resolve()
+    assert saved_path.resolve().parent == expected_dir
+
+    loaded = load_proposal("prop-legit-001", repo)
+    assert loaded is not None
+    assert loaded.id == "prop-legit-001"
+    assert loaded.exact_argv == ["pytest", "-v"]
+
+
+def test_save_proposal_itself_rejects_malicious_proposal_id(tmp_path):
+    """Verifies that save_proposal() independently validates proposal IDs even if model validation is bypassed."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    for evil_id in ["../../escaped_id", "..\\escaped_id", "/etc/passwd", "sub/id", "id\x00null"]:
+        prop = Proposal(
+            id="valid-initial-id",
+            repo_id="test-repo",
+            exact_argv=["pytest"],
+            cwd=".",
+            source_evidence="Makefile",
+            platform=sys.platform,
+            identity_hash="hash",
+            created_at="2026-10-30T00:00:00Z",
+        )
+        # Deliberately mutate ID bypassing Pydantic model __init__ validator
+        object.__setattr__(prop, "id", evil_id)
+
+        with pytest.raises(ValueError, match="id|escape|traversal"):
+            save_proposal(prop, repo)
+
+        assert not (tmp_path / "escaped_id.json").exists()
+        assert not (repo.parent / "escaped_id.json").exists()
