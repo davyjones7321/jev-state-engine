@@ -112,6 +112,8 @@ DOS_DEVICE_NAMES = frozenset({
     "clock$", "conin$", "conout$",
     "com0", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
     "lpt0", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+    "com¹", "com²", "com³",
+    "lpt¹", "lpt²", "lpt³",
 })
 
 
@@ -123,12 +125,17 @@ def is_dos_device_name(name: Union[str, Path]) -> bool:
     for part in raw.split("/"):
         if not part:
             continue
-        clean_part = part.strip()
-        if clean_part.endswith(":"):
-            clean_part = clean_part[:-1].strip()
+        clean_part = part.strip().rstrip(": ")
+        if not clean_part:
+            continue
         stem = clean_part.split(".")[0].strip().rstrip(". ").lower()
         if stem in DOS_DEVICE_NAMES:
             return True
+        if ":" in clean_part:
+            colon_prefix = clean_part.split(":")[0].strip().rstrip(". ")
+            colon_stem = colon_prefix.split(".")[0].strip().rstrip(". ").lower()
+            if colon_stem in DOS_DEVICE_NAMES:
+                return True
     return False
 
 

@@ -358,8 +358,15 @@ def test_get_knowledge_db_path_rejects_nul_and_dos_devices():
         "NUL",
         "COM1",
         "LPT1",
+        "COM¹",
+        "COM²",
+        "COM³",
+        "LPT¹",
+        "LPT²",
+        "LPT³",
         "con.txt",
         "nul.db",
+        "com¹.db",
     ]
     for key in invalid_keys:
         with pytest.raises(ValueError, match="(?i)invalid|traversal|device"):
@@ -376,7 +383,14 @@ def test_get_trust_file_path_rejects_nul_and_dos_devices():
         "NUL",
         "COM1",
         "LPT1",
+        "COM¹",
+        "COM²",
+        "COM³",
+        "LPT¹",
+        "LPT²",
+        "LPT³",
         "con.json",
+        "lpt¹.json",
     ]
     for rid in invalid_ids:
         with pytest.raises(ValueError, match="(?i)invalid|traversal|device"):
@@ -412,6 +426,26 @@ def test_workspace_resolve_in_worktree_rejects_dos_device_names(tmp_path):
         "com9",
         "LPT1",
         "lpt9",
+        "COM¹",
+        "com¹",
+        "COM²",
+        "com²",
+        "COM³",
+        "com³",
+        "LPT¹",
+        "lpt¹",
+        "LPT²",
+        "lpt²",
+        "LPT³",
+        "lpt³",
+        "COM¹.txt",
+        "COM²:",
+        "COM³   ",
+        "LPT¹...",
+        "LPT².:",
+        "COM¹:stream",
+        "sub/COM¹",
+        "sub/COM².txt",
         "CON.txt",
         "con.log",
         "conin$.txt",
@@ -425,8 +459,11 @@ def test_workspace_resolve_in_worktree_rejects_dos_device_names(tmp_path):
         with pytest.raises(ValueError, match="(?i)device|reserved|outside"):
             ws.resolve_in_worktree(dev)
 
-    # Verify legitimate files with similar prefixes are not blocked
-    legitimate_names = ["conference.py", "connection.ts", "clock.py", "nulled.json", "context.md"]
+    # Verify legitimate files with similar prefixes and near-misses are not blocked
+    legitimate_names = [
+        "conference.py", "connection.ts", "clock.py", "nulled.json", "context.md",
+        "COM⁴", "com⁴", "LPT⁴", "lpt⁴", "COM10", "LPT10", "COM10.txt"
+    ]
     for leg in legitimate_names:
         resolved = ws.resolve_in_worktree(leg)
         assert resolved == repo / leg
@@ -446,6 +483,15 @@ def test_workspace_stage_file_mutation_rejects_dos_device_names(tmp_path):
 
     ws = Workspace(repo_dir=repo)
 
-    for dev in ["NUL", "AUX", "PRN", "COM1", "CONIN$", "CLOCK$", "CON.txt", "conin$.txt", "sub/CON.log"]:
+    for dev in [
+        "NUL", "AUX", "PRN", "COM1", "CONIN$", "CLOCK$", "CON.txt", "conin$.txt", "sub/CON.log",
+        "COM¹", "com¹", "COM²", "com²", "COM³", "com³",
+        "LPT¹", "lpt¹", "LPT²", "lpt²", "LPT³", "lpt³",
+        "COM¹.txt", "COM²:", "sub/COM¹",
+    ]:
         with pytest.raises((ValueError, PermissionError), match="(?i)device|reserved|outside|blocked"):
             ws.stage_file_mutation(dev, "test content")
+
+    # Verify staging legitimate near-miss does not trigger DOS device rejection
+    ws.stage_file_mutation("COM10.txt", "legitimate content")
+    assert (repo / "COM10.txt").read_text(encoding="utf-8") == "legitimate content" 
