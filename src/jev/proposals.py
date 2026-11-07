@@ -22,7 +22,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 yaml = importlib.import_module("yaml")
 
@@ -157,11 +157,30 @@ def compute_proposal_identity_hash(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+
+PROPOSAL_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_\-]+$")
+
+
+def validate_proposal_id(val: str) -> str:
+    """Validates that proposal id contains only alphanumeric, hyphen, and underscore characters and no path traversal."""
+    if not isinstance(val, str) or not val:
+        raise ValueError("Proposal id must be a non-empty string.")
+    if ".." in val or "/" in val or "\\" in val or "\x00" in val:
+        raise ValueError(f"Proposal id contains invalid path traversal characters: '{val}'")
+    if not PROPOSAL_ID_PATTERN.match(val):
+        raise ValueError(f"Proposal id contains invalid characters: '{val}'. Only alphanumeric, '-', and '_' are allowed.")
+    return val
+
 class Proposal(BaseModel):
     """Schema for a test command proposal generated for unknown ecosystems."""
     model_config = ConfigDict(extra="ignore")
 
     id: str
+
+    @field_validator("id")
+    @classmethod
+    def check_id_format(cls, v: str) -> str:
+        return validate_proposal_id(v)
     repo_id: str
     exact_argv: List[str]
     cwd: str = "."
@@ -202,10 +221,31 @@ class Proposal(BaseModel):
 
 
 def get_proposals_dir(repo_dir: Union[str, Path]) -> Path:
-    """Returns .jev/proposals directory for a repository, creating it if needed."""
-    pdir = Path(repo_dir).resolve() / ".jev" / "proposals"
-    pdir.mkdir(parents=True, exist_ok=True)
-    return pdir
+    """Returns .jev/proposals directory for a repository, creating it if needed.
+
+    Rejects symlinked .jev or .jev/proposals directory components and verifies
+    that the resolved proposals directory remains strictly inside the repository root.
+    """
+    trusted_repo = Path(repo_dir).resolve()
+    jev_dir = trusted_repo / ".jev"
+    if jev_dir.is_symlink():
+        raise PermissionError(f"Rejected symlinked .jev directory: {jev_dir}")
+    proposals_dir = jev_dir / "proposals"
+    if proposals_dir.is_symlink():
+        raise PermissionError(f"Rejected symlinked proposals directory: {proposals_dir}")
+
+    proposals_dir.mkdir(parents=True, exist_ok=True)
+
+    if jev_dir.is_symlink() or proposals_dir.is_symlink():
+        raise PermissionError("Rejected symlinked directory component in proposals path.")
+
+    resolved_pdir = proposals_dir.resolve()
+    try:
+        resolved_pdir.relative_to(trusted_repo)
+    except ValueError:
+        raise PermissionError(f"Proposals directory '{resolved_pdir}' escapes repository root '{trusted_repo}'.")
+
+    return proposals_dir
 
 
 def save_proposal(
@@ -217,6 +257,12 @@ def save_proposal(
 
     If secret patterns are found inside exact_argv, refuses to save the proposal
     with a clear message to pass secrets via environment variables.
+
+    Security Note (TOCTOU Limitation):
+    Lexical and filesystem checks verify that .jev, .jev/proposals, and target file
+    are not symlinks and remain strictly inside the repository root. A concurrent
+    host process swapping paths between check and write represents a known TOCTOU
+    window absent OS-level openat2 RESOLVE_NO_SYMLINKS support.
     """
     if argv_contains_secrets(proposal.exact_argv):
         msg = (
@@ -254,25 +300,60 @@ def save_proposal(
         recipe_text=proposal.recipe_text,
     )
 
-    pdir = get_proposals_dir(repo_dir)
-    target = pdir / f"{proposal.id}.json"
+    validate_proposal_id(proposal.id)
+    trusted_repo = Path(repo_dir).resolve()
+    jev_dir = trusted_repo / ".jev"
+    if jev_dir.is_symlink():
+        raise PermissionError(f"Rejected symlinked .jev directory: {jev_dir}")
+
+    pdir = get_proposals_dir(trusted_repo)
+    if pdir.is_symlink():
+        raise PermissionError(f"Rejected symlinked proposals directory: {pdir}")
+
+    expected_proposals_dir = (trusted_repo / ".jev" / "proposals").resolve()
+    resolved_pdir = pdir.resolve()
+    if resolved_pdir != expected_proposals_dir:
+        raise PermissionError(f"Proposals directory mismatch: {resolved_pdir} != {expected_proposals_dir}")
+
+    clean_id = proposal.id.removesuffix(".json")
+    target = pdir / f"{clean_id}.json"
+    if target.is_symlink():
+        raise PermissionError(f"Proposal target file '{target}' cannot be a symlink.")
+
+    resolved_target = target.resolve()
+    if resolved_target.parent != expected_proposals_dir:
+        raise ValueError(f"Proposal id '{proposal.id}' escapes proposals directory.")
+
+    try:
+        resolved_target.relative_to(trusted_repo)
+    except ValueError:
+        raise PermissionError(f"Proposal target '{resolved_target}' escapes repository root '{trusted_repo}'.")
+
     target.write_text(proposal.model_dump_json(indent=2), encoding="utf-8")
     return target
 
 
 def load_proposal(proposal_id: str, repo_dir: Union[str, Path]) -> Optional[Proposal]:
     """Loads a proposal by id from .jev/proposals/<id>.json."""
-    pdir = get_proposals_dir(repo_dir)
-    clean_id = proposal_id.removesuffix(".json")
-    path = pdir / f"{clean_id}.json"
-    if not path.exists():
-        # Also check without prefix if user passed short hash
-        matches = list(pdir.glob(f"*{clean_id}*.json"))
-        if matches:
-            path = matches[0]
-        else:
-            return None
+    if not proposal_id or ".." in proposal_id or "/" in proposal_id or "\\" in proposal_id:
+        return None
     try:
+        trusted_repo = Path(repo_dir).resolve()
+        pdir = get_proposals_dir(trusted_repo)
+        expected_proposals_dir = (trusted_repo / ".jev" / "proposals").resolve()
+        clean_id = proposal_id.removesuffix(".json")
+        path = (pdir / f"{clean_id}.json").resolve()
+        if path.parent != expected_proposals_dir:
+            return None
+        if not path.exists():
+            # Also check without prefix if user passed short hash
+            matches = list(pdir.glob(f"*{clean_id}*.json"))
+            if matches:
+                path = matches[0].resolve()
+                if path.parent != expected_proposals_dir:
+                    return None
+            else:
+                return None
         data = json.loads(path.read_text(encoding="utf-8"))
         return Proposal(**data)
     except Exception:

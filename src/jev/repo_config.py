@@ -109,7 +109,13 @@ def get_trust_dir() -> Path:
 
 def get_trust_file_path(repo_id: str) -> Path:
     """Returns the external path for a repository trust record: <JEV_HOME>/trust/<repo_id>.json."""
-    return get_trust_dir() / f"{repo_id}.json"
+    if not repo_id or ".." in repo_id or "/" in repo_id or "\\" in repo_id:
+        raise ValueError(f"Invalid repo_id with path traversal: '{repo_id}'")
+    td = get_trust_dir().resolve()
+    target = (td / f"{repo_id}.json").resolve()
+    if target.parent != td:
+        raise ValueError(f"Invalid repo_id with path traversal: '{repo_id}'")
+    return target
 
 
 def normalize_command_argv(cmd: Union[str, Sequence[str]]) -> List[str]:

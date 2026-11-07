@@ -2713,7 +2713,7 @@ def node_implement(
                 )
                 try:
                     completed = subprocess.run(
-                        [sys.executable, "-c", checker, *safe_python_files],
+                        [sys.executable, "-I", "-c", checker, *safe_python_files],
                         cwd=str(implementation_root),
                         capture_output=True,
                         text=True,
@@ -3010,9 +3010,9 @@ def node_implement(
                     s_norm = s_norm[2:]
                 norm_scope.add(s_norm)
 
-            if norm_scope and norm_path not in norm_scope:
+            if not norm_scope or norm_path not in norm_scope:
                 return (
-                    f"Error: Target path '{path}' is not within declared scope {subgoal.scope}. "
+                    f"Error: Target path '{path}' is not within declared scope {subgoal.scope or []}. "
                     "You may only mutate files within the declared scope for this subgoal. "
                     "Subsequent subgoals will address other files."
                 )
