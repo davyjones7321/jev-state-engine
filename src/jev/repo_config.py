@@ -107,10 +107,44 @@ def get_trust_dir() -> Path:
     return td
 
 
+DOS_DEVICE_NAMES = frozenset({
+    "con", "prn", "aux", "nul",
+    "clock$", "conin$", "conout$",
+    "com0", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
+    "lpt0", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+    "com¹", "com²", "com³",
+    "lpt¹", "lpt²", "lpt³",
+})
+
+
+def is_dos_device_name(name: Union[str, Path]) -> bool:
+    """Checks if any segment in path or filename matches a Windows legacy DOS device name."""
+    if not name:
+        return False
+    raw = str(name).replace("\\", "/").strip()
+    for part in raw.split("/"):
+        if not part:
+            continue
+        clean_part = part.strip().rstrip(": ")
+        if not clean_part:
+            continue
+        stem = clean_part.split(".")[0].strip().rstrip(". ").lower()
+        if stem in DOS_DEVICE_NAMES:
+            return True
+        if ":" in clean_part:
+            colon_prefix = clean_part.split(":")[0].strip().rstrip(". ")
+            colon_stem = colon_prefix.split(".")[0].strip().rstrip(". ").lower()
+            if colon_stem in DOS_DEVICE_NAMES:
+                return True
+    return False
+
+
 def get_trust_file_path(repo_id: str) -> Path:
     """Returns the external path for a repository trust record: <JEV_HOME>/trust/<repo_id>.json."""
-    if not repo_id or ".." in repo_id or "/" in repo_id or "\\" in repo_id:
+    if not repo_id or ".." in repo_id or "/" in repo_id or "\\" in repo_id or "\x00" in repo_id:
         raise ValueError(f"Invalid repo_id with path traversal: '{repo_id}'")
+    if is_dos_device_name(repo_id):
+        raise ValueError(f"Invalid repo_id with DOS device name: '{repo_id}'")
     td = get_trust_dir().resolve()
     target = (td / f"{repo_id}.json").resolve()
     if target.parent != td:
@@ -580,35 +614,105 @@ def validate_trust(
     return True, None
 
 
+def _is_safe_repo_config_candidate(candidate: Path, repo_root: Path) -> bool:
+    """Verifies that candidate (.jev/config.json) and its parent .jev are not symlinks and reside strictly within repo_root."""
+    try:
+        resolved_root = repo_root.resolve()
+        candidate_jev = candidate.parent
+        if candidate_jev.name != ".jev":
+            return False
+        if candidate_jev.is_symlink() or candidate.is_symlink():
+            return False
+        resolved_jev = candidate_jev.resolve()
+        resolved_candidate = candidate.resolve()
+        if resolved_candidate.parent != resolved_jev:
+            return False
+        resolved_jev.relative_to(resolved_root)
+        resolved_candidate.relative_to(resolved_root)
+        return True
+    except (ValueError, OSError):
+        return False
+
+
 def load_repo_config(repo_dir: Union[str, Path]) -> Optional[RepoConfig]:
     """Loads and validates .jev/config.json if present in repo_dir or parent worktree repo."""
     p = Path(repo_dir).resolve()
-    cfg_file = p / ".jev" / "config.json"
-    if not cfg_file.exists() or not cfg_file.is_file():
+    jev_dir = p / ".jev"
+    cfg_file: Optional[Path] = None
+
+    if jev_dir.exists():
+        if jev_dir.is_symlink():
+            return None
+        direct_cfg = jev_dir / "config.json"
+        if direct_cfg.exists() and direct_cfg.is_file():
+            if _is_safe_repo_config_candidate(direct_cfg, p):
+                cfg_file = direct_cfg
+            else:
+                return None
+
+    if cfg_file is None:
         curr = p
         while curr != curr.parent:
             candidate = curr / ".jev" / "config.json"
             if candidate.exists() and candidate.is_file():
-                cfg_file = candidate
-                break
+                if _is_safe_repo_config_candidate(candidate, curr):
+                    cfg_file = candidate
+                    break
+                else:
+                    return None
             git_file = curr / ".git"
-            if git_file.exists() and git_file.is_file():
+            if git_file.exists() and git_file.is_file() and not git_file.is_symlink():
                 try:
                     gitdir_content = git_file.read_text(encoding="utf-8").strip()
                     if gitdir_content.startswith("gitdir:"):
-                        gitdir_path = Path(gitdir_content[7:].strip())
+                        raw_gitdir = gitdir_content[7:].strip()
+                        gitdir_path = Path(raw_gitdir)
                         if not gitdir_path.is_absolute():
                             gitdir_path = (curr / gitdir_path).resolve()
-                        main_repo = gitdir_path.parent.parent.parent
-                        candidate = main_repo / ".jev" / "config.json"
-                        if candidate.exists() and candidate.is_file():
-                            cfg_file = candidate
-                            break
+                        else:
+                            gitdir_path = gitdir_path.resolve()
+
+                        # Validate that gitdir_path is an authentic Git worktree directory
+                        # with valid commondir and a verifiable bidirectional backlink
+                        commondir_file = gitdir_path / "commondir"
+                        backlink_file = gitdir_path / "gitdir"
+                        if (
+                            gitdir_path.is_dir()
+                            and not gitdir_path.is_symlink()
+                            and commondir_file.is_file()
+                            and not commondir_file.is_symlink()
+                            and backlink_file.is_file()
+                            and not backlink_file.is_symlink()
+                        ):
+                            backlink_raw = backlink_file.read_text(encoding="utf-8").strip()
+                            backlink_target = Path(backlink_raw)
+                            if not backlink_target.is_absolute():
+                                backlink_target = (gitdir_path / backlink_target).resolve()
+                            else:
+                                backlink_target = backlink_target.resolve()
+
+                            # Require bidirectional linkage: worktree .git must match the gitdir backlink
+                            if backlink_target == git_file.resolve():
+                                commondir_raw = commondir_file.read_text(encoding="utf-8").strip()
+                                commondir_path = (gitdir_path / commondir_raw).resolve()
+                                if commondir_path.name == ".git":
+                                    main_repo = commondir_path.parent.resolve()
+                                else:
+                                    main_repo = commondir_path.resolve()
+
+                                candidate = main_repo / ".jev" / "config.json"
+                                if candidate.exists() and candidate.is_file():
+                                    if _is_safe_repo_config_candidate(candidate, main_repo):
+                                        cfg_file = candidate
+                                        break
+                                    else:
+                                        return None
                 except Exception:
                     pass
             curr = curr.parent
-        else:
-            return None
+
+    if cfg_file is None:
+        return None
 
     try:
         data = json.loads(cfg_file.read_text(encoding="utf-8"))
@@ -619,11 +723,45 @@ def load_repo_config(repo_dir: Union[str, Path]) -> Optional[RepoConfig]:
 
 def save_repo_config(config: RepoConfig, repo_dir: Union[str, Path]) -> Path:
     """Saves .jev/config.json inside the repository (declarations only, never trust)."""
-    p = Path(repo_dir).resolve()
-    target = p / ".jev" / "config.json"
-    target.parent.mkdir(parents=True, exist_ok=True)
+    trusted_repo = Path(repo_dir).resolve()
+    jev_dir = trusted_repo / ".jev"
+    if jev_dir.is_symlink():
+        raise PermissionError(f"Rejected symlinked .jev directory: {jev_dir}")
+    jev_dir.mkdir(parents=True, exist_ok=True)
+    if jev_dir.is_symlink():
+        raise PermissionError("Rejected symlinked directory component in config path.")
+
+    resolved_jev = jev_dir.resolve()
+    try:
+        resolved_jev.relative_to(trusted_repo)
+    except ValueError:
+        raise PermissionError(f"Config directory '{resolved_jev}' escapes repository root '{trusted_repo}'.")
+
+    target = jev_dir / "config.json"
+    if target.is_symlink():
+        raise PermissionError(f"Config target file '{target}' cannot be a symlink.")
+
+    resolved_target = target.resolve()
+    if resolved_target.parent != resolved_jev:
+        raise PermissionError(f"Config target '{resolved_target}' escapes config directory.")
+    try:
+        resolved_target.relative_to(trusted_repo)
+    except ValueError:
+        raise PermissionError(f"Config target '{resolved_target}' escapes repository root '{trusted_repo}'.")
 
     # Exclude internal ignored_embedded_trust flag
     data = config.model_dump(exclude={"ignored_embedded_trust"}, exclude_none=True)
-    target.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    import uuid
+    temp_target = jev_dir / f".tmp_config_{uuid.uuid4().hex}.json"
+    try:
+        temp_target.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        if target.is_symlink():
+            raise PermissionError(f"Config target file '{target}' cannot be a symlink.")
+        os.replace(temp_target, target)
+    finally:
+        if temp_target.exists():
+            try:
+                temp_target.unlink()
+            except OSError:
+                pass
     return target

@@ -22,8 +22,11 @@ logger = logging.getLogger(__name__)
 
 def get_knowledge_db_path(repo_key: str) -> Path:
     """Returns the default knowledge.db path for a repository key: <JEV_HOME>/repos/<repo_key>/knowledge.db."""
-    if not repo_key or ".." in repo_key or "/" in repo_key or "\\" in repo_key:
+    if not repo_key or ".." in repo_key or "/" in repo_key or "\\" in repo_key or "\x00" in repo_key:
         raise ValueError(f"Invalid repo_key with path traversal: '{repo_key}'")
+    from jev.repo_config import is_dos_device_name
+    if is_dos_device_name(repo_key):
+        raise ValueError(f"Invalid repo_key with DOS device name: '{repo_key}'")
     repos_dir = (get_jev_home() / "repos").resolve()
     target = (repos_dir / repo_key / "knowledge.db").resolve()
     if target.parent.parent != repos_dir:
@@ -183,6 +186,11 @@ class KnowledgeStore:
         readonly: bool = False,
     ):
         self.db_path = Path(db_path)
+        if str(self.db_path) != ":memory:":
+            if self.db_path.is_symlink():
+                raise PermissionError(f"Rejected symlinked database path: {self.db_path}")
+            if any(p.is_symlink() for p in self.db_path.parents):
+                raise PermissionError(f"Rejected database path with symlinked parent: {self.db_path}")
         self.repo_key = repo_key
         self.ttl_days = ttl_days
         self._clock = clock if clock is not None else (lambda: datetime.now(timezone.utc))
@@ -198,6 +206,8 @@ class KnowledgeStore:
 
     def _init_db(self) -> None:
         if str(self.db_path) != ":memory:":
+            if self.db_path.is_symlink() or any(p.is_symlink() for p in self.db_path.parents):
+                raise PermissionError(f"Rejected symlinked database path: {self.db_path}")
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
             if self.db_path.exists():
                 conn = None
@@ -264,6 +274,9 @@ class KnowledgeStore:
 
     @contextmanager
     def _connect(self, readonly: bool = False):
+        if str(self.db_path) != ":memory:":
+            if self.db_path.is_symlink() or any(p.is_symlink() for p in self.db_path.parents):
+                raise PermissionError(f"Rejected symlinked database path: {self.db_path}")
         ro = readonly or self.readonly
         if str(self.db_path) == ":memory:":
             conn = sqlite3.connect(":memory:")
