@@ -661,7 +661,7 @@ def load_repo_config(repo_dir: Union[str, Path]) -> Optional[RepoConfig]:
                 else:
                     return None
             git_file = curr / ".git"
-            if git_file.exists() and git_file.is_file():
+            if git_file.exists() and git_file.is_file() and not git_file.is_symlink():
                 try:
                     gitdir_content = git_file.read_text(encoding="utf-8").strip()
                     if gitdir_content.startswith("gitdir:"):
@@ -671,14 +671,42 @@ def load_repo_config(repo_dir: Union[str, Path]) -> Optional[RepoConfig]:
                             gitdir_path = (curr / gitdir_path).resolve()
                         else:
                             gitdir_path = gitdir_path.resolve()
-                        main_repo = gitdir_path.parent.parent.parent.resolve()
-                        candidate = main_repo / ".jev" / "config.json"
-                        if candidate.exists() and candidate.is_file():
-                            if _is_safe_repo_config_candidate(candidate, main_repo):
-                                cfg_file = candidate
-                                break
+
+                        # Validate that gitdir_path is an authentic Git worktree directory
+                        # with valid commondir and a verifiable bidirectional backlink
+                        commondir_file = gitdir_path / "commondir"
+                        backlink_file = gitdir_path / "gitdir"
+                        if (
+                            gitdir_path.is_dir()
+                            and not gitdir_path.is_symlink()
+                            and commondir_file.is_file()
+                            and not commondir_file.is_symlink()
+                            and backlink_file.is_file()
+                            and not backlink_file.is_symlink()
+                        ):
+                            backlink_raw = backlink_file.read_text(encoding="utf-8").strip()
+                            backlink_target = Path(backlink_raw)
+                            if not backlink_target.is_absolute():
+                                backlink_target = (gitdir_path / backlink_target).resolve()
                             else:
-                                return None
+                                backlink_target = backlink_target.resolve()
+
+                            # Require bidirectional linkage: worktree .git must match the gitdir backlink
+                            if backlink_target == git_file.resolve():
+                                commondir_raw = commondir_file.read_text(encoding="utf-8").strip()
+                                commondir_path = (gitdir_path / commondir_raw).resolve()
+                                if commondir_path.name == ".git":
+                                    main_repo = commondir_path.parent.resolve()
+                                else:
+                                    main_repo = commondir_path.resolve()
+
+                                candidate = main_repo / ".jev" / "config.json"
+                                if candidate.exists() and candidate.is_file():
+                                    if _is_safe_repo_config_candidate(candidate, main_repo):
+                                        cfg_file = candidate
+                                        break
+                                    else:
+                                        return None
                 except Exception:
                     pass
             curr = curr.parent

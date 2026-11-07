@@ -136,17 +136,100 @@ def test_load_repo_config_parent_worktree_discovery_works(tmp_path):
     assert loaded_sub is not None
     assert loaded_sub.test_command == ["pytest"]
 
-    # 2. Git worktree with gitdir: pointer
+    # 2. Git worktree with authentic bidirectional gitdir and commondir linkage
     worktree_dir = tmp_path / "worktree_wt"
     worktree_dir.mkdir()
     fake_gitdir = main_repo / ".git" / "worktrees" / "wt"
     fake_gitdir.mkdir(parents=True)
     git_file = worktree_dir / ".git"
     git_file.write_text(f"gitdir: {fake_gitdir}\n", encoding="utf-8")
+    (fake_gitdir / "commondir").write_text("../..\n", encoding="utf-8")
+    (fake_gitdir / "gitdir").write_text(f"{git_file.resolve()}\n", encoding="utf-8")
 
     loaded_wt = load_repo_config(worktree_dir)
     assert loaded_wt is not None
     assert loaded_wt.test_command == ["pytest"]
+
+
+def test_load_repo_config_rejects_untrusted_gitdir_pointers(tmp_path):
+    """Verifies load_repo_config rejects untrusted, forged, or mismatched .git gitdir pointers."""
+    # External legitimate repository with its own .jev config
+    external_repo = tmp_path / "external_repo"
+    external_repo.mkdir()
+    ext_jev = external_repo / ".jev"
+    ext_jev.mkdir()
+    (ext_jev / "config.json").write_text(
+        json.dumps({"runner_profile": "pytest", "test_command": ["pytest", "external"]}),
+        encoding="utf-8",
+    )
+    ext_git_wt = external_repo / ".git" / "worktrees" / "valid_wt"
+    ext_git_wt.mkdir(parents=True)
+    (ext_git_wt / "commondir").write_text("../..\n", encoding="utf-8")
+    real_ext_wt_git = external_repo / "real_wt" / ".git"
+    (ext_git_wt / "gitdir").write_text(f"{real_ext_wt_git.resolve()}\n", encoding="utf-8")
+
+    # 1. Attacker directory with forged pointer to external_repo's worktree metadata
+    attacker_dir = tmp_path / "attacker_dir"
+    attacker_dir.mkdir()
+    (attacker_dir / ".git").write_text(f"gitdir: {ext_git_wt}\n", encoding="utf-8")
+
+    # Attacker's worktree .git is not backlinked by external_repo, must be rejected
+    assert load_repo_config(attacker_dir) is None
+
+    # 2. Forged pointer with missing commondir
+    broken_gitdir = tmp_path / "broken_gitdir"
+    broken_gitdir.mkdir()
+    (broken_gitdir / "gitdir").write_text(f"{(attacker_dir / '.git').resolve()}\n", encoding="utf-8")
+    (attacker_dir / ".git").write_text(f"gitdir: {broken_gitdir}\n", encoding="utf-8")
+    assert load_repo_config(attacker_dir) is None
+
+    # 3. Forged pointer with missing gitdir backlink
+    broken_gitdir2 = tmp_path / "broken_gitdir2"
+    broken_gitdir2.mkdir()
+    (broken_gitdir2 / "commondir").write_text("../..\n", encoding="utf-8")
+    (attacker_dir / ".git").write_text(f"gitdir: {broken_gitdir2}\n", encoding="utf-8")
+    assert load_repo_config(attacker_dir) is None
+
+    # 4. Forged pointer to nonexistent target
+    (attacker_dir / ".git").write_text("gitdir: /nonexistent/external/path\n", encoding="utf-8")
+    assert load_repo_config(attacker_dir) is None
+
+    # 5. Symlinked .git file in worktree
+    symlink_wt = tmp_path / "symlink_wt"
+    symlink_wt.mkdir()
+    real_git_file = tmp_path / "real_git_file"
+    real_git_file.write_text(f"gitdir: {ext_git_wt}\n", encoding="utf-8")
+    try:
+        os.symlink(str(real_git_file), str(symlink_wt / ".git"))
+        assert load_repo_config(symlink_wt) is None
+    except OSError:
+        pass
+
+
+def test_load_repo_config_real_git_worktree_integration(tmp_path):
+    """Verifies load_repo_config works with authentic Git worktree created via git worktree add."""
+    main = tmp_path / "main"
+    main.mkdir()
+    subprocess.run(["git", "init"], cwd=str(main), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Tester"], cwd=str(main), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=str(main), check=True, capture_output=True)
+    (main / "dummy.txt").write_text("content", encoding="utf-8")
+    subprocess.run(["git", "add", "dummy.txt"], cwd=str(main), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=str(main), check=True, capture_output=True)
+
+    main_jev = main / ".jev"
+    main_jev.mkdir()
+    (main_jev / "config.json").write_text(
+        json.dumps({"runner_profile": "pytest", "test_command": ["pytest"]}),
+        encoding="utf-8",
+    )
+
+    wt = tmp_path / "actual_worktree"
+    subprocess.run(["git", "worktree", "add", str(wt), "HEAD"], cwd=str(main), check=True, capture_output=True)
+
+    loaded = load_repo_config(wt)
+    assert loaded is not None
+    assert loaded.test_command == ["pytest"]
 
 
 # -----------------------------------------------------------------------------
