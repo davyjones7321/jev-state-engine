@@ -344,19 +344,19 @@ I attest that Phase R4 of the security audit and boundary hardening has been com
 - **Commit 11** (`4357334`): `fix(security): reject Windows superscript reserved device names COM¹-³ and LPT¹-³`
 - **Commit 12** (`dd0d300`): `test(security): strengthen proposal atomic concurrency verification with active read-write overlap`
 - **Commit 13** (`af2650d`): `fix(security): validate bidirectional gitdir linkage before trusting parent worktree repo config`
-- **Commit 14**: `docs(hardening-r4): accurately scope atomic replacement guarantees and intermediate parent directory TOCTOU limitations`
+- **Commit 14** (`ad4dd2d`): `docs(hardening-r4): accurately scope atomic replacement guarantees and intermediate parent directory TOCTOU limitations`
 
 ---
 
 ## 15. Appendix: Test Inventory
 
-- `tests/test_hardening_r4_security.py` (14 targeted tests)
+- `tests/test_hardening_r4_security.py` (16 targeted tests)
 - `tests/test_hardening_r3_security.py` (21 tests)
 - `tests/test_proposals.py` (21 tests)
 - `tests/test_knowledge.py` (16 tests)
 - `tests/test_workspace.py` (38 tests)
 - `tests/test_repo_config.py` (28 tests)
-- Full test suite: 1,358 passed, 42 skipped (platform-dependent), 2 deselected.
+- Full test suite: 1,360 passed, 42 skipped (platform-dependent), 2 deselected.
 
 ---
 
