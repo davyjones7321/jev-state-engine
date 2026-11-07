@@ -262,19 +262,34 @@ def test_workspace_resolve_in_worktree_rejects_dos_device_names(tmp_path):
         "aux",
         "NUL",
         "nul",
+        "CONIN$",
+        "conin$",
+        "CONOUT$",
+        "conout$",
+        "CLOCK$",
+        "clock$",
         "COM1",
         "com9",
         "LPT1",
         "lpt9",
         "CON.txt",
         "con.log",
+        "conin$.txt",
+        "CONOUT$.log",
         "sub/CON",
         "sub/aux.py",
+        "sub/conin$.txt",
     ]
 
     for dev in device_names:
         with pytest.raises(ValueError, match="(?i)device|reserved|outside"):
             ws.resolve_in_worktree(dev)
+
+    # Verify legitimate files with similar prefixes are not blocked
+    legitimate_names = ["conference.py", "connection.ts", "clock.py", "nulled.json", "context.md"]
+    for leg in legitimate_names:
+        resolved = ws.resolve_in_worktree(leg)
+        assert resolved == repo / leg
 
 
 def test_workspace_stage_file_mutation_rejects_dos_device_names(tmp_path):
@@ -291,6 +306,6 @@ def test_workspace_stage_file_mutation_rejects_dos_device_names(tmp_path):
 
     ws = Workspace(repo_dir=repo)
 
-    for dev in ["NUL", "AUX", "PRN", "COM1", "CON.txt", "sub/CON.log"]:
+    for dev in ["NUL", "AUX", "PRN", "COM1", "CONIN$", "CLOCK$", "CON.txt", "conin$.txt", "sub/CON.log"]:
         with pytest.raises((ValueError, PermissionError), match="(?i)device|reserved|outside|blocked"):
             ws.stage_file_mutation(dev, "test content")

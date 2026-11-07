@@ -109,8 +109,9 @@ def get_trust_dir() -> Path:
 
 DOS_DEVICE_NAMES = frozenset({
     "con", "prn", "aux", "nul",
-    "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
-    "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+    "clock$", "conin$", "conout$",
+    "com0", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
+    "lpt0", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
 })
 
 
@@ -122,7 +123,10 @@ def is_dos_device_name(name: Union[str, Path]) -> bool:
     for part in raw.split("/"):
         if not part:
             continue
-        stem = part.split(".")[0].strip().lower()
+        clean_part = part.strip()
+        if clean_part.endswith(":"):
+            clean_part = clean_part[:-1].strip()
+        stem = clean_part.split(".")[0].strip().rstrip(". ").lower()
         if stem in DOS_DEVICE_NAMES:
             return True
     return False
