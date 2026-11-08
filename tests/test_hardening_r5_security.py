@@ -251,3 +251,82 @@ class TestR5WorktreeDiscardContainment:
             ws.discard_subgoal_worktree(outside)
         assert outside.exists(), "External directory was deleted!"
         assert canary.exists()
+
+
+def make_dir_link(target: Path, link_path: Path):
+    import sys
+    if sys.platform == "win32":
+        import _winapi
+        _winapi.CreateJunction(str(target), str(link_path))
+    else:
+        import os
+        os.symlink(str(target), str(link_path), target_is_directory=True)
+
+
+class TestR5WorktreeBaseSymlinkBoundary:
+    """Tests for worktree base directory symlink/junction and symlinked worktree target defenses."""
+
+    def test_discard_through_symlinked_base_rejected(self, git_repo: Path, tmp_path: Path):
+        outside = tmp_path / "outside_worktrees"
+        outside.mkdir()
+        canary = outside / "canary.txt"
+        canary.write_text("OUTSIDE_CANARY", encoding="utf-8")
+        victim_sub = outside / "subgoal-1"
+        victim_sub.mkdir()
+        victim_file = victim_sub / "important.txt"
+        victim_file.write_text("DO_NOT_DELETE", encoding="utf-8")
+
+        base_link = git_repo / ".jev-worktrees"
+        make_dir_link(outside, base_link)
+
+        ws = Workspace(repo_dir=git_repo)
+        target_path = base_link / "subgoal-1"
+
+        with pytest.raises((ValueError, PermissionError), match=r"symlink|junction|escapes|refusing"):
+            ws.discard_subgoal_worktree(target_path)
+
+        with pytest.raises((ValueError, PermissionError), match=r"symlink|junction|escapes|refusing"):
+            ws.discard_verify_worktree(target_path)
+
+        assert outside.exists(), "Outside directory was removed!"
+        assert canary.exists(), "Canary file in outside directory was deleted!"
+        assert victim_file.exists(), "Victim file was deleted!"
+
+    def test_create_subgoal_through_symlinked_base_rejected(self, git_repo: Path, tmp_path: Path):
+        outside = tmp_path / "outside_worktrees"
+        outside.mkdir()
+        canary = outside / "canary.txt"
+        canary.write_text("OUTSIDE_CANARY", encoding="utf-8")
+
+        base_link = git_repo / ".jev-worktrees"
+        make_dir_link(outside, base_link)
+
+        ws = Workspace(repo_dir=git_repo)
+
+        with pytest.raises((ValueError, PermissionError), match=r"symlink|junction|escapes|refusing"):
+            ws.create_subgoal_worktree("sg1")
+
+        assert canary.exists()
+        assert not (outside / "subgoal-sg1").exists(), "Worktree directory was created inside outside dir!"
+
+    def test_discard_symlinked_worktree_target_rejected(self, git_repo: Path, tmp_path: Path):
+        outside = tmp_path / "outside_victim"
+        outside.mkdir()
+        canary = outside / "canary.txt"
+        canary.write_text("VICTIM_CANARY", encoding="utf-8")
+
+        worktrees_dir = git_repo / ".jev-worktrees"
+        worktrees_dir.mkdir(parents=True, exist_ok=True)
+        target_link = worktrees_dir / "subgoal-symtarget"
+        make_dir_link(outside, target_link)
+
+        ws = Workspace(repo_dir=git_repo)
+
+        with pytest.raises((ValueError, PermissionError), match=r"symlink|junction|escapes|refusing"):
+            ws.discard_subgoal_worktree(target_link)
+
+        with pytest.raises((ValueError, PermissionError), match=r"symlink|junction|escapes|refusing"):
+            ws.discard_verify_worktree(target_link)
+
+        assert outside.exists(), "Outside victim directory was deleted!"
+        assert canary.exists()

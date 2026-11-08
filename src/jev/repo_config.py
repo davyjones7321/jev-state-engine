@@ -553,6 +553,11 @@ def record_trust(
     if trust_path.parent != trust_dir:
         raise PermissionError(f"Trust target '{trust_path}' escapes trust directory '{trust_dir}'.")
 
+    # Security guarantee & TOCTOU limitations:
+    # - Atomic replacement protects against partial final-file writes.
+    # - Final-target symlink checks provide protection against straightforward symlink attacks.
+    # - Path-based checks do not guarantee immunity to concurrent replacement of parent directories.
+    # - Complete race resistance is not claimed across hostile local environments.
     import uuid
     temp_target = trust_dir / f".tmp_trust_{uuid.uuid4().hex}.json"
     try:
