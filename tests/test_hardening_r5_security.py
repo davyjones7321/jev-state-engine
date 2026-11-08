@@ -65,3 +65,60 @@ class TestR5SubgoalWorktreeContainment:
         for bad_id in ["../traversal", "x/../y", "has space", "bad;char"]:
             with pytest.raises(ValueError):
                 Subgoal(id=bad_id)
+
+
+class TestR5NodeModulesContainment:
+    """VULN-2: Prevent host read escape via external node_modules symlink/junction."""
+
+    def test_node_modules_external_link_creation_blocked(self, tmp_path: Path):
+        import sys
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "secret.txt").write_text("SECRET_OUTSIDE", encoding="utf-8")
+
+        nm = repo / "node_modules"
+        if sys.platform == "win32":
+            import _winapi
+            _winapi.CreateJunction(str(outside), str(nm))
+        else:
+            import os
+            os.symlink(str(outside), str(nm), target_is_directory=True)
+
+        wt = tmp_path / "wt"
+        wt.mkdir()
+
+        Workspace._link_node_modules(repo, wt)
+        assert not (wt / "node_modules").exists(), "_link_node_modules created link to external target!"
+
+    def test_node_modules_external_symlink_read_blocked(self, tmp_path: Path):
+        import sys
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "secret.txt").write_text("SECRET_OUTSIDE", encoding="utf-8")
+
+        nm = repo / "node_modules"
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        wt_nm = wt / "node_modules"
+
+        if sys.platform == "win32":
+            import _winapi
+            _winapi.CreateJunction(str(outside), str(nm))
+            _winapi.CreateJunction(str(outside), str(wt_nm))
+        else:
+            import os
+            os.symlink(str(outside), str(nm), target_is_directory=True)
+            os.symlink(str(outside), str(wt_nm), target_is_directory=True)
+
+        ws = Workspace(repo_dir=repo)
+        ws.worktree_dir = wt
+
+        with pytest.raises((ValueError, PermissionError)):
+            ws._resolve_for_read("node_modules/secret.txt")
+
+        res = ws.run_read_tool("cat", ["node_modules/secret.txt"])
+        assert "SECRET_OUTSIDE" not in res

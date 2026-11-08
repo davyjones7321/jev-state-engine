@@ -1470,9 +1470,17 @@ class Workspace:
             nm_dir = self.repo_dir / "node_modules"
             if not nm_dir.exists():
                 raise original_err
+            try:
+                resolved_repo = self.repo_dir.resolve()
+                resolved_nm = nm_dir.resolve()
+                resolved_nm.relative_to(resolved_repo)
+            except (ValueError, OSError):
+                raise original_err
+
             candidate = (self.worktree_dir / normalized).resolve()
             try:
-                candidate.relative_to(nm_dir.resolve())
+                candidate.relative_to(resolved_nm)
+                candidate.relative_to(resolved_repo)
                 return candidate
             except ValueError:
                 raise original_err
@@ -2054,7 +2062,14 @@ class Workspace:
 
     @classmethod
     def _link_node_modules(cls, src_repo_dir: Path, target_worktree_dir: Path) -> None:
-        src_nm = src_repo_dir / "node_modules"
+        try:
+            resolved_src_repo = src_repo_dir.resolve()
+            src_nm = src_repo_dir / "node_modules"
+            resolved_src_nm = src_nm.resolve()
+            resolved_src_nm.relative_to(resolved_src_repo)
+        except (ValueError, OSError):
+            return
+
         target_nm = target_worktree_dir / "node_modules"
         if src_nm.exists() and src_nm.is_dir() and not target_nm.exists() and not cls._is_junction_or_symlink(target_nm):
             if sys.platform == "win32":
