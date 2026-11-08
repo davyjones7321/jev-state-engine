@@ -329,32 +329,57 @@ def save_proposal(
     except ValueError:
         raise PermissionError(f"Proposal target '{resolved_target}' escapes repository root '{trusted_repo}'.")
 
-    target.write_text(proposal.model_dump_json(indent=2), encoding="utf-8")
+    import uuid
+    temp_target = pdir / f".tmp_{clean_id}_{uuid.uuid4().hex}.json"
+    try:
+        temp_target.write_text(proposal.model_dump_json(indent=2), encoding="utf-8")
+        if target.is_symlink():
+            raise PermissionError(f"Proposal target file '{target}' cannot be a symlink.")
+        os.replace(temp_target, target)
+    finally:
+        if temp_target.exists():
+            try:
+                temp_target.unlink()
+            except OSError:
+                pass
     return target
 
 
 def load_proposal(proposal_id: str, repo_dir: Union[str, Path]) -> Optional[Proposal]:
     """Loads a proposal by id from .jev/proposals/<id>.json."""
-    if not proposal_id or ".." in proposal_id or "/" in proposal_id or "\\" in proposal_id:
+    if not proposal_id or ".." in proposal_id or "/" in proposal_id or "\\" in proposal_id or "\x00" in proposal_id:
         return None
     try:
         trusted_repo = Path(repo_dir).resolve()
         pdir = get_proposals_dir(trusted_repo)
         expected_proposals_dir = (trusted_repo / ".jev" / "proposals").resolve()
         clean_id = proposal_id.removesuffix(".json")
-        path = (pdir / f"{clean_id}.json").resolve()
-        if path.parent != expected_proposals_dir:
+        target_file = pdir / f"{clean_id}.json"
+
+        # Check symlink on the filesystem entry BEFORE resolving
+        if target_file.is_symlink():
             return None
-        if not path.exists():
+
+        if not target_file.exists():
             # Also check without prefix if user passed short hash
-            matches = list(pdir.glob(f"*{clean_id}*.json"))
+            matches = [m for m in pdir.glob(f"*{clean_id}*.json") if not m.is_symlink()]
             if matches:
-                path = matches[0].resolve()
-                if path.parent != expected_proposals_dir:
-                    return None
+                target_file = matches[0]
             else:
                 return None
-        data = json.loads(path.read_text(encoding="utf-8"))
+
+        if target_file.is_symlink():
+            return None
+
+        resolved_path = target_file.resolve()
+        if resolved_path.parent != expected_proposals_dir:
+            return None
+        try:
+            resolved_path.relative_to(trusted_repo)
+        except ValueError:
+            return None
+
+        data = json.loads(resolved_path.read_text(encoding="utf-8"))
         return Proposal(**data)
     except Exception:
         return None
@@ -365,6 +390,8 @@ def list_proposals(repo_dir: Union[str, Path]) -> List[Proposal]:
     pdir = get_proposals_dir(repo_dir)
     proposals: List[Proposal] = []
     for f in pdir.glob("*.json"):
+        if f.is_symlink():
+            continue
         try:
             p = Proposal(**json.loads(f.read_text(encoding="utf-8")))
             proposals.append(p)

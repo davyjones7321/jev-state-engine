@@ -1394,6 +1394,11 @@ class Workspace:
         norm_posix = raw_str.replace("\\", "/")
         worktree_root = self.worktree_dir.resolve()
 
+        # Reject Windows legacy DOS reserved device names
+        from jev.repo_config import is_dos_device_name
+        if is_dos_device_name(raw_str) or is_dos_device_name(norm_posix):
+            raise ValueError(f"Windows DOS device name '{path}' is not allowed within worktree.")
+
         # Paths are an untrusted, platform-independent relative-path
         # contract. Never resolve an absolute path and accept it merely
         # because it happens to point below the worktree.
@@ -1413,6 +1418,10 @@ class Workspace:
         parts = normalized.split("/")
         if ".." in parts or normalized == ".." or normalized.startswith("../"):
             raise ValueError(f"Path '{path}' traverses outside worktree.")
+
+        for p in parts:
+            if is_dos_device_name(p):
+                raise ValueError(f"Windows DOS device name '{path}' is not allowed within worktree.")
 
         candidate = self.worktree_dir / normalized
         resolved_candidate = candidate.resolve()
@@ -1662,6 +1671,10 @@ class Workspace:
         if norm_str.startswith("./"):
             norm_str = norm_str[2:]
 
+        from jev.repo_config import is_dos_device_name
+        if is_dos_device_name(raw_str) or is_dos_device_name(norm_str):
+            raise PermissionError(f"Modifying DOS device names is blocked: '{path}'.")
+
         if norm_str == "." or norm_str.startswith(".."):
             raise PermissionError(f"Modifying path with traversal is blocked: '{path}'.")
 
@@ -1703,7 +1716,19 @@ class Workspace:
 
         target_path.parent.mkdir(parents=True, exist_ok=True)
         content_bytes = content.encode("utf-8") if isinstance(content, str) else content
-        target_path.write_bytes(content_bytes)
+        import uuid
+        temp_file = target_path.parent / f".tmp_stage_{uuid.uuid4().hex}"
+        try:
+            temp_file.write_bytes(content_bytes)
+            if target_path.is_symlink() or (self.worktree_dir / norm_str).is_symlink():
+                raise PermissionError(f"Modifying symlinks is blocked: '{path}'.")
+            os.replace(temp_file, target_path)
+        finally:
+            if temp_file.exists():
+                try:
+                    temp_file.unlink()
+                except OSError:
+                    pass
         sha256_hash = hashlib.sha256(content_bytes).hexdigest()
         self.worker_staged_paths.record(rel_posix, sha256_hash)
         self._run_git(["add", rel_posix])
