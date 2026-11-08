@@ -2191,7 +2191,8 @@ class Workspace:
         if not target_branch:
             raise ValueError("target_branch is required for merge_subgoal_worktree; direct merge to main is disallowed")
 
-        wt_path = Path(worktree_path).resolve() if worktree_path else getattr(self, "current_worktree_path", None)
+        raw_path = worktree_path if worktree_path is not None else getattr(self, "current_worktree_path", None)
+        wt_path = self._validate_worktree_path(raw_path) if raw_path else None
         br_name = branch_name or getattr(self, "current_worktree_branch", None)
 
         if wt_path and wt_path.exists():
@@ -2267,9 +2268,26 @@ class Workspace:
         self.worktree_dir = verify_wt_path
         return verify_wt_path
 
+    def _validate_worktree_path(self, path: Union[str, Path]) -> Path:
+        """Validates that a worktree path is strictly within .jev-worktrees and not repo_dir."""
+        if not path:
+            raise ValueError("Worktree path cannot be empty.")
+        p = Path(path).resolve()
+        repo_root = self.repo_dir.resolve()
+        if p == repo_root:
+            raise ValueError(f"Refusing to delete repository root as worktree: {p}")
+        worktree_base = (repo_root / ".jev-worktrees").resolve()
+        if p == worktree_base:
+            raise ValueError(f"Refusing to delete .jev-worktrees base directory: {p}")
+        try:
+            p.relative_to(worktree_base)
+        except ValueError:
+            raise ValueError(f"Worktree path '{p}' escapes worktree directory '{worktree_base}'.")
+        return p
+
     def discard_verify_worktree(self, verify_path: Union[str, Path]) -> None:
         """Discards the verify worktree safely, ensuring node_modules is unlinked first."""
-        v_path = Path(verify_path).resolve()
+        v_path = self._validate_worktree_path(verify_path)
         self.worktree_dir = self.repo_dir
         if v_path.exists() or v_path.is_symlink():
             self._unlink_node_modules(v_path)
@@ -2320,7 +2338,8 @@ class Workspace:
         branch_name: Optional[str] = None,
     ) -> None:
         """Discards the subgoal worktree and deletes its branch without modifying main repo."""
-        wt_path = Path(worktree_path).resolve() if worktree_path else getattr(self, "current_worktree_path", None)
+        raw_path = worktree_path if worktree_path is not None else getattr(self, "current_worktree_path", None)
+        wt_path = self._validate_worktree_path(raw_path) if raw_path else None
         br_name = branch_name or getattr(self, "current_worktree_branch", None)
 
         self.worktree_dir = self.repo_dir

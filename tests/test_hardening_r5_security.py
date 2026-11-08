@@ -211,3 +211,43 @@ class TestR5TrustRecordPersistence:
         cfg = RepoConfig()
         with pytest.raises(PermissionError, match=r"symlinked trust directory|cannot be a symlink"):
             record_trust(cfg, repo)
+
+
+class TestR5WorktreeDiscardContainment:
+    """VULN-4: Prevent deletion of repository root or external directories via discard functions."""
+
+    def test_discard_verify_worktree_refuses_repo_root(self, git_repo: Path):
+        ws = Workspace(repo_dir=git_repo)
+        with pytest.raises(ValueError, match=r"Refusing to delete repository root"):
+            ws.discard_verify_worktree(git_repo)
+        assert git_repo.exists(), "Repository root was deleted!"
+
+    def test_discard_verify_worktree_refuses_external_path(self, git_repo: Path, tmp_path: Path):
+        outside = tmp_path / "outside_dir"
+        outside.mkdir()
+        canary = outside / "canary.txt"
+        canary.write_text("CANARY", encoding="utf-8")
+
+        ws = Workspace(repo_dir=git_repo)
+        with pytest.raises(ValueError, match=r"escapes worktree directory|Refusing"):
+            ws.discard_verify_worktree(outside)
+        assert outside.exists(), "External directory was deleted!"
+        assert canary.exists()
+
+    def test_discard_subgoal_worktree_refuses_repo_root(self, git_repo: Path):
+        ws = Workspace(repo_dir=git_repo)
+        with pytest.raises(ValueError, match=r"Refusing to delete repository root"):
+            ws.discard_subgoal_worktree(git_repo)
+        assert git_repo.exists(), "Repository root was deleted!"
+
+    def test_discard_subgoal_worktree_refuses_external_path(self, git_repo: Path, tmp_path: Path):
+        outside = tmp_path / "outside_dir"
+        outside.mkdir()
+        canary = outside / "canary.txt"
+        canary.write_text("CANARY", encoding="utf-8")
+
+        ws = Workspace(repo_dir=git_repo)
+        with pytest.raises(ValueError, match=r"escapes worktree directory|Refusing"):
+            ws.discard_subgoal_worktree(outside)
+        assert outside.exists(), "External directory was deleted!"
+        assert canary.exists()
