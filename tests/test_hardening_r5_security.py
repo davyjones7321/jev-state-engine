@@ -122,3 +122,92 @@ class TestR5NodeModulesContainment:
 
         res = ws.run_read_tool("cat", ["node_modules/secret.txt"])
         assert "SECRET_OUTSIDE" not in res
+
+
+class TestR5TrustRecordPersistence:
+    """VULN-3: Prevent symlink attacks and partial writes on trust records."""
+
+    def test_record_trust_rejects_symlinked_target(self, tmp_path: Path, monkeypatch):
+        from jev.repo_config import record_trust, RepoConfig, compute_repo_id
+        jev_home = tmp_path / "jev_home"
+        monkeypatch.setenv("JEV_HOME", str(jev_home))
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        victim = tmp_path / "victim_data.txt"
+        victim.write_text("CANARY_VICTIM_DATA", encoding="utf-8")
+
+        repo_id = compute_repo_id(repo)
+        trust_dir = jev_home / "trust"
+        trust_dir.mkdir(parents=True, exist_ok=True)
+        trust_file = trust_dir / f"{repo_id}.json"
+
+        # Create target symlink pointing to victim file (e.g., inside or outside trust dir)
+        # We test with another file inside trust_dir as well
+        victim_inside = trust_dir / "other_repo.json"
+        victim_inside.write_text("OTHER_REPO_TRUST_DATA", encoding="utf-8")
+        trust_file.symlink_to(victim_inside)
+
+        cfg = RepoConfig(build_command="echo safe")
+        with pytest.raises(PermissionError, match=r"cannot be a symlink"):
+            record_trust(cfg, repo)
+
+        assert victim_inside.read_text(encoding="utf-8") == "OTHER_REPO_TRUST_DATA", "Symlink target was overwritten!"
+
+    def test_validate_trust_rejects_symlink(self, tmp_path: Path, monkeypatch):
+        from jev.repo_config import validate_trust, RepoConfig, compute_repo_id
+        jev_home = tmp_path / "jev_home"
+        monkeypatch.setenv("JEV_HOME", str(jev_home))
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        repo_id = compute_repo_id(repo)
+        trust_dir = jev_home / "trust"
+        trust_dir.mkdir(parents=True, exist_ok=True)
+        trust_file = trust_dir / f"{repo_id}.json"
+
+        valid_file = trust_dir / "valid.json"
+        valid_file.write_text('{"repo_id": "' + repo_id + '"}', encoding="utf-8")
+        trust_file.symlink_to(valid_file)
+
+        cfg = RepoConfig()
+        is_trusted, reason = validate_trust(cfg, repo)
+        assert not is_trusted
+        assert "symlink" in str(reason).lower() or "untrusted" in str(reason).lower()
+
+    def test_record_trust_atomic_replace_and_roundtrip(self, tmp_path: Path, monkeypatch):
+        from jev.repo_config import record_trust, validate_trust, RepoConfig, get_trust_file_path, compute_repo_id
+        jev_home = tmp_path / "jev_home"
+        monkeypatch.setenv("JEV_HOME", str(jev_home))
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+
+        cfg = RepoConfig(build_command="echo build_success")
+        rec = record_trust(cfg, repo)
+        assert rec.repo_id == compute_repo_id(repo)
+
+        trust_file = get_trust_file_path(rec.repo_id)
+        assert trust_file.exists()
+        assert not trust_file.is_symlink()
+
+        is_trusted, err = validate_trust(cfg, repo)
+        assert is_trusted, f"Validation failed: {err}"
+
+    def test_record_trust_rejects_symlinked_trust_dir(self, tmp_path: Path, monkeypatch):
+        from jev.repo_config import record_trust, RepoConfig
+        jev_home = tmp_path / "jev_home"
+        monkeypatch.setenv("JEV_HOME", str(jev_home))
+
+        outside_dir = tmp_path / "outside_dir"
+        outside_dir.mkdir()
+
+        trust_dir = jev_home / "trust"
+        jev_home.mkdir(parents=True, exist_ok=True)
+        trust_dir.symlink_to(outside_dir, target_is_directory=True)
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        cfg = RepoConfig()
+        with pytest.raises(PermissionError, match=r"symlinked trust directory|cannot be a symlink"):
+            record_trust(cfg, repo)

@@ -103,7 +103,11 @@ def get_jev_home() -> Path:
 def get_trust_dir() -> Path:
     """Returns the directory where repository trust records are stored."""
     td = get_jev_home() / "trust"
+    if td.is_symlink():
+        raise PermissionError(f"Rejected symlinked trust directory: {td}")
     td.mkdir(parents=True, exist_ok=True)
+    if td.is_symlink():
+        raise PermissionError(f"Rejected symlinked trust directory: {td}")
     return td
 
 
@@ -146,8 +150,11 @@ def get_trust_file_path(repo_id: str) -> Path:
     if is_dos_device_name(repo_id):
         raise ValueError(f"Invalid repo_id with DOS device name: '{repo_id}'")
     td = get_trust_dir().resolve()
-    target = (td / f"{repo_id}.json").resolve()
-    if target.parent != td:
+    target = td / f"{repo_id}.json"
+    if target.is_symlink():
+        raise PermissionError(f"Trust target file '{target}' cannot be a symlink.")
+    resolved = target.resolve()
+    if resolved.parent != td:
         raise ValueError(f"Invalid repo_id with path traversal: '{repo_id}'")
     return target
 
@@ -532,9 +539,33 @@ def record_trust(
         recipe_hash=recipe_hash or config.recipe_hash,
     )
 
+    raw_td = get_trust_dir()
+    if raw_td.is_symlink():
+        raise PermissionError(f"Rejected symlinked trust directory: {raw_td}")
+    raw_td.mkdir(parents=True, exist_ok=True)
+    if raw_td.is_symlink():
+        raise PermissionError(f"Rejected symlinked trust directory: {raw_td}")
+    trust_dir = raw_td.resolve()
+
     trust_path = get_trust_file_path(repo_id)
-    trust_path.parent.mkdir(parents=True, exist_ok=True)
-    trust_path.write_text(rec.model_dump_json(indent=2), encoding="utf-8")
+    if trust_path.is_symlink():
+        raise PermissionError(f"Trust target file '{trust_path}' cannot be a symlink.")
+    if trust_path.parent != trust_dir:
+        raise PermissionError(f"Trust target '{trust_path}' escapes trust directory '{trust_dir}'.")
+
+    import uuid
+    temp_target = trust_dir / f".tmp_trust_{uuid.uuid4().hex}.json"
+    try:
+        temp_target.write_text(rec.model_dump_json(indent=2), encoding="utf-8")
+        if trust_path.is_symlink():
+            raise PermissionError(f"Trust target file '{trust_path}' cannot be a symlink.")
+        os.replace(temp_target, trust_path)
+    finally:
+        if temp_target.exists():
+            try:
+                temp_target.unlink()
+            except OSError:
+                pass
     return rec
 
 
@@ -547,9 +578,12 @@ def validate_trust(
 ) -> Tuple[bool, Optional[str]]:
     """Validates repository configuration against the external trust record in <JEV_HOME>/trust/<repo_id>.json."""
     repo_id = compute_repo_id(repo_dir)
-    trust_path = get_trust_file_path(repo_id)
+    try:
+        trust_path = get_trust_file_path(repo_id)
+    except PermissionError as e:
+        return False, f"untrusted_repo_config: {e}"
 
-    if not trust_path.exists() or not trust_path.is_file():
+    if not trust_path.exists() or not trust_path.is_file() or trust_path.is_symlink():
         return False, "untrusted_repo_config: run scripts/trust_repo.py"
 
     try:
