@@ -105,8 +105,15 @@ def _is_junction_or_symlink(path: Union[str, Path]) -> bool:
                 st.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
             ):
                 return True
-        except (OSError, ValueError):
-            pass
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+        except PermissionError:
+            raise
+        except (OSError, ValueError) as err:
+            winerror = getattr(err, "winerror", None)
+            if winerror in (2, 3, 123, 161):
+                return False
+            raise PermissionError(f"Cannot verify filesystem attributes for path '{p}': {err}") from err
     return False
 
 
@@ -611,8 +618,11 @@ def validate_trust(
     except PermissionError as e:
         return False, f"untrusted_repo_config: {e}"
 
-    if not trust_path.exists() or not trust_path.is_file() or _is_junction_or_symlink(trust_path):
-        return False, "untrusted_repo_config: run scripts/trust_repo.py"
+    try:
+        if not trust_path.exists() or not trust_path.is_file() or _is_junction_or_symlink(trust_path):
+            return False, "untrusted_repo_config: run scripts/trust_repo.py"
+    except (PermissionError, OSError) as e:
+        return False, f"untrusted_repo_config: {e}"
 
     try:
         data = json.loads(trust_path.read_text(encoding="utf-8"))

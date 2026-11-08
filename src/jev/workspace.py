@@ -2049,7 +2049,11 @@ class Workspace:
             return
 
         target_nm = target_worktree_dir / "node_modules"
-        if src_nm.exists() and src_nm.is_dir() and not target_nm.exists() and not cls._is_junction_or_symlink(target_nm):
+        try:
+            target_is_link = cls._is_junction_or_symlink(target_nm)
+        except (PermissionError, OSError):
+            target_is_link = True
+        if src_nm.exists() and src_nm.is_dir() and not target_nm.exists() and not target_is_link:
             if sys.platform == "win32":
                 try:
                     import _winapi

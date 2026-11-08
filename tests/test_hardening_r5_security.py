@@ -384,3 +384,98 @@ class TestR5WorktreeBaseSymlinkBoundary:
 
         assert outside.exists(), "Outside victim directory was deleted!"
         assert canary.exists()
+
+
+class TestR5InspectionFailClosed:
+    """Verify that _is_junction_or_symlink and security callers fail closed on inconclusive inspection."""
+
+    def test_ordinary_nonexistent_path_returns_false(self, tmp_path: Path):
+        from jev.repo_config import _is_junction_or_symlink
+        nonexistent = tmp_path / "does_not_exist_at_all.json"
+        assert _is_junction_or_symlink(nonexistent) is False
+
+    def test_ordinary_symbolic_link_returns_true(self, tmp_path: Path):
+        from jev.repo_config import _is_junction_or_symlink
+        from unittest.mock import patch
+        with patch.object(Path, "is_symlink", return_value=True):
+            assert _is_junction_or_symlink(tmp_path / "symlink_file") is True
+
+    def test_windows_junction_and_dangling_junction_return_true(self, tmp_path: Path):
+        import sys
+        if sys.platform != "win32":
+            pytest.skip("Windows NTFS junction test only")
+        from jev.repo_config import _is_junction_or_symlink
+        tgt = tmp_path / "tgt"
+        tgt.mkdir()
+        junc = tmp_path / "junc"
+        make_dir_link(tgt, junc)
+        assert _is_junction_or_symlink(junc) is True
+        tgt.rmdir()
+        assert not junc.exists()
+        assert _is_junction_or_symlink(junc) is True
+
+    def test_permission_error_during_inspection_raises(self, tmp_path: Path):
+        from jev.repo_config import _is_junction_or_symlink
+        from unittest.mock import patch
+        target = tmp_path / "protected_target"
+        with patch.object(Path, "is_symlink", return_value=False):
+            with patch("os.stat", side_effect=PermissionError("Access denied on reparse inspection")):
+                with pytest.raises(PermissionError, match=r"Access denied|Cannot verify"):
+                    _is_junction_or_symlink(target)
+
+    def test_unexpected_filesystem_error_fails_closed(self, tmp_path: Path):
+        from jev.repo_config import _is_junction_or_symlink
+        from unittest.mock import patch
+        target = tmp_path / "locked_target"
+        with patch.object(Path, "is_symlink", return_value=False):
+            with patch("os.stat", side_effect=OSError(32, "Sharing violation")):
+                with pytest.raises(PermissionError, match=r"Cannot verify filesystem attributes"):
+                    _is_junction_or_symlink(target)
+
+    def test_security_callers_fail_closed_on_inconclusive_inspection(self, tmp_path: Path, monkeypatch):
+        from jev.repo_config import (
+            get_trust_dir,
+            get_trust_file_path,
+            record_trust,
+            validate_trust,
+            save_repo_config,
+            RepoConfig,
+        )
+        from unittest.mock import patch
+        jev_home = tmp_path / "jev_home"
+        monkeypatch.setenv("JEV_HOME", str(jev_home))
+        repo = tmp_path / "repo"
+        repo.mkdir()
+
+        # 1. get_trust_dir fails closed with PermissionError
+        with patch("jev.repo_config._is_junction_or_symlink", side_effect=PermissionError("ACL denied")):
+            with pytest.raises(PermissionError):
+                get_trust_dir()
+
+        # 2. get_trust_file_path fails closed with PermissionError
+        with patch("jev.repo_config._is_junction_or_symlink", side_effect=PermissionError("ACL denied")):
+            with pytest.raises(PermissionError):
+                get_trust_file_path("repo1")
+
+        # 3. record_trust fails closed with PermissionError
+        with patch("jev.repo_config._is_junction_or_symlink", side_effect=PermissionError("ACL denied")):
+            with pytest.raises(PermissionError):
+                record_trust(RepoConfig(), repo)
+
+        # 4. validate_trust returns untrusted / False
+        with patch("jev.repo_config._is_junction_or_symlink", side_effect=PermissionError("ACL denied")):
+            is_trusted, reason = validate_trust(RepoConfig(), repo)
+            assert is_trusted is False
+            assert "untrusted" in str(reason).lower() or "acl denied" in str(reason).lower()
+
+        # 5. save_repo_config fails closed with PermissionError
+        with patch("jev.repo_config._is_junction_or_symlink", side_effect=PermissionError("ACL denied")):
+            with pytest.raises(PermissionError):
+                save_repo_config(RepoConfig(), repo)
+
+        # 6. Workspace worktree discard fails closed with PermissionError
+        from jev.workspace import Workspace
+        ws = Workspace(repo_dir=repo)
+        with patch("jev.workspace._is_junction_or_symlink", side_effect=PermissionError("ACL denied")):
+            with pytest.raises(PermissionError):
+                ws.discard_subgoal_worktree(repo / ".jev-worktrees" / "subgoal-1")
