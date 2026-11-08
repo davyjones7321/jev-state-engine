@@ -15,7 +15,7 @@ from pathlib import Path
 
 
 def run_cmd(cmd, check=True, env=None):
-    res = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", env=env)
     if check and res.returncode != 0:
         raise RuntimeError(f"Command {' '.join(cmd)} failed (code {res.returncode}):\n{res.stderr}")
     return res
@@ -122,6 +122,7 @@ def main(argv=None):
         [sys.executable, "-m", "pytest", "-q", "-rs", "-m", "not live"],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         env=clean_env,
         cwd=repo_root,
     )

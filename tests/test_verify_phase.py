@@ -178,3 +178,29 @@ def test_verifier_warns_on_unrecognized_dirty_files(capsys):
 
     captured = capsys.readouterr()
     assert "WARNING: Working tree is dirty!" in captured.out
+
+
+def test_run_cmd_uses_utf8_encoding():
+    """run_cmd specifies encoding='utf-8' so Unicode/superscript characters do not cause cp1252 decode errors on Windows."""
+    with patch("subprocess.run") as mock_run:
+        mock_res = MagicMock()
+        mock_res.returncode = 0
+        mock_res.stdout = "COM¹ COM² COM³"
+        mock_run.return_value = mock_res
+
+        res = verify_phase.run_cmd(["git", "diff", "--stat", "HEAD~1"])
+        assert res.stdout == "COM¹ COM² COM³"
+        mock_run.assert_called_once_with(
+            ["git", "diff", "--stat", "HEAD~1"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env=None,
+        )
+
+
+def test_run_cmd_real_subprocess_decodes_utf8():
+    """run_cmd executes real child process outputting UTF-8 characters without UnicodeDecodeError."""
+    cmd = [sys.executable, "-c", "import sys; sys.stdout.buffer.write('COM¹ LPT²'.encode('utf-8'))"]
+    res = verify_phase.run_cmd(cmd)
+    assert "COM¹ LPT²" in res.stdout
