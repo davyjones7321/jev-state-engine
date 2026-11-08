@@ -20,6 +20,16 @@ def git_repo(tmp_path: Path) -> Path:
     return repo
 
 
+def make_dir_link(target: Path, link_path: Path):
+    import sys
+    if sys.platform == "win32":
+        import _winapi
+        _winapi.CreateJunction(str(target), str(link_path))
+    else:
+        import os
+        os.symlink(str(target), str(link_path), target_is_directory=True)
+
+
 class TestR5SubgoalWorktreeContainment:
     """VULN-1: Prevent directory traversal and arbitrary deletion via subgoal_id."""
 
@@ -212,6 +222,60 @@ class TestR5TrustRecordPersistence:
         with pytest.raises(PermissionError, match=r"symlinked trust directory|cannot be a symlink"):
             record_trust(cfg, repo)
 
+    def test_record_trust_rejects_junctioned_trust_dir(self, tmp_path: Path, monkeypatch):
+        from jev.repo_config import record_trust, RepoConfig
+        jev_home = tmp_path / "jev_home"
+        monkeypatch.setenv("JEV_HOME", str(jev_home))
+
+        outside_dir = tmp_path / "outside_dir"
+        outside_dir.mkdir()
+
+        trust_dir = jev_home / "trust"
+        jev_home.mkdir(parents=True, exist_ok=True)
+        make_dir_link(outside_dir, trust_dir)
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        cfg = RepoConfig()
+        with pytest.raises(PermissionError, match=r"symlink|junction"):
+            record_trust(cfg, repo)
+
+    def test_validate_trust_rejects_junctioned_trust_dir(self, tmp_path: Path, monkeypatch):
+        from jev.repo_config import validate_trust, RepoConfig, compute_repo_id
+        jev_home = tmp_path / "jev_home"
+        monkeypatch.setenv("JEV_HOME", str(jev_home))
+
+        outside_dir = tmp_path / "outside_dir"
+        outside_dir.mkdir()
+
+        trust_dir = jev_home / "trust"
+        jev_home.mkdir(parents=True, exist_ok=True)
+        make_dir_link(outside_dir, trust_dir)
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        repo_id = compute_repo_id(repo)
+
+        (outside_dir / f"{repo_id}.json").write_text('{"repo_id": "' + repo_id + '"}', encoding="utf-8")
+
+        cfg = RepoConfig()
+        is_trusted, reason = validate_trust(cfg, repo)
+        assert not is_trusted
+        assert "symlink" in str(reason).lower() or "junction" in str(reason).lower()
+
+    def test_is_junction_or_symlink_detects_broken_junction(self, tmp_path: Path):
+        import sys
+        if sys.platform != "win32":
+            pytest.skip("Windows NTFS junction test only")
+        from jev.repo_config import _is_junction_or_symlink
+        tgt = tmp_path / "target_dir"
+        tgt.mkdir()
+        junc = tmp_path / "junc_dir"
+        make_dir_link(tgt, junc)
+        tgt.rmdir()
+        assert not junc.exists()
+        assert _is_junction_or_symlink(junc) is True
+
 
 class TestR5WorktreeDiscardContainment:
     """VULN-4: Prevent deletion of repository root or external directories via discard functions."""
@@ -251,16 +315,6 @@ class TestR5WorktreeDiscardContainment:
             ws.discard_subgoal_worktree(outside)
         assert outside.exists(), "External directory was deleted!"
         assert canary.exists()
-
-
-def make_dir_link(target: Path, link_path: Path):
-    import sys
-    if sys.platform == "win32":
-        import _winapi
-        _winapi.CreateJunction(str(target), str(link_path))
-    else:
-        import os
-        os.symlink(str(target), str(link_path), target_is_directory=True)
 
 
 class TestR5WorktreeBaseSymlinkBoundary:

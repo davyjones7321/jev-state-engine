@@ -33,6 +33,7 @@ from jev.process_runner import CommandResult, run_command
 
 from jev.repo_config import (
     PROTECTED_FILES,
+    _is_junction_or_symlink,
     extract_makefile_target_and_recipe,
     is_build_or_test_config,
     is_lockfile,
@@ -534,19 +535,7 @@ class ScopeCheckResult(BaseModel):
         return self.passed
 
 
-def _is_junction_or_symlink(path: Path) -> bool:
-    if not path.exists() and not path.is_symlink():
-        return False
-    if path.is_symlink():
-        return True
-    if sys.platform == "win32":
-        try:
-            st = os.stat(str(path), follow_symlinks=False)
-            if hasattr(st, "st_file_attributes") and (st.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT):
-                return True
-        except Exception:
-            pass
-    return False
+# Note: _is_junction_or_symlink is imported from jev.repo_config
 
 
 ALL_SOURCE_EXTENSIONS = {
@@ -2032,18 +2021,7 @@ class Workspace:
 
     @staticmethod
     def _is_junction_or_symlink(path: Path) -> bool:
-        if not path.exists() and not path.is_symlink():
-            return False
-        if path.is_symlink():
-            return True
-        if sys.platform == "win32":
-            try:
-                st = os.stat(str(path), follow_symlinks=False)
-                if hasattr(st, "st_file_attributes") and (st.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT):
-                    return True
-            except Exception:
-                pass
-        return False
+        return _is_junction_or_symlink(path)
 
     @classmethod
     def _unlink_node_modules(cls, wt_or_path: Path) -> None:
