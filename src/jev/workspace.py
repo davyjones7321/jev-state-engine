@@ -2101,9 +2101,15 @@ class Workspace:
             return res.stdout.strip()
         raise RuntimeError(f"Could not resolve commit for branch {branch_name}")
 
-    def create_subgoal_worktree(self, subgoal_id: str, base_ref: Optional[str] = None) -> Path:
+    def create_subgoal_worktree(self, subgoal_id: Union[str, int], base_ref: Optional[str] = None) -> Path:
         """Creates an isolated git worktree for a subgoal branching from base_ref."""
-        worktree_base = self.repo_dir / ".jev-worktrees"
+        sid = str(subgoal_id).strip()
+        if not sid or not re.fullmatch(r"[a-zA-Z0-9_-]+", sid):
+            raise ValueError(
+                f"Invalid subgoal_id: '{subgoal_id}'. Must be non-empty and alphanumeric with underscores or hyphens."
+            )
+
+        worktree_base = (self.repo_dir / ".jev-worktrees").resolve()
         worktree_base.mkdir(parents=True, exist_ok=True)
 
         exclude_file = self.repo_dir / ".git" / "info" / "exclude"
@@ -2124,8 +2130,14 @@ class Workspace:
             except Exception:
                 pass
 
-        worktree_path = (worktree_base / f"subgoal-{subgoal_id}").resolve()
-        branch_name = f"jev-subgoal-{subgoal_id}"
+        worktree_path = (worktree_base / f"subgoal-{sid}").resolve()
+        if worktree_path.parent != worktree_base:
+            raise ValueError(f"Worktree path '{worktree_path}' escapes worktree base directory.")
+        try:
+            worktree_path.relative_to(worktree_base)
+        except ValueError:
+            raise ValueError(f"Worktree path '{worktree_path}' escapes worktree base directory.")
+        branch_name = f"jev-subgoal-{sid}"
 
         # Clean up if prior branch or worktree directory exists
         if worktree_path.exists():

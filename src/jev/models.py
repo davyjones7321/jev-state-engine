@@ -1,6 +1,7 @@
 from enum import Enum
+import re
 from typing import Any, Dict, List, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing_extensions import TypedDict
 
 from jev.mech_evidence import (
@@ -49,6 +50,13 @@ class Subgoal(BaseModel):
     expects_tests: bool = True
     status: str = "pending"
     no_tests_reason: Optional[str] = None
+
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, v: str) -> str:
+        if v and not re.fullmatch(r"[a-zA-Z0-9_-]+", v):
+            raise ValueError(f"Invalid subgoal id '{v}': must be alphanumeric, underscores, or hyphens.")
+        return v
 
 
 class MechanicalCheckResult(BaseModel):
