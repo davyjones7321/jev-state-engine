@@ -1025,3 +1025,152 @@ class TestR6VerificationIntegrityAndMetadataValidation:
         assert out.get("status") in ("verification_failed", "escalated")
         ws.fast_forward_main.assert_not_called()
         ws.delete_integration_branch.assert_not_called()
+
+    def test_exit_code_float_fails_verification(self):
+        """exit_code=0.5 with claimed PASSED must fail verification (strict integer required)."""
+        ws = MagicMock()
+        ws.check_compile.return_value = {"outcome": "PASSED"}
+        ws.run_tests.return_value = TestOutcome.PASSED
+        ws.get_cumulative_diff.return_value = "diff --git a/a.py b/a.py\n+x = 1"
+        ws.get_staged_diff.return_value = ""
+        ws.last_test_run = {
+            "ran": True,
+            "command": ["pytest"],
+            "exit_code": 0.5,
+            "outcome": "PASSED",
+        }
+
+        gk = MagicMock()
+        gk.verify_ticket.return_value = ValidationVerdict(valid=True, probability=0.99)
+
+        state: State = {
+            "ticket": "Implement feature",
+            "integration_branch": "jev-ticket-1",
+            "status": "in_progress",
+            "trajectory": [],
+        }
+
+        out = node_verify(state, workspace=ws, gatekeeper=gk)
+        assert out.get("gate_status") == "verification_failed"
+        assert out.get("status") in ("verification_failed", "escalated")
+        ws.fast_forward_main.assert_not_called()
+
+    def test_exit_code_boolean_false_fails_verification(self):
+        """exit_code=False with claimed PASSED must fail verification (booleans explicitly excluded)."""
+        ws = MagicMock()
+        ws.check_compile.return_value = {"outcome": "PASSED"}
+        ws.run_tests.return_value = TestOutcome.PASSED
+        ws.get_cumulative_diff.return_value = "diff --git a/a.py b/a.py\n+x = 1"
+        ws.get_staged_diff.return_value = ""
+        ws.last_test_run = {
+            "ran": True,
+            "command": ["pytest"],
+            "exit_code": False,
+            "outcome": "PASSED",
+        }
+
+        gk = MagicMock()
+        gk.verify_ticket.return_value = ValidationVerdict(valid=True, probability=0.99)
+
+        state: State = {
+            "ticket": "Implement feature",
+            "integration_branch": "jev-ticket-1",
+            "status": "in_progress",
+            "trajectory": [],
+        }
+
+        out = node_verify(state, workspace=ws, gatekeeper=gk)
+        assert out.get("gate_status") == "verification_failed"
+        assert out.get("status") in ("verification_failed", "escalated")
+        ws.fast_forward_main.assert_not_called()
+
+    def test_exit_code_string_zero_fails_verification(self):
+        """exit_code='0' with claimed PASSED must fail verification (strings rejected)."""
+        ws = MagicMock()
+        ws.check_compile.return_value = {"outcome": "PASSED"}
+        ws.run_tests.return_value = TestOutcome.PASSED
+        ws.get_cumulative_diff.return_value = "diff --git a/a.py b/a.py\n+x = 1"
+        ws.get_staged_diff.return_value = ""
+        ws.last_test_run = {
+            "ran": True,
+            "command": ["pytest"],
+            "exit_code": "0",
+            "outcome": "PASSED",
+        }
+
+        gk = MagicMock()
+        gk.verify_ticket.return_value = ValidationVerdict(valid=True, probability=0.99)
+
+        state: State = {
+            "ticket": "Implement feature",
+            "integration_branch": "jev-ticket-1",
+            "status": "in_progress",
+            "trajectory": [],
+        }
+
+        out = node_verify(state, workspace=ws, gatekeeper=gk)
+        assert out.get("gate_status") == "verification_failed"
+        assert out.get("status") in ("verification_failed", "escalated")
+        ws.fast_forward_main.assert_not_called()
+
+    def test_exit_code_zero_with_only_ecosystem_fails_verification(self):
+        """exit_code=0 with only ecosystem (no command/argv/output) must fail verification."""
+        ws = MagicMock()
+        ws.check_compile.return_value = {"outcome": "PASSED"}
+        ws.run_tests.return_value = TestOutcome.PASSED
+        ws.get_cumulative_diff.return_value = "diff --git a/a.py b/a.py\n+x = 1"
+        ws.get_staged_diff.return_value = ""
+        ws.last_test_run = {
+            "ran": True,
+            "exit_code": 0,
+            "ecosystem": "pytest",
+            "outcome": "PASSED",
+        }
+
+        gk = MagicMock()
+        gk.verify_ticket.return_value = ValidationVerdict(valid=True, probability=0.99)
+
+        state: State = {
+            "ticket": "Implement feature",
+            "integration_branch": "jev-ticket-1",
+            "status": "in_progress",
+            "trajectory": [],
+        }
+
+        out = node_verify(state, workspace=ws, gatekeeper=gk)
+        assert out.get("gate_status") == "verification_failed"
+        assert out.get("status") in ("verification_failed", "escalated")
+        ws.fast_forward_main.assert_not_called()
+
+    def test_legitimate_producer_generated_metadata_passes_verification(self):
+        """Legitimate integer exit_code=0 with command evidence from producer passes verification."""
+        ws = MagicMock()
+        ws.check_compile.return_value = {"outcome": "PASSED"}
+        ws.run_tests.return_value = TestOutcome.PASSED
+        ws.get_cumulative_diff.return_value = "diff --git a/a.py b/a.py\n+x = 1"
+        ws.get_staged_diff.return_value = ""
+        ws.last_test_run = {
+            "ecosystem": "pytest",
+            "command": ["pytest"],
+            "executed_command": ["pytest"],
+            "exit_code": 0,
+            "stdout": "5 passed in 0.2s",
+            "stderr": "",
+            "ran": True,
+            "outcome": "PASSED",
+        }
+
+        gk = MagicMock()
+        gk.verify_ticket.return_value = ValidationVerdict(valid=True, probability=0.99)
+
+        state: State = {
+            "ticket": "Implement feature",
+            "integration_branch": "jev-ticket-1",
+            "status": "in_progress",
+            "trajectory": [],
+        }
+
+        out = node_verify(state, workspace=ws, gatekeeper=gk)
+        assert out.get("gate_status") == "verified"
+        assert out.get("status") == "completed"
+        ws.fast_forward_main.assert_called_once()

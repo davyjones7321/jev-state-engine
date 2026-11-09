@@ -5173,11 +5173,12 @@ def node_verify(
         elif isinstance(test_runner_info, dict) and test_runner_info.get("exit_code") is not None:
             raw_exit = test_runner_info.get("exit_code")
 
+        is_valid_int_exit = (type(raw_exit) is int and not isinstance(raw_exit, bool))
         explicit_nonzero_exit = False
         if raw_exit is not None:
-            try:
-                explicit_nonzero_exit = (int(raw_exit) != 0)
-            except (ValueError, TypeError):
+            if not is_valid_int_exit:
+                explicit_nonzero_exit = True
+            elif raw_exit != 0:
                 explicit_nonzero_exit = True
 
         runner_reported_outcome = test_runner_info.get("outcome") if isinstance(test_runner_info, dict) else None
@@ -5216,9 +5217,14 @@ def node_verify(
                 if orig_last_run.get("ran") is False:
                     malformed_metadata = True
 
+                orig_exit = orig_last_run.get("exit_code")
+                is_valid_orig_exit = (type(orig_exit) is int and not isinstance(orig_exit, bool))
+
                 if claims_pass:
-                    if orig_last_run.get("exit_code") is None:
+                    if orig_exit is None:
                         missing_runner_evidence = True
+                    elif not is_valid_orig_exit:
+                        malformed_metadata = True
                     elif explicit_nonzero_exit:
                         contradictory_metadata = True
 
@@ -5228,7 +5234,6 @@ def node_verify(
                             "command",
                             "executed_command",
                             "argv",
-                            "ecosystem",
                             "output_tail",
                             "stdout",
                             "stdout_tail",
