@@ -1142,23 +1142,33 @@ class TestR6VerificationIntegrityAndMetadataValidation:
         assert out.get("status") in ("verification_failed", "escalated")
         ws.fast_forward_main.assert_not_called()
 
-    def test_legitimate_producer_generated_metadata_passes_verification(self):
-        """Legitimate integer exit_code=0 with command evidence from producer passes verification."""
+    def test_legitimate_producer_generated_metadata_passes_verification(self, git_repo: Path):
+        """Actual Workspace producer metadata with integer exit_code=0 passes verification."""
+        producer = Workspace(repo_dir=git_repo)
+        producer._record_test_run(
+            ecosystem="pytest",
+            command=["pytest"],
+            executed_command=["pytest"],
+            exit_code=0,
+            stdout="5 passed in 0.2s",
+            stderr="",
+            outcome=TestOutcome.PASSED,
+        )
+        produced_metadata = producer.last_test_run
+        assert type(produced_metadata["exit_code"]) is int
+        assert produced_metadata["exit_code"] == 0
+        assert produced_metadata["command"] == ["pytest"]
+        assert produced_metadata["executed_command"] == ["pytest"]
+        assert produced_metadata["argv"] == ["pytest"]
+
+        # Keep node_verify's orchestration dependencies isolated while feeding it
+        # the exact metadata dictionary emitted by the real Workspace producer.
         ws = MagicMock()
         ws.check_compile.return_value = {"outcome": "PASSED"}
         ws.run_tests.return_value = TestOutcome.PASSED
-        ws.get_cumulative_diff.return_value = "diff --git a/a.py b/a.py\n+x = 1"
+        ws.get_cumulative_diff.return_value = "diff --git a/a.py b/a.py\\n+x = 1"
         ws.get_staged_diff.return_value = ""
-        ws.last_test_run = {
-            "ecosystem": "pytest",
-            "command": ["pytest"],
-            "executed_command": ["pytest"],
-            "exit_code": 0,
-            "stdout": "5 passed in 0.2s",
-            "stderr": "",
-            "ran": True,
-            "outcome": "PASSED",
-        }
+        ws.last_test_run = produced_metadata
 
         gk = MagicMock()
         gk.verify_ticket.return_value = ValidationVerdict(valid=True, probability=0.99)
