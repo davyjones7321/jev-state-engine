@@ -98,22 +98,21 @@ def _is_junction_or_symlink(path: Union[str, Path]) -> bool:
     p = Path(path)
     if p.is_symlink():
         return True
-    if sys.platform == "win32":
-        try:
-            st = os.stat(str(p), follow_symlinks=False)
-            if hasattr(st, "st_file_attributes") and (
-                st.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
-            ):
-                return True
-        except (FileNotFoundError, NotADirectoryError):
+    try:
+        st = os.stat(str(p), follow_symlinks=False)
+        if sys.platform == "win32" and hasattr(st, "st_file_attributes") and (
+            st.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+        ):
+            return True
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except PermissionError:
+        raise
+    except (OSError, ValueError) as err:
+        winerror = getattr(err, "winerror", None)
+        if winerror in (2, 3, 123, 161):
             return False
-        except PermissionError:
-            raise
-        except (OSError, ValueError) as err:
-            winerror = getattr(err, "winerror", None)
-            if winerror in (2, 3, 123, 161):
-                return False
-            raise PermissionError(f"Cannot verify filesystem attributes for path '{p}': {err}") from err
+        raise PermissionError(f"Cannot verify filesystem attributes for path '{p}': {err}") from err
     return False
 
 
