@@ -33,6 +33,7 @@ from jev.process_runner import CommandResult, run_command
 
 from jev.repo_config import (
     PROTECTED_FILES,
+    _is_junction_or_symlink,
     extract_makefile_target_and_recipe,
     is_build_or_test_config,
     is_lockfile,
@@ -534,19 +535,7 @@ class ScopeCheckResult(BaseModel):
         return self.passed
 
 
-def _is_junction_or_symlink(path: Path) -> bool:
-    if not path.exists() and not path.is_symlink():
-        return False
-    if path.is_symlink():
-        return True
-    if sys.platform == "win32":
-        try:
-            st = os.stat(str(path), follow_symlinks=False)
-            if hasattr(st, "st_file_attributes") and (st.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT):
-                return True
-        except Exception:
-            pass
-    return False
+# Note: _is_junction_or_symlink is imported from jev.repo_config
 
 
 ALL_SOURCE_EXTENSIONS = {
@@ -1470,9 +1459,17 @@ class Workspace:
             nm_dir = self.repo_dir / "node_modules"
             if not nm_dir.exists():
                 raise original_err
+            try:
+                resolved_repo = self.repo_dir.resolve()
+                resolved_nm = nm_dir.resolve()
+                resolved_nm.relative_to(resolved_repo)
+            except (ValueError, OSError):
+                raise original_err
+
             candidate = (self.worktree_dir / normalized).resolve()
             try:
-                candidate.relative_to(nm_dir.resolve())
+                candidate.relative_to(resolved_nm)
+                candidate.relative_to(resolved_repo)
                 return candidate
             except ValueError:
                 raise original_err
@@ -2024,18 +2021,7 @@ class Workspace:
 
     @staticmethod
     def _is_junction_or_symlink(path: Path) -> bool:
-        if not path.exists() and not path.is_symlink():
-            return False
-        if path.is_symlink():
-            return True
-        if sys.platform == "win32":
-            try:
-                st = os.stat(str(path), follow_symlinks=False)
-                if hasattr(st, "st_file_attributes") and (st.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT):
-                    return True
-            except Exception:
-                pass
-        return False
+        return _is_junction_or_symlink(path)
 
     @classmethod
     def _unlink_node_modules(cls, wt_or_path: Path) -> None:
@@ -2054,9 +2040,20 @@ class Workspace:
 
     @classmethod
     def _link_node_modules(cls, src_repo_dir: Path, target_worktree_dir: Path) -> None:
-        src_nm = src_repo_dir / "node_modules"
+        try:
+            resolved_src_repo = src_repo_dir.resolve()
+            src_nm = src_repo_dir / "node_modules"
+            resolved_src_nm = src_nm.resolve()
+            resolved_src_nm.relative_to(resolved_src_repo)
+        except (ValueError, OSError):
+            return
+
         target_nm = target_worktree_dir / "node_modules"
-        if src_nm.exists() and src_nm.is_dir() and not target_nm.exists() and not cls._is_junction_or_symlink(target_nm):
+        try:
+            target_is_link = cls._is_junction_or_symlink(target_nm)
+        except (PermissionError, OSError):
+            target_is_link = True
+        if src_nm.exists() and src_nm.is_dir() and not target_nm.exists() and not target_is_link:
             if sys.platform == "win32":
                 try:
                     import _winapi
@@ -2101,10 +2098,27 @@ class Workspace:
             return res.stdout.strip()
         raise RuntimeError(f"Could not resolve commit for branch {branch_name}")
 
-    def create_subgoal_worktree(self, subgoal_id: str, base_ref: Optional[str] = None) -> Path:
+    def create_subgoal_worktree(self, subgoal_id: Union[str, int], base_ref: Optional[str] = None) -> Path:
         """Creates an isolated git worktree for a subgoal branching from base_ref."""
-        worktree_base = self.repo_dir / ".jev-worktrees"
-        worktree_base.mkdir(parents=True, exist_ok=True)
+        sid = str(subgoal_id).strip()
+        if not sid or not re.fullmatch(r"[a-zA-Z0-9_-]+", sid):
+            raise ValueError(
+                f"Invalid subgoal_id: '{subgoal_id}'. Must be non-empty and alphanumeric with underscores or hyphens."
+            )
+
+        raw_base = self.repo_dir / ".jev-worktrees"
+        if self._is_junction_or_symlink(raw_base):
+            raise PermissionError(f"Rejected symlinked worktree base directory: {raw_base}")
+        raw_base.mkdir(parents=True, exist_ok=True)
+        if self._is_junction_or_symlink(raw_base):
+            raise PermissionError(f"Rejected symlinked worktree base directory: {raw_base}")
+
+        repo_root = self.repo_dir.resolve()
+        worktree_base = raw_base.resolve()
+        try:
+            worktree_base.relative_to(repo_root)
+        except ValueError:
+            raise PermissionError(f"Worktree base directory '{worktree_base}' escapes repository root '{repo_root}'.")
 
         exclude_file = self.repo_dir / ".git" / "info" / "exclude"
         if exclude_file.exists():
@@ -2124,8 +2138,18 @@ class Workspace:
             except Exception:
                 pass
 
-        worktree_path = (worktree_base / f"subgoal-{subgoal_id}").resolve()
-        branch_name = f"jev-subgoal-{subgoal_id}"
+        target_candidate = worktree_base / f"subgoal-{sid}"
+        if self._is_junction_or_symlink(target_candidate):
+            raise PermissionError(f"Rejected symlinked worktree target: {target_candidate}")
+        worktree_path = target_candidate.resolve()
+        if worktree_path.parent != worktree_base:
+            raise ValueError(f"Worktree path '{worktree_path}' escapes worktree base directory.")
+        try:
+            worktree_path.relative_to(worktree_base)
+            worktree_path.relative_to(repo_root)
+        except ValueError:
+            raise ValueError(f"Worktree path '{worktree_path}' escapes worktree base directory.")
+        branch_name = f"jev-subgoal-{sid}"
 
         # Clean up if prior branch or worktree directory exists
         if worktree_path.exists():
@@ -2164,7 +2188,8 @@ class Workspace:
         if not target_branch:
             raise ValueError("target_branch is required for merge_subgoal_worktree; direct merge to main is disallowed")
 
-        wt_path = Path(worktree_path).resolve() if worktree_path else getattr(self, "current_worktree_path", None)
+        raw_path = worktree_path if worktree_path is not None else getattr(self, "current_worktree_path", None)
+        wt_path = self._validate_worktree_path(raw_path) if raw_path else None
         br_name = branch_name or getattr(self, "current_worktree_branch", None)
 
         if wt_path and wt_path.exists():
@@ -2222,10 +2247,24 @@ class Workspace:
 
     def create_verify_worktree(self, integration_branch: str) -> Path:
         """Creates a dedicated detached worktree for final verification from the integration branch."""
-        worktree_base = self.repo_dir / ".jev-worktrees"
-        worktree_base.mkdir(parents=True, exist_ok=True)
+        raw_base = self.repo_dir / ".jev-worktrees"
+        if self._is_junction_or_symlink(raw_base):
+            raise PermissionError(f"Rejected symlinked worktree base directory: {raw_base}")
+        raw_base.mkdir(parents=True, exist_ok=True)
+        if self._is_junction_or_symlink(raw_base):
+            raise PermissionError(f"Rejected symlinked worktree base directory: {raw_base}")
 
-        verify_wt_path = (worktree_base / f"verify-{uuid.uuid4().hex[:8]}").resolve()
+        repo_root = self.repo_dir.resolve()
+        worktree_base = raw_base.resolve()
+        try:
+            worktree_base.relative_to(repo_root)
+        except ValueError:
+            raise PermissionError(f"Worktree base directory '{worktree_base}' escapes repository root '{repo_root}'.")
+
+        target_candidate = worktree_base / f"verify-{uuid.uuid4().hex[:8]}"
+        if self._is_junction_or_symlink(target_candidate):
+            raise PermissionError("Rejected symlinked verify worktree target.")
+        verify_wt_path = target_candidate.resolve()
         if verify_wt_path.exists():
             self._unlink_node_modules(verify_wt_path)
             self._run_repo_git(["worktree", "remove", "--force", str(verify_wt_path)])
@@ -2240,9 +2279,40 @@ class Workspace:
         self.worktree_dir = verify_wt_path
         return verify_wt_path
 
+    def _validate_worktree_path(self, path: Union[str, Path]) -> Path:
+        """Validates that a worktree path is strictly within .jev-worktrees and not repo_dir."""
+        if not path:
+            raise ValueError("Worktree path cannot be empty.")
+        raw_p = Path(path)
+        if self._is_junction_or_symlink(raw_p):
+            raise PermissionError(f"Rejected symlinked worktree target: {raw_p}")
+
+        raw_base = self.repo_dir / ".jev-worktrees"
+        if self._is_junction_or_symlink(raw_base):
+            raise PermissionError(f"Rejected symlinked worktree base directory: {raw_base}")
+
+        repo_root = self.repo_dir.resolve()
+        worktree_base = raw_base.resolve()
+        try:
+            worktree_base.relative_to(repo_root)
+        except ValueError:
+            raise PermissionError(f"Worktree base directory '{worktree_base}' escapes repository root '{repo_root}'.")
+
+        p = raw_p.resolve()
+        if p == repo_root:
+            raise ValueError(f"Refusing to delete repository root as worktree: {p}")
+        if p == worktree_base:
+            raise ValueError(f"Refusing to delete .jev-worktrees base directory: {p}")
+        try:
+            p.relative_to(worktree_base)
+            p.relative_to(repo_root)
+        except ValueError:
+            raise ValueError(f"Worktree path '{p}' escapes worktree directory '{worktree_base}'.")
+        return p
+
     def discard_verify_worktree(self, verify_path: Union[str, Path]) -> None:
         """Discards the verify worktree safely, ensuring node_modules is unlinked first."""
-        v_path = Path(verify_path).resolve()
+        v_path = self._validate_worktree_path(verify_path)
         self.worktree_dir = self.repo_dir
         if v_path.exists() or v_path.is_symlink():
             self._unlink_node_modules(v_path)
@@ -2293,7 +2363,8 @@ class Workspace:
         branch_name: Optional[str] = None,
     ) -> None:
         """Discards the subgoal worktree and deletes its branch without modifying main repo."""
-        wt_path = Path(worktree_path).resolve() if worktree_path else getattr(self, "current_worktree_path", None)
+        raw_path = worktree_path if worktree_path is not None else getattr(self, "current_worktree_path", None)
+        wt_path = self._validate_worktree_path(raw_path) if raw_path else None
         br_name = branch_name or getattr(self, "current_worktree_branch", None)
 
         self.worktree_dir = self.repo_dir

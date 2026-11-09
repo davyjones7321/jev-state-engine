@@ -7,6 +7,7 @@ import os
 import posixpath
 import re
 import shlex
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -92,6 +93,29 @@ LOCKFILES = (
 )
 
 
+def _is_junction_or_symlink(path: Union[str, Path]) -> bool:
+    """Checks if a path is a symbolic link or a Windows NTFS junction/reparse point."""
+    p = Path(path)
+    if p.is_symlink():
+        return True
+    try:
+        st = os.stat(str(p), follow_symlinks=False)
+        if sys.platform == "win32" and hasattr(st, "st_file_attributes") and (
+            st.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+        ):
+            return True
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except PermissionError:
+        raise
+    except (OSError, ValueError) as err:
+        winerror = getattr(err, "winerror", None)
+        if winerror in (2, 3, 123, 161):
+            return False
+        raise PermissionError(f"Cannot verify filesystem attributes for path '{p}': {err}") from err
+    return False
+
+
 def get_jev_home() -> Path:
     """Returns JEV_HOME path (defaults to ~/.jev)."""
     jev_home = os.environ.get("JEV_HOME")
@@ -103,7 +127,16 @@ def get_jev_home() -> Path:
 def get_trust_dir() -> Path:
     """Returns the directory where repository trust records are stored."""
     td = get_jev_home() / "trust"
+    if _is_junction_or_symlink(td):
+        raise PermissionError(f"Rejected symlinked trust directory: {td}")
     td.mkdir(parents=True, exist_ok=True)
+    if _is_junction_or_symlink(td):
+        raise PermissionError(f"Rejected symlinked trust directory: {td}")
+    resolved = td.resolve()
+    try:
+        resolved.relative_to(get_jev_home().resolve())
+    except ValueError:
+        raise PermissionError(f"Trust directory '{resolved}' escapes JEV_HOME.")
     return td
 
 
@@ -146,8 +179,11 @@ def get_trust_file_path(repo_id: str) -> Path:
     if is_dos_device_name(repo_id):
         raise ValueError(f"Invalid repo_id with DOS device name: '{repo_id}'")
     td = get_trust_dir().resolve()
-    target = (td / f"{repo_id}.json").resolve()
-    if target.parent != td:
+    target = td / f"{repo_id}.json"
+    if _is_junction_or_symlink(target):
+        raise PermissionError(f"Trust target file '{target}' cannot be a symlink.")
+    resolved = target.resolve()
+    if resolved.parent != td:
         raise ValueError(f"Invalid repo_id with path traversal: '{repo_id}'")
     return target
 
@@ -532,9 +568,38 @@ def record_trust(
         recipe_hash=recipe_hash or config.recipe_hash,
     )
 
+    raw_td = get_trust_dir()
+    if _is_junction_or_symlink(raw_td):
+        raise PermissionError(f"Rejected symlinked trust directory: {raw_td}")
+    raw_td.mkdir(parents=True, exist_ok=True)
+    if _is_junction_or_symlink(raw_td):
+        raise PermissionError(f"Rejected symlinked trust directory: {raw_td}")
+    trust_dir = raw_td.resolve()
+
     trust_path = get_trust_file_path(repo_id)
-    trust_path.parent.mkdir(parents=True, exist_ok=True)
-    trust_path.write_text(rec.model_dump_json(indent=2), encoding="utf-8")
+    if _is_junction_or_symlink(trust_path):
+        raise PermissionError(f"Trust target file '{trust_path}' cannot be a symlink.")
+    if trust_path.parent != trust_dir:
+        raise PermissionError(f"Trust target '{trust_path}' escapes trust directory '{trust_dir}'.")
+
+    # Security guarantee & TOCTOU limitations:
+    # - Atomic replacement protects against partial final-file writes.
+    # - Final-target symlink checks provide protection against straightforward symlink attacks.
+    # - Path-based checks do not guarantee immunity to concurrent replacement of parent directories.
+    # - Complete race resistance is not claimed across hostile local environments.
+    import uuid
+    temp_target = trust_dir / f".tmp_trust_{uuid.uuid4().hex}.json"
+    try:
+        temp_target.write_text(rec.model_dump_json(indent=2), encoding="utf-8")
+        if _is_junction_or_symlink(trust_path):
+            raise PermissionError(f"Trust target file '{trust_path}' cannot be a symlink.")
+        os.replace(temp_target, trust_path)
+    finally:
+        if temp_target.exists():
+            try:
+                temp_target.unlink()
+            except OSError:
+                pass
     return rec
 
 
@@ -547,10 +612,16 @@ def validate_trust(
 ) -> Tuple[bool, Optional[str]]:
     """Validates repository configuration against the external trust record in <JEV_HOME>/trust/<repo_id>.json."""
     repo_id = compute_repo_id(repo_dir)
-    trust_path = get_trust_file_path(repo_id)
+    try:
+        trust_path = get_trust_file_path(repo_id)
+    except PermissionError as e:
+        return False, f"untrusted_repo_config: {e}"
 
-    if not trust_path.exists() or not trust_path.is_file():
-        return False, "untrusted_repo_config: run scripts/trust_repo.py"
+    try:
+        if not trust_path.exists() or not trust_path.is_file() or _is_junction_or_symlink(trust_path):
+            return False, "untrusted_repo_config: run scripts/trust_repo.py"
+    except (PermissionError, OSError) as e:
+        return False, f"untrusted_repo_config: {e}"
 
     try:
         data = json.loads(trust_path.read_text(encoding="utf-8"))
@@ -621,7 +692,7 @@ def _is_safe_repo_config_candidate(candidate: Path, repo_root: Path) -> bool:
         candidate_jev = candidate.parent
         if candidate_jev.name != ".jev":
             return False
-        if candidate_jev.is_symlink() or candidate.is_symlink():
+        if _is_junction_or_symlink(candidate_jev) or _is_junction_or_symlink(candidate):
             return False
         resolved_jev = candidate_jev.resolve()
         resolved_candidate = candidate.resolve()
@@ -641,7 +712,7 @@ def load_repo_config(repo_dir: Union[str, Path]) -> Optional[RepoConfig]:
     cfg_file: Optional[Path] = None
 
     if jev_dir.exists():
-        if jev_dir.is_symlink():
+        if _is_junction_or_symlink(jev_dir):
             return None
         direct_cfg = jev_dir / "config.json"
         if direct_cfg.exists() and direct_cfg.is_file():
@@ -661,7 +732,7 @@ def load_repo_config(repo_dir: Union[str, Path]) -> Optional[RepoConfig]:
                 else:
                     return None
             git_file = curr / ".git"
-            if git_file.exists() and git_file.is_file() and not git_file.is_symlink():
+            if git_file.exists() and git_file.is_file() and not _is_junction_or_symlink(git_file):
                 try:
                     gitdir_content = git_file.read_text(encoding="utf-8").strip()
                     if gitdir_content.startswith("gitdir:"):
@@ -678,11 +749,11 @@ def load_repo_config(repo_dir: Union[str, Path]) -> Optional[RepoConfig]:
                         backlink_file = gitdir_path / "gitdir"
                         if (
                             gitdir_path.is_dir()
-                            and not gitdir_path.is_symlink()
+                            and not _is_junction_or_symlink(gitdir_path)
                             and commondir_file.is_file()
-                            and not commondir_file.is_symlink()
+                            and not _is_junction_or_symlink(commondir_file)
                             and backlink_file.is_file()
-                            and not backlink_file.is_symlink()
+                            and not _is_junction_or_symlink(backlink_file)
                         ):
                             backlink_raw = backlink_file.read_text(encoding="utf-8").strip()
                             backlink_target = Path(backlink_raw)
@@ -725,10 +796,10 @@ def save_repo_config(config: RepoConfig, repo_dir: Union[str, Path]) -> Path:
     """Saves .jev/config.json inside the repository (declarations only, never trust)."""
     trusted_repo = Path(repo_dir).resolve()
     jev_dir = trusted_repo / ".jev"
-    if jev_dir.is_symlink():
+    if _is_junction_or_symlink(jev_dir):
         raise PermissionError(f"Rejected symlinked .jev directory: {jev_dir}")
     jev_dir.mkdir(parents=True, exist_ok=True)
-    if jev_dir.is_symlink():
+    if _is_junction_or_symlink(jev_dir):
         raise PermissionError("Rejected symlinked directory component in config path.")
 
     resolved_jev = jev_dir.resolve()
@@ -738,7 +809,7 @@ def save_repo_config(config: RepoConfig, repo_dir: Union[str, Path]) -> Path:
         raise PermissionError(f"Config directory '{resolved_jev}' escapes repository root '{trusted_repo}'.")
 
     target = jev_dir / "config.json"
-    if target.is_symlink():
+    if _is_junction_or_symlink(target):
         raise PermissionError(f"Config target file '{target}' cannot be a symlink.")
 
     resolved_target = target.resolve()
@@ -755,7 +826,7 @@ def save_repo_config(config: RepoConfig, repo_dir: Union[str, Path]) -> Path:
     temp_target = jev_dir / f".tmp_config_{uuid.uuid4().hex}.json"
     try:
         temp_target.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        if target.is_symlink():
+        if _is_junction_or_symlink(target):
             raise PermissionError(f"Config target file '{target}' cannot be a symlink.")
         os.replace(temp_target, target)
     finally:
