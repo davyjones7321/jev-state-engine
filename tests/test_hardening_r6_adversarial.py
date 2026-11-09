@@ -505,3 +505,393 @@ class TestR6PermissionEscalationAndBoundaries:
         # Confirm b.py was NOT staged
         staged_files = ws.worker_staged_paths
         assert "b.py" not in staged_files
+
+
+# ==============================================================================
+# ADV-07: Windows Protected-Path Security & Disk Boundary Integrity
+# ==============================================================================
+class TestR6WindowsProtectedPathDiskIntegrity:
+    """Exercises the actual stage_file_mutation() boundary on disk with Windows
+    trailing-dot, trailing-space, NTFS alternate data stream (ADS), and case aliases.
+    Verifies protected files cannot be modified through aliases and remain untouched on disk.
+    Executes on Windows and Linux.
+    """
+
+    def test_stage_file_mutation_rejects_trailing_dot_aliases_and_preserves_disk(self, git_repo: Path):
+        ws = Workspace(repo_dir=git_repo)
+        wt = ws.create_subgoal_worktree("sg-dot-test")
+        ws.worktree_dir = wt
+
+        # Create real protected files on disk with known baseline content
+        cfg_file = wt / "src" / "jev" / "repo_config.py"
+        cfg_file.parent.mkdir(parents=True, exist_ok=True)
+        baseline_content = "# ORIGINAL REPO_CONFIG CONTENT\nSAFE_INVARIANT = True\n"
+        cfg_file.write_text(baseline_content, encoding="utf-8")
+
+        jev_cfg = wt / ".jev" / "config.json"
+        jev_cfg.parent.mkdir(parents=True, exist_ok=True)
+        baseline_jev = '{"safe": true}\n'
+        jev_cfg.write_text(baseline_jev, encoding="utf-8")
+
+        trailing_dot_aliases = [
+            "src/jev/repo_config.py.",
+            "src/jev/repo_config.py..",
+            "src/jev/repo_config.py...",
+            "repo_config.py.",
+            "runner_registry.py.",
+            "runner_profiles.json.",
+            "process_runner.py.",
+            ".git.",
+            ".git./hooks/pre-commit",
+            ".jev.",
+            ".jev./config.json",
+            "node_modules.",
+            "node_modules./evil.js",
+        ]
+
+        for alias in trailing_dot_aliases:
+            assert is_protected_path(alias), f"Expected is_protected_path=True for {alias}"
+            with pytest.raises(PermissionError):
+                ws.stage_file_mutation(alias, "MALICIOUS_OVERWRITE_PAYLOAD")
+
+        # Verify on-disk integrity: original files remain completely intact and untouched
+        assert cfg_file.read_text(encoding="utf-8") == baseline_content
+        assert jev_cfg.read_text(encoding="utf-8") == baseline_jev
+
+    def test_stage_file_mutation_rejects_trailing_space_aliases_and_preserves_disk(self, git_repo: Path):
+        ws = Workspace(repo_dir=git_repo)
+        wt = ws.create_subgoal_worktree("sg-space-test")
+        ws.worktree_dir = wt
+
+        cfg_file = wt / "src" / "jev" / "repo_config.py"
+        cfg_file.parent.mkdir(parents=True, exist_ok=True)
+        baseline_content = "# PROTECTED CONFIG\n"
+        cfg_file.write_text(baseline_content, encoding="utf-8")
+
+        trailing_space_aliases = [
+            "src/jev/repo_config.py ",
+            "src/jev/repo_config.py   ",
+            "src/jev/repo_config.py.. ",
+            "src/jev/repo_config.py . .",
+            "repo_config.py ",
+            "runner_registry.py ",
+            ".git ",
+            ".git /config",
+            ".jev ",
+            ".jev /config.json",
+            "node_modules ",
+            "node_modules /package.json",
+        ]
+
+        for alias in trailing_space_aliases:
+            assert is_protected_path(alias), f"Expected is_protected_path=True for {alias}"
+            with pytest.raises(PermissionError):
+                ws.stage_file_mutation(alias, "MALICIOUS_OVERWRITE_PAYLOAD")
+
+        assert cfg_file.read_text(encoding="utf-8") == baseline_content
+
+    def test_stage_file_mutation_rejects_ntfs_ads_aliases_and_preserves_disk(self, git_repo: Path):
+        ws = Workspace(repo_dir=git_repo)
+        wt = ws.create_subgoal_worktree("sg-ads-test")
+        ws.worktree_dir = wt
+
+        cfg_file = wt / "src" / "jev" / "repo_config.py"
+        cfg_file.parent.mkdir(parents=True, exist_ok=True)
+        baseline_content = "# SAFE CONFIG CONTENT\n"
+        cfg_file.write_text(baseline_content, encoding="utf-8")
+
+        ads_aliases = [
+            "src/jev/repo_config.py:stream",
+            "src/jev/repo_config.py:$DATA",
+            "src/jev/repo_config.py:hidden",
+            "src/jev/repo_config.py.:stream",
+            "src/jev/repo_config.py :stream",
+            "src/jev/repo_config.py.. :$DATA",
+            "repo_config.py:stream",
+            "runner_registry.py:$DATA",
+            "process_runner.py:stream",
+            "runner_profiles.json:stream",
+        ]
+
+        for alias in ads_aliases:
+            assert is_protected_path(alias), f"Expected is_protected_path=True for {alias}"
+            with pytest.raises(PermissionError):
+                ws.stage_file_mutation(alias, "MALICIOUS_ADS_PAYLOAD")
+
+        assert cfg_file.read_text(encoding="utf-8") == baseline_content
+
+    def test_stage_file_mutation_rejects_case_variation_and_preserves_disk(self, git_repo: Path):
+        ws = Workspace(repo_dir=git_repo)
+        wt = ws.create_subgoal_worktree("sg-case-test")
+        ws.worktree_dir = wt
+
+        cfg_file = wt / "src" / "jev" / "repo_config.py"
+        cfg_file.parent.mkdir(parents=True, exist_ok=True)
+        baseline_content = "# ORIGINAL CASE-INSENSITIVE PROTECTED CONTENT\n"
+        cfg_file.write_text(baseline_content, encoding="utf-8")
+
+        case_aliases = [
+            "src/jev/REPO_CONFIG.PY",
+            "SRC/JEV/repo_config.py",
+            "SRC/JEV/REPO_CONFIG.PY",
+            "REPO_CONFIG.PY",
+            "RUNNER_REGISTRY.PY",
+            "PROCESS_RUNNER.PY",
+            "RUNNER_PROFILES.JSON",
+            ".GIT/config",
+            ".GIT/hooks/pre-commit",
+            ".JEV/config.json",
+            "NODE_MODULES/package/index.js",
+            "src/jev/REPO_CONFIG.PY.",
+            "src/jev/REPO_CONFIG.PY ",
+        ]
+
+        for alias in case_aliases:
+            assert is_protected_path(alias), f"Expected is_protected_path=True for {alias}"
+            with pytest.raises(PermissionError):
+                ws.stage_file_mutation(alias, "MALICIOUS_CASE_PAYLOAD")
+
+        assert cfg_file.read_text(encoding="utf-8") == baseline_content
+
+
+# ==============================================================================
+# ADV-08: Verification Integrity & Runner Metadata Validation
+# ==============================================================================
+class TestR6VerificationIntegrityAndMetadataValidation:
+    """Evaluates strict verification integrity:
+    1. Explicit nonzero exit codes fail verification.
+    2. Contradictory runner metadata fails verification.
+    3. Malformed/incomplete runner metadata fails verification.
+    4. A passing gatekeeper verdict must never override failed test execution.
+    """
+
+    def test_explicit_nonzero_exit_code_fails_verification_even_if_outcome_claims_passed(self):
+        """Runner exit_code != 0 must cause verification failure even if outcome claims PASSED."""
+        ws = MagicMock()
+        ws.check_compile.return_value = {"outcome": "PASSED"}
+        ws.run_tests.return_value = TestOutcome.PASSED
+        ws.get_cumulative_diff.return_value = "diff --git a/a.py b/a.py\n+x = 1"
+        ws.get_staged_diff.return_value = ""
+        ws.last_test_run = {
+            "ran": True,
+            "exit_code": 1,  # Nonzero exit code
+            "outcome": "PASSED",
+            "output_tail": "Tests passed according to output tail",
+        }
+
+        gk = MagicMock()
+        gk.verify_ticket.return_value = ValidationVerdict(valid=True, probability=0.99, reason="Gatekeeper approved")
+
+        state: State = {
+            "ticket": "Implement feature",
+            "integration_branch": "jev-ticket-1",
+            "status": "in_progress",
+            "trajectory": [],
+        }
+
+        out = node_verify(state, workspace=ws, gatekeeper=gk)
+        assert out.get("gate_status") == "verification_failed", "Nonzero exit code must fail verification!"
+        assert out.get("status") in ("verification_failed", "escalated")
+        assert out.get("full_suite_clean") is False
+        assert out.get("test_classification") == "FAILED"
+        ws.fast_forward_main.assert_not_called()
+        ws.delete_integration_branch.assert_not_called()
+
+    def test_contradictory_metadata_new_failures_fails_verification(self):
+        """new_failures > 0 with outcome claiming PASSED must fail verification."""
+        ws = MagicMock()
+        ws.check_compile.return_value = {"outcome": "PASSED"}
+        ws.run_tests.return_value = TestOutcome.PASSED
+        ws.get_cumulative_diff.return_value = "diff --git a/a.py b/a.py\n+x = 1"
+        ws.get_staged_diff.return_value = ""
+        ws.last_test_run = {
+            "ran": True,
+            "exit_code": 0,
+            "new_failures": 2,  # Contradictory new failures!
+            "outcome": "PASSED",
+        }
+
+        gk = MagicMock()
+        gk.verify_ticket.return_value = ValidationVerdict(valid=True, probability=0.99)
+
+        state: State = {
+            "ticket": "Implement feature",
+            "integration_branch": "jev-ticket-1",
+            "status": "in_progress",
+            "trajectory": [],
+        }
+
+        out = node_verify(state, workspace=ws, gatekeeper=gk)
+        assert out.get("gate_status") == "verification_failed", "Contradictory new_failures must fail verification!"
+        ws.fast_forward_main.assert_not_called()
+
+    def test_contradictory_metadata_failing_test_ids_fails_verification(self):
+        """failing_test_ids non-empty with outcome claiming PASSED must fail verification."""
+        ws = MagicMock()
+        ws.check_compile.return_value = {"outcome": "PASSED"}
+        ws.run_tests.return_value = TestOutcome.PASSED
+        ws.get_cumulative_diff.return_value = "diff --git a/a.py b/a.py\n+x = 1"
+        ws.get_staged_diff.return_value = ""
+        ws.last_test_run = {
+            "ran": True,
+            "exit_code": 0,
+            "failing_test_ids": ["tests/test_auth.py::test_bypass"],
+            "outcome": "PASSED",
+        }
+
+        gk = MagicMock()
+        gk.verify_ticket.return_value = ValidationVerdict(valid=True, probability=0.99)
+
+        state: State = {
+            "ticket": "Implement feature",
+            "integration_branch": "jev-ticket-1",
+            "status": "in_progress",
+            "trajectory": [],
+        }
+
+        out = node_verify(state, workspace=ws, gatekeeper=gk)
+        assert out.get("gate_status") == "verification_failed"
+        ws.fast_forward_main.assert_not_called()
+
+    def test_contradictory_runner_outcome_failed_fails_verification(self):
+        """Runner outcome FAILED while run_tests claims PASSED must fail verification."""
+        ws = MagicMock()
+        ws.check_compile.return_value = {"outcome": "PASSED"}
+        ws.run_tests.return_value = TestOutcome.PASSED
+        ws.get_cumulative_diff.return_value = "diff --git a/a.py b/a.py\n+x = 1"
+        ws.get_staged_diff.return_value = ""
+        ws.last_test_run = {
+            "ran": True,
+            "exit_code": 0,
+            "outcome": "FAILED",
+        }
+
+        gk = MagicMock()
+        gk.verify_ticket.return_value = ValidationVerdict(valid=True, probability=0.99)
+
+        state: State = {
+            "ticket": "Implement feature",
+            "integration_branch": "jev-ticket-1",
+            "status": "in_progress",
+            "trajectory": [],
+        }
+
+        out = node_verify(state, workspace=ws, gatekeeper=gk)
+        assert out.get("gate_status") == "verification_failed"
+        ws.fast_forward_main.assert_not_called()
+
+    def test_malformed_metadata_not_dict_fails_verification(self):
+        """Non-dict last_test_run when tests ran must fail verification."""
+        ws = MagicMock()
+        ws.check_compile.return_value = {"outcome": "PASSED"}
+        ws.run_tests.return_value = None
+        ws.get_cumulative_diff.return_value = "diff --git a/a.py b/a.py\n+x = 1"
+        ws.get_staged_diff.return_value = ""
+        ws.last_test_run = "MALFORMED_NON_DICT_STRING"
+
+        gk = MagicMock()
+        gk.verify_ticket.return_value = ValidationVerdict(valid=True, probability=0.99)
+
+        state: State = {
+            "ticket": "Implement feature",
+            "integration_branch": "jev-ticket-1",
+            "status": "in_progress",
+            "trajectory": [],
+        }
+
+        out = node_verify(state, workspace=ws, gatekeeper=gk)
+        assert out.get("gate_status") == "verification_failed"
+        ws.fast_forward_main.assert_not_called()
+
+    def test_malformed_metadata_unknown_outcome_fails_verification(self):
+        """Outcome UNKNOWN must fail verification."""
+        ws = MagicMock()
+        ws.check_compile.return_value = {"outcome": "PASSED"}
+        ws.run_tests.return_value = "UNKNOWN"
+        ws.get_cumulative_diff.return_value = "diff --git a/a.py b/a.py\n+x = 1"
+        ws.get_staged_diff.return_value = ""
+        ws.last_test_run = {
+            "ran": True,
+            "exit_code": None,
+            "outcome": "UNKNOWN",
+        }
+
+        gk = MagicMock()
+        gk.verify_ticket.return_value = ValidationVerdict(valid=True, probability=0.99)
+
+        state: State = {
+            "ticket": "Implement feature",
+            "integration_branch": "jev-ticket-1",
+            "status": "in_progress",
+            "trajectory": [],
+        }
+
+        out = node_verify(state, workspace=ws, gatekeeper=gk)
+        assert out.get("gate_status") == "verification_failed"
+        ws.fast_forward_main.assert_not_called()
+
+    def test_malformed_metadata_ran_false_fails_verification(self):
+        """Metadata claiming ran=False when tests were executed must fail verification."""
+        ws = MagicMock()
+        ws.check_compile.return_value = {"outcome": "PASSED"}
+        ws.run_tests.return_value = None
+        ws.get_cumulative_diff.return_value = "diff --git a/a.py b/a.py\n+x = 1"
+        ws.get_staged_diff.return_value = ""
+        ws.last_test_run = {
+            "ran": False,
+            "exit_code": None,
+            "outcome": "PASSED",
+        }
+
+        gk = MagicMock()
+        gk.verify_ticket.return_value = ValidationVerdict(valid=True, probability=0.99)
+
+        state: State = {
+            "ticket": "Implement feature",
+            "integration_branch": "jev-ticket-1",
+            "status": "in_progress",
+            "trajectory": [],
+        }
+
+        out = node_verify(state, workspace=ws, gatekeeper=gk)
+        assert out.get("gate_status") == "verification_failed"
+        ws.fast_forward_main.assert_not_called()
+
+    def test_passing_gatekeeper_verdict_never_overrides_failed_test_execution(self):
+        """Adversarial test: A perfect Gatekeeper verdict (probability 1.0, valid=True)
+        must NEVER override failed unit test execution, whether from nonzero exit code,
+        test failure output, or contradictory metadata.
+        """
+        ws = MagicMock()
+        ws.check_compile.return_value = {"outcome": "PASSED"}
+        ws.run_tests.return_value = TestOutcome.FAILED
+        ws.get_cumulative_diff.return_value = "diff --git a/a.py b/a.py\n+x = 1"
+        ws.get_staged_diff.return_value = ""
+        ws.last_test_run = {
+            "ran": True,
+            "exit_code": 2,
+            "outcome": "FAILED",
+            "output_tail": "2 failed, 10 passed in 1.2s",
+        }
+
+        # Gatekeeper returns highest possible approval
+        gk = MagicMock()
+        gk.verify_ticket.return_value = ValidationVerdict(
+            valid=True,
+            probability=1.0,
+            reason="Flawless code changes, 100% approved by gatekeeper",
+        )
+
+        state: State = {
+            "ticket": "Security critical feature",
+            "integration_branch": "jev-ticket-security",
+            "status": "in_progress",
+            "trajectory": [],
+        }
+
+        out = node_verify(state, workspace=ws, gatekeeper=gk)
+        assert out.get("gate_status") == "verification_failed", "Gatekeeper MUST NOT override failed test execution!"
+        assert out.get("status") in ("verification_failed", "escalated")
+        assert "Verification rejected: automated unit tests failed." in out.get("last_feedback", "")
+        ws.fast_forward_main.assert_not_called()
+        ws.delete_integration_branch.assert_not_called()

@@ -205,9 +205,11 @@ def is_protected_path(path: Union[str, Path]) -> bool:
         norm = norm[2:]
     norm_lower = norm.lower()
 
-    # Clean segments: strip Windows trailing dots, spaces, and NTFS alternate data stream specifiers
+    # Clean segments: strip Windows trailing dots, spaces, and NTFS alternate data stream specifiers.
+    # Colons in ADS specifiers (e.g. file:stream) are split before stripping trailing dots/spaces
+    # to handle combined forms like "repo_config.py.:stream" and "repo_config.py :$DATA".
     raw_parts = [p for p in norm_lower.split("/") if p]
-    clean_parts = [p.rstrip(". ").split(":")[0] for p in raw_parts]
+    clean_parts = [p.split(":")[0].rstrip(". ") for p in raw_parts if p.split(":")[0].rstrip(". ")]
     clean_norm = "/".join(clean_parts)
 
     # Prefix checks
@@ -217,10 +219,11 @@ def is_protected_path(path: Union[str, Path]) -> bool:
             or norm_lower.startswith(f"{prefix}/")
             or clean_norm == prefix
             or clean_norm.startswith(f"{prefix}/")
+            or any(part == prefix for part in clean_parts)
         ):
             return True
 
-    # Protected file name checks (exact or trailing component)
+    # Protected file name checks (exact, trailing component, or any segment)
     clean_filename = clean_parts[-1] if clean_parts else ""
     for pf in PROTECTED_FILES:
         pf_lower = pf.lower()
@@ -230,6 +233,7 @@ def is_protected_path(path: Union[str, Path]) -> bool:
             or clean_norm.endswith(f"/{pf_lower}")
             or norm_lower == pf_lower
             or norm_lower.endswith(f"/{pf_lower}")
+            or any(part == pf_lower for part in clean_parts)
         ):
             return True
 

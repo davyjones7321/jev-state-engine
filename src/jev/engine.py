@@ -5161,6 +5161,61 @@ def node_verify(
             required=any_expects_tests,
         )
 
+        # Strict Verification Integrity & Runner Metadata Validation:
+        # Any explicit nonzero test-runner exit code causes verification failure.
+        # Contradictory, malformed, or incomplete runner metadata cannot produce a successful verification.
+        raw_exit = None
+        if isinstance(test_runner_info, dict) and test_runner_info.get("exit_code") is not None:
+            raw_exit = test_runner_info.get("exit_code")
+        elif workspace is not None and hasattr(workspace, "last_test_run") and isinstance(workspace.last_test_run, dict):
+            raw_exit = workspace.last_test_run.get("exit_code")
+
+        explicit_nonzero_exit = False
+        if raw_exit is not None:
+            try:
+                explicit_nonzero_exit = (int(raw_exit) != 0)
+            except (ValueError, TypeError):
+                explicit_nonzero_exit = True
+
+        runner_reported_outcome = test_runner_info.get("outcome") if isinstance(test_runner_info, dict) else None
+        new_failures = test_runner_info.get("new_failures") if isinstance(test_runner_info, dict) else None
+        failing_ids = test_runner_info.get("failing_test_ids") if isinstance(test_runner_info, dict) else None
+        if failing_ids is None and workspace is not None and hasattr(workspace, "last_test_run") and isinstance(workspace.last_test_run, dict):
+            failing_ids = workspace.last_test_run.get("failing_test_ids")
+
+        contradictory_metadata = False
+        claims_pass = (outcome in (TestOutcome.PASSED, "PASSED") or runner_reported_outcome in (TestOutcome.PASSED, "PASSED", "passed"))
+        if explicit_nonzero_exit and claims_pass:
+            contradictory_metadata = True
+        if isinstance(new_failures, int) and new_failures > 0 and claims_pass:
+            contradictory_metadata = True
+        if failing_ids and len(failing_ids) > 0 and claims_pass:
+            contradictory_metadata = True
+        if runner_reported_outcome in (TestOutcome.FAILED, "FAILED", "failed") and outcome in (TestOutcome.PASSED, "PASSED"):
+            contradictory_metadata = True
+        if isinstance(test_runner_info, dict) and (test_runner_info.get("launch_failed") or test_runner_info.get("timed_out")) and claims_pass:
+            contradictory_metadata = True
+
+        malformed_metadata = False
+        if tests_ran:
+            orig_last_run = getattr(workspace, "last_test_run", None)
+            if orig_last_run is not None and isinstance(orig_last_run, (str, list, int, float, tuple, bool)):
+                malformed_metadata = True
+            elif orig_last_run is not None and isinstance(orig_last_run, dict) and orig_last_run.get("ran") is False:
+                malformed_metadata = True
+            elif runner_reported_outcome in ("UNKNOWN", "MALFORMED"):
+                malformed_metadata = True
+
+        if explicit_nonzero_exit or contradictory_metadata or malformed_metadata:
+            outcome = TestOutcome.FAILED
+            test_output = (
+                f"FAILED\nVerification test runner check failed: "
+                f"explicit_nonzero_exit={explicit_nonzero_exit} (exit_code={raw_exit}), "
+                f"contradictory_metadata={contradictory_metadata}, malformed_metadata={malformed_metadata}"
+            )
+            if isinstance(test_runner_info, dict):
+                test_runner_info["outcome"] = "FAILED"
+
         verify_classification = None
         verify_baseline_failures = 0
         verify_new_failures = 0
@@ -5263,7 +5318,10 @@ def node_verify(
                 verify_keys = None
 
             tests_failed = (
-                outcome in (TestOutcome.FAILED, "FAILED")
+                explicit_nonzero_exit
+                or contradictory_metadata
+                or malformed_metadata
+                or outcome in (TestOutcome.FAILED, "FAILED")
                 or (isinstance(test_output, str) and test_output.startswith("FAILED"))
                 or (isinstance(test_runner_info, dict) and test_runner_info.get("outcome") in (TestOutcome.FAILED, "FAILED", "failed"))
             )
@@ -5344,7 +5402,10 @@ def node_verify(
                 )
         else:
             tests_failed = (
-                outcome in (TestOutcome.FAILED, "FAILED")
+                explicit_nonzero_exit
+                or contradictory_metadata
+                or malformed_metadata
+                or outcome in (TestOutcome.FAILED, "FAILED")
                 or (isinstance(test_output, str) and test_output.startswith("FAILED"))
                 or (isinstance(test_runner_info, dict) and test_runner_info.get("outcome") in (TestOutcome.FAILED, "FAILED", "failed"))
             )
