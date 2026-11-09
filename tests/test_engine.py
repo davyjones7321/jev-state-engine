@@ -63,6 +63,14 @@ class FakeWorkspace:
         return "M file.py"
 
     def run_tests(self):
+        if not hasattr(self, "last_test_run") or self.last_test_run is None:
+            self.last_test_run = {
+                "ran": True,
+                "command": ["pytest"],
+                "exit_code": 0 if self.test_outcome == TestOutcome.PASSED else 1,
+                "outcome": getattr(self.test_outcome, "value", str(self.test_outcome)),
+                "output_tail": "passed" if self.test_outcome == TestOutcome.PASSED else "failed",
+            }
         return self.test_outcome
 
     def resolve_in_worktree(self, path):
@@ -586,6 +594,7 @@ def test_node_verify_passes_investigation_notes_to_gatekeeper():
     """Assert node_verify forwards state['investigation_notes'] to gatekeeper.verify_ticket."""
     ws = MagicMock()
     ws.run_tests.return_value = TestOutcome.PASSED
+    ws.last_test_run = {"ran": True, "command": ["pytest"], "exit_code": 0, "outcome": "PASSED"}
     ws.get_cumulative_diff.return_value = "+x = 1\n"
     ws.get_staged_diff.return_value = "+x = 1\n"
 

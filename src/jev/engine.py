@@ -5132,13 +5132,20 @@ def node_verify(
         elif test_output == "NO_TEST_FRAMEWORK":
             test_output = "NO_TEST_FRAMEWORK (Untested pass: no test framework present in workspace)"
 
+        orig_last_run = getattr(workspace, "last_test_run", None) if workspace is not None else None
+        is_mock_runner = hasattr(orig_last_run, "_mock_return_value") or type(orig_last_run).__name__ in ("MagicMock", "Mock")
+
         if not tests_ran:
             test_runner_info = {
                 "ran": False,
             }
         else:
-            test_runner_info = getattr(workspace, "last_test_run", None)
-            if not isinstance(test_runner_info, dict):
+            if isinstance(orig_last_run, dict) and not is_mock_runner:
+                test_runner_info = dict(orig_last_run)
+                test_runner_info["ran"] = True
+                if "outcome" not in test_runner_info and outcome is not None:
+                    test_runner_info["outcome"] = getattr(outcome, "value", str(outcome))
+            else:
                 test_runner_info = {
                     "ran": True,
                     "ecosystem": None,
@@ -5147,12 +5154,8 @@ def node_verify(
                     "stdout_tail": "",
                     "stderr_tail": "",
                     "output_tail": "",
-                    "outcome": getattr(outcome, "value", str(outcome)) if 'outcome' in locals() else "UNKNOWN",
+                    "outcome": getattr(outcome, "value", str(outcome)) if outcome is not None else "UNMEASURED",
                 }
-            else:
-                test_runner_info = dict(test_runner_info)
-                test_runner_info["ran"] = True
-                test_runner_info.setdefault("outcome", getattr(outcome, "value", str(outcome)))
 
         test_runner_info = _test_evidence(
             test_policy, tests_ran, test_runner_info,
@@ -5160,6 +5163,116 @@ def node_verify(
                                       (hasattr(workspace, "run_tests") and _accepts_param(workspace.run_tests, "targets"))) else [],
             required=any_expects_tests,
         )
+
+        # Strict Verification Integrity & Runner Metadata Validation:
+        # Any explicit nonzero test-runner exit code causes verification failure.
+        # Contradictory, malformed, or incomplete runner metadata cannot produce a successful verification.
+        raw_exit = None
+        if isinstance(orig_last_run, dict) and not is_mock_runner and orig_last_run.get("exit_code") is not None:
+            raw_exit = orig_last_run.get("exit_code")
+        elif isinstance(test_runner_info, dict) and test_runner_info.get("exit_code") is not None:
+            raw_exit = test_runner_info.get("exit_code")
+
+        is_valid_int_exit = (type(raw_exit) is int and not isinstance(raw_exit, bool))
+        explicit_nonzero_exit = False
+        if raw_exit is not None:
+            if not is_valid_int_exit:
+                explicit_nonzero_exit = True
+            elif raw_exit != 0:
+                explicit_nonzero_exit = True
+
+        runner_reported_outcome = test_runner_info.get("outcome") if isinstance(test_runner_info, dict) else None
+        new_failures = test_runner_info.get("new_failures") if isinstance(test_runner_info, dict) else None
+        failing_ids = test_runner_info.get("failing_test_ids") if isinstance(test_runner_info, dict) else None
+        if failing_ids is None and isinstance(orig_last_run, dict) and not is_mock_runner:
+            failing_ids = orig_last_run.get("failing_test_ids")
+
+        require_tests = state.get("require_tests")
+        require_tests_strict = (require_tests in ("on", True))
+
+        contradictory_metadata = False
+        claims_pass = (
+            outcome in (TestOutcome.PASSED, "PASSED")
+            or (isinstance(orig_last_run, dict) and not is_mock_runner and orig_last_run.get("outcome") in (TestOutcome.PASSED, "PASSED", "passed"))
+            or (isinstance(test_runner_info, dict) and test_runner_info.get("outcome") in (TestOutcome.PASSED, "PASSED", "passed"))
+        )
+
+        missing_runner_evidence = False
+        malformed_metadata = False
+
+        if tests_ran:
+            if orig_last_run is None or is_mock_runner:
+                if claims_pass:
+                    missing_runner_evidence = True
+                elif any_expects_tests and require_tests_strict:
+                    missing_runner_evidence = True
+            elif not isinstance(orig_last_run, dict):
+                malformed_metadata = True
+            elif len(orig_last_run) == 0:
+                if claims_pass:
+                    missing_runner_evidence = True
+                elif any_expects_tests and require_tests_strict:
+                    missing_runner_evidence = True
+            else:
+                if orig_last_run.get("ran") is False:
+                    malformed_metadata = True
+
+                orig_exit = orig_last_run.get("exit_code")
+                is_valid_orig_exit = (type(orig_exit) is int and not isinstance(orig_exit, bool))
+
+                if claims_pass:
+                    if orig_exit is None:
+                        missing_runner_evidence = True
+                    elif not is_valid_orig_exit:
+                        malformed_metadata = True
+                    elif explicit_nonzero_exit:
+                        contradictory_metadata = True
+
+                    has_runner_evidence = any(
+                        orig_last_run.get(k)
+                        for k in (
+                            "command",
+                            "executed_command",
+                            "argv",
+                            "output_tail",
+                            "stdout",
+                            "stdout_tail",
+                            "stderr",
+                            "stderr_tail",
+                        )
+                    )
+                    if not has_runner_evidence:
+                        missing_runner_evidence = True
+
+                    if orig_last_run.get("launch_failed") or orig_last_run.get("timed_out"):
+                        contradictory_metadata = True
+                    if orig_last_run.get("outcome") in (TestOutcome.FAILED, "FAILED", "failed", "ERROR", "error"):
+                        contradictory_metadata = True
+
+            if runner_reported_outcome in ("UNKNOWN", "MALFORMED") and state.get("require_tests") != "off":
+                malformed_metadata = True
+
+        if explicit_nonzero_exit and claims_pass:
+            contradictory_metadata = True
+        if isinstance(new_failures, int) and new_failures > 0 and claims_pass:
+            contradictory_metadata = True
+        if failing_ids and len(failing_ids) > 0 and claims_pass:
+            contradictory_metadata = True
+        if runner_reported_outcome in (TestOutcome.FAILED, "FAILED", "failed") and outcome in (TestOutcome.PASSED, "PASSED"):
+            contradictory_metadata = True
+        if isinstance(test_runner_info, dict) and (test_runner_info.get("launch_failed") or test_runner_info.get("timed_out")) and claims_pass:
+            contradictory_metadata = True
+
+        if explicit_nonzero_exit or contradictory_metadata or malformed_metadata or missing_runner_evidence:
+            outcome = TestOutcome.FAILED
+            test_output = (
+                f"FAILED\nVerification test runner check failed: "
+                f"explicit_nonzero_exit={explicit_nonzero_exit} (exit_code={raw_exit}), "
+                f"contradictory_metadata={contradictory_metadata}, malformed_metadata={malformed_metadata}, "
+                f"missing_runner_evidence={missing_runner_evidence}"
+            )
+            if isinstance(test_runner_info, dict):
+                test_runner_info["outcome"] = "FAILED"
 
         verify_classification = None
         verify_baseline_failures = 0
@@ -5262,7 +5375,16 @@ def node_verify(
             if not isinstance(verify_keys, str):
                 verify_keys = None
 
-            if verdict.valid:
+            tests_failed = (
+                explicit_nonzero_exit
+                or contradictory_metadata
+                or malformed_metadata
+                or missing_runner_evidence
+                or outcome in (TestOutcome.FAILED, "FAILED")
+                or (isinstance(test_output, str) and test_output.startswith("FAILED"))
+                or (isinstance(test_runner_info, dict) and test_runner_info.get("outcome") in (TestOutcome.FAILED, "FAILED", "failed"))
+            )
+            if verdict.valid and not tests_failed:
                 # Discard verify worktree safely first
                 if verify_wt_path and hasattr(workspace, "discard_verify_worktree"):
                     workspace.discard_verify_worktree(verify_wt_path)
@@ -5303,7 +5425,9 @@ def node_verify(
                 state["gate_status"] = "verification_failed"
                 state["status"] = "verification_failed"
                 prob_str = f" (confidence: {verdict.probability:.2f})" if hasattr(verdict, "probability") and isinstance(verdict.probability, (int, float)) else ""
-                base_fb = verdict.reason or f"Verification rejected by Gatekeeper{prob_str}."
+                base_fb = verdict.reason if (not verdict.valid) else "Verification rejected: automated unit tests failed."
+                if not base_fb:
+                    base_fb = f"Verification rejected by Gatekeeper{prob_str}."
                 if outcome == TestOutcome.FAILED or "FAILED" in str(test_output):
                     output_tail = None
                     if isinstance(test_runner_info, dict):
@@ -5336,6 +5460,24 @@ def node_verify(
                     jev_state_keys=verify_keys,
                 )
         else:
+            tests_failed = (
+                explicit_nonzero_exit
+                or contradictory_metadata
+                or malformed_metadata
+                or missing_runner_evidence
+                or outcome in (TestOutcome.FAILED, "FAILED")
+                or (isinstance(test_output, str) and test_output.startswith("FAILED"))
+                or (isinstance(test_runner_info, dict) and test_runner_info.get("outcome") in (TestOutcome.FAILED, "FAILED", "failed"))
+            )
+            if tests_failed:
+                if verify_wt_path and hasattr(workspace, "discard_verify_worktree"):
+                    workspace.discard_verify_worktree(verify_wt_path)
+                    verify_wt_path = None
+                state["gate_status"] = "verification_failed"
+                state["status"] = "verification_failed"
+                state["last_feedback"] = "Verification failed: unit test suite failed."
+                return state
+
             if verify_wt_path and hasattr(workspace, "discard_verify_worktree"):
                 workspace.discard_verify_worktree(verify_wt_path)
                 verify_wt_path = None
