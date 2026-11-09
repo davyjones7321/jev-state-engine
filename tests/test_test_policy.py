@@ -218,6 +218,7 @@ def test_node_verify_skips_tests_when_policy_never(git_repo):
 def test_node_verify_runs_tests_when_policy_verify_only(git_repo):
     ws = Workspace(repo_dir=git_repo)
     ws.run_tests = MagicMock(return_value=TestOutcome.PASSED)
+    ws.last_test_run = {"ran": True, "command": ["pytest"], "exit_code": 0, "outcome": "PASSED"}
     ws.create_integration_branch("jev-verify-test-2")
 
     gk = FakeGatekeeper()
