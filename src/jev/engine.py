@@ -5262,7 +5262,12 @@ def node_verify(
             if not isinstance(verify_keys, str):
                 verify_keys = None
 
-            if verdict.valid:
+            tests_failed = (
+                outcome in (TestOutcome.FAILED, "FAILED")
+                or (isinstance(test_output, str) and test_output.startswith("FAILED"))
+                or (isinstance(test_runner_info, dict) and test_runner_info.get("outcome") in (TestOutcome.FAILED, "FAILED", "failed"))
+            )
+            if verdict.valid and not tests_failed:
                 # Discard verify worktree safely first
                 if verify_wt_path and hasattr(workspace, "discard_verify_worktree"):
                     workspace.discard_verify_worktree(verify_wt_path)
@@ -5303,7 +5308,9 @@ def node_verify(
                 state["gate_status"] = "verification_failed"
                 state["status"] = "verification_failed"
                 prob_str = f" (confidence: {verdict.probability:.2f})" if hasattr(verdict, "probability") and isinstance(verdict.probability, (int, float)) else ""
-                base_fb = verdict.reason or f"Verification rejected by Gatekeeper{prob_str}."
+                base_fb = verdict.reason if (not verdict.valid) else "Verification rejected: automated unit tests failed."
+                if not base_fb:
+                    base_fb = f"Verification rejected by Gatekeeper{prob_str}."
                 if outcome == TestOutcome.FAILED or "FAILED" in str(test_output):
                     output_tail = None
                     if isinstance(test_runner_info, dict):
@@ -5336,6 +5343,20 @@ def node_verify(
                     jev_state_keys=verify_keys,
                 )
         else:
+            tests_failed = (
+                outcome in (TestOutcome.FAILED, "FAILED")
+                or (isinstance(test_output, str) and test_output.startswith("FAILED"))
+                or (isinstance(test_runner_info, dict) and test_runner_info.get("outcome") in (TestOutcome.FAILED, "FAILED", "failed"))
+            )
+            if tests_failed:
+                if verify_wt_path and hasattr(workspace, "discard_verify_worktree"):
+                    workspace.discard_verify_worktree(verify_wt_path)
+                    verify_wt_path = None
+                state["gate_status"] = "verification_failed"
+                state["status"] = "verification_failed"
+                state["last_feedback"] = "Verification failed: unit test suite failed."
+                return state
+
             if verify_wt_path and hasattr(workspace, "discard_verify_worktree"):
                 workspace.discard_verify_worktree(verify_wt_path)
                 verify_wt_path = None

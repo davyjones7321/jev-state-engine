@@ -205,17 +205,32 @@ def is_protected_path(path: Union[str, Path]) -> bool:
         norm = norm[2:]
     norm_lower = norm.lower()
 
+    # Clean segments: strip Windows trailing dots, spaces, and NTFS alternate data stream specifiers
+    raw_parts = [p for p in norm_lower.split("/") if p]
+    clean_parts = [p.rstrip(". ").split(":")[0] for p in raw_parts]
+    clean_norm = "/".join(clean_parts)
+
     # Prefix checks
     for prefix in (".git", ".jev", "node_modules"):
-        if norm_lower == prefix or norm_lower.startswith(f"{prefix}/"):
+        if (
+            norm_lower == prefix
+            or norm_lower.startswith(f"{prefix}/")
+            or clean_norm == prefix
+            or clean_norm.startswith(f"{prefix}/")
+        ):
             return True
 
     # Protected file name checks (exact or trailing component)
-    parts = norm_lower.split("/")
-    filename = parts[-1]
+    clean_filename = clean_parts[-1] if clean_parts else ""
     for pf in PROTECTED_FILES:
         pf_lower = pf.lower()
-        if filename == pf_lower or norm_lower == pf_lower or norm_lower.endswith(f"/{pf_lower}"):
+        if (
+            clean_filename == pf_lower
+            or clean_norm == pf_lower
+            or clean_norm.endswith(f"/{pf_lower}")
+            or norm_lower == pf_lower
+            or norm_lower.endswith(f"/{pf_lower}")
+        ):
             return True
 
     return False
