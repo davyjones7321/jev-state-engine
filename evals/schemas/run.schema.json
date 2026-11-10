@@ -1,0 +1,328 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/jev-state-engine/evals/schemas/run.schema.json",
+  "title": "Agent evaluation run record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "recorded_at_utc",
+    "agent",
+    "benchmark",
+    "task",
+    "status",
+    "execution",
+    "result",
+    "cost"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "recorded_at_utc": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "agent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "adapter_version"
+      ],
+      "properties": {
+        "name": {
+          "enum": [
+            "jev",
+            "opencode",
+            "antigravity"
+          ]
+        },
+        "adapter_version": {
+          "type": "string"
+        },
+        "configuration_sha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[a-fA-F0-9]{64}$"
+        },
+        "model": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "provider",
+            "model_id",
+            "access_route"
+          ],
+          "properties": {
+            "provider": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "model_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "access_route": {
+              "enum": [
+                "free_tier",
+                "paid_subscription",
+                "prepaid_credits",
+                "local",
+                "unknown"
+              ]
+            },
+            "generation_settings": {
+              "type": [
+                "object",
+                "null"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "benchmark": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version",
+        "split",
+        "evaluator_version"
+      ],
+      "properties": {
+        "name": {
+          "enum": [
+            "mbpp_plus",
+            "gaia",
+            "assistantbench"
+          ]
+        },
+        "version": {
+          "type": "string"
+        },
+        "split": {
+          "type": "string"
+        },
+        "evaluator_version": {
+          "type": "string"
+        },
+        "source_revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "task": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "task_id",
+        "category"
+      ],
+      "properties": {
+        "task_id": {
+          "type": "string"
+        },
+        "category": {
+          "enum": [
+            "coding",
+            "reasoning_research",
+            "browser"
+          ]
+        },
+        "eligibility": {
+          "enum": [
+            "eligible",
+            "not_eligible"
+          ]
+        },
+        "eligibility_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "status": {
+      "enum": [
+        "completed",
+        "agent_failure",
+        "infrastructure_failure",
+        "provider_failure",
+        "timed_out",
+        "not_run"
+      ]
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "environment_id",
+        "tools",
+        "network_policy",
+        "timeout_seconds"
+      ],
+      "properties": {
+        "environment_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "network_policy": {
+          "enum": [
+            "disabled",
+            "benchmark_required_allowlist",
+            "unrestricted",
+            "unknown"
+          ]
+        },
+        "timeout_seconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "duration_seconds": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "resource_usage": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "credential_boundary_verified": {
+          "type": "boolean"
+        }
+      }
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evaluator_status",
+        "score",
+        "metric_name"
+      ],
+      "properties": {
+        "evaluator_status": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_scored",
+            "evaluator_error"
+          ]
+        },
+        "score": {
+          "type": [
+            "number",
+            "integer",
+            "null"
+          ]
+        },
+        "metric_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "passed_tests": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "total_tests": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "failure_class": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "notes": {
+          "type": "string"
+        }
+      }
+    },
+    "cost": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "currency",
+        "amount",
+        "status"
+      ],
+      "properties": {
+        "currency": {
+          "const": "USD"
+        },
+        "amount": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "status": {
+          "enum": [
+            "zero_additional_cost",
+            "covered_subscription",
+            "prepaid_credit",
+            "unknown",
+            "charge_detected"
+          ]
+        },
+        "quota_observation": {
+          "type": "string"
+        }
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "local_log_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "redacted": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}
