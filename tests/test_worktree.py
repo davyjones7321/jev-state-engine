@@ -575,3 +575,42 @@ def test_stage_file_mutation_reports_git_add_failure_without_recording_path(git_
     with pytest.raises(RuntimeError, match="simulated git add failure"):
         ws.stage_file_mutation("cannot-stage.py", "x = 1\n")
     assert "cannot-stage.py" not in ws.worker_staged_paths
+
+
+def test_node_implement_discards_worktree_when_local_input_seeding_fails(git_repo, monkeypatch):
+    ws = Workspace(repo_dir=git_repo)
+    seed_error = RuntimeError("simulated unsafe local input")
+
+    def fail_seeding(scope_paths):
+        raise seed_error
+
+    monkeypatch.setattr(ws, "seed_subgoal_worktree_inputs", fail_seeding)
+    subgoal = Subgoal(
+        description="Implement local fixture",
+        scope=["evals/local/mbpp_plus/workspaces/jev/Mbpp_2/solution.py"],
+    )
+    state = {"current_subgoal": subgoal, "plan_queue": [], "trajectory": []}
+
+    with pytest.raises(RuntimeError, match="simulated unsafe local input") as exc_info:
+        node_implement(state, workspace=ws, llm=None)
+
+    assert exc_info.value is seed_error
+    assert state.get("current_worktree_path") is None
+    assert state.get("current_worktree_branch") is None
+    worktree_list = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=git_repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert ".jev-worktrees" not in worktree_list
+    branch_list = subprocess.run(
+        ["git", "branch", "--list", "jev-subgoal-*"],
+        cwd=git_repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert branch_list.strip() == ""
+    assert ws.worktree_dir.resolve() == ws.repo_dir.resolve()
