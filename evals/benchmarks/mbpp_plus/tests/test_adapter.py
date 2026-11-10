@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from adapter import read_jsonl, validate_samples, write_jsonl
+from adapter import read_jsonl, select_ids, validate_samples, write_jsonl
 
 
 class SampleValidationTests(unittest.TestCase):
@@ -33,6 +33,11 @@ class SampleValidationTests(unittest.TestCase):
     def test_rejects_empty_solution(self):
         with self.assertRaisesRegex(ValueError, "non-empty"):
             validate_samples(["2"], [{"task_id": "2", "solution": " "}])
+
+    def test_select_ids_sorts_canonical_mbpp_ids_numerically(self):
+        tasks = {"Mbpp/10": {}, "Mbpp/2": {}, "Mbpp/3": {}}
+        self.assertEqual(select_ids(tasks, None, 2), ["Mbpp/2", "Mbpp/3"])
+        self.assertEqual(select_ids(tasks, ["Mbpp/10", "Mbpp/2"], 2), ["Mbpp/10", "Mbpp/2"])
 
     def test_jsonl_round_trip(self):
         with tempfile.TemporaryDirectory() as directory:
