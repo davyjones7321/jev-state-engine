@@ -207,3 +207,8 @@ The user's statement that they have a paid Jev subscription is accepted as autho
 Official references:
 - [TypeSafe: How much does Jev cost?](https://help.typesafe.ai/articles/5187202169-how-much-does-jev-cost)
 - [TypeSafe: How do I add credits?](https://help.typesafe.ai/articles/7771619341-how-do-i-add-credits)
+
+
+## 14. User confirmation of Jev prepaid credits
+
+The user confirmed that they have prepaid credits for the Jev API and authorized using those existing credits for the evaluation. This resolves the earlier uncertainty about whether any paid entitlement exists. The actual balance and auto-recharge setting remain private and are not visible to this repository. Before running scored tasks, ensure the configured key uses the API endpoint above and that auto-recharge will not purchase additional credits unexpectedly. No additional billing or purchases are authorized.
