@@ -82,7 +82,8 @@ evals/
 - `local/.gitignore` prevents generated datasets, private evaluator inputs,
   samples, and result JSON from being committed.
 
-EvalPlus has been pinned in the project requirements, but no benchmark package
-has been installed in a runner and no benchmark tasks have been run. The
-adapter's unit tests have been added to a dedicated GitHub Actions workflow;
-its result is pending. No cloud resources have been provisioned.
+EvalPlus has been pinned and installed by the dedicated GitHub Actions unit-test
+workflow. The initial workflow run passed; later revisions to the adapter and
+tests are queued for CI verification. No benchmark dataset has been prepared,
+no benchmark task has been executed, and no cloud development environment has
+been provisioned.
