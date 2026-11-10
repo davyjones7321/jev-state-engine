@@ -1138,6 +1138,9 @@ class Workspace:
         self._attempt_result_cache: Dict[str, Any] = {}
         self.worker_staged_paths = StagedPathsList()
         self.worker_staged_hashes = self.worker_staged_paths._hashes
+        # Ignored local evaluation outputs may only be force-staged when the
+        # exact path was declared in the active subgoal scope.
+        self.worker_allowed_local_paths: Set[str] = set()
         self.engine_touched_paths: List[str] = []
         self.collision_paths: List[str] = []
 
@@ -1711,6 +1714,21 @@ class Workspace:
         if target_path.is_symlink() or (self.worktree_dir / norm_str).is_symlink():
             raise PermissionError(f"Modifying symlinks is blocked: '{path}'.")
 
+        # Git worktrees omit ignored files from the source checkout. Permit
+        # force-staging only for an exact local-evaluation path explicitly
+        # seeded from the current subgoal's declared scope.
+        ignore_check = self._run_git(["check-ignore", "-q", "--", rel_posix])
+        if ignore_check.returncode not in (0, 1):
+            raise RuntimeError(
+                f"Could not determine ignore status for '{rel_posix}': "
+                f"{ignore_check.stderr or ignore_check.stdout}"
+            )
+        is_ignored = ignore_check.returncode == 0
+        if is_ignored and rel_posix not in self.worker_allowed_local_paths:
+            raise PermissionError(
+                f"Refusing to force-stage ignored path outside the active local-input allowlist: '{rel_posix}'."
+            )
+
         target_path.parent.mkdir(parents=True, exist_ok=True)
         content_bytes = content.encode("utf-8") if isinstance(content, str) else content
         import uuid
@@ -1726,9 +1744,18 @@ class Workspace:
                     temp_file.unlink()
                 except OSError:
                     pass
+        add_args = ["add"]
+        if is_ignored:
+            add_args.append("-f")
+        add_args.extend(["--", rel_posix])
+        add_result = self._run_git(add_args)
+        if add_result.returncode != 0:
+            raise RuntimeError(
+                f"Git could not stage '{rel_posix}': {add_result.stderr or add_result.stdout}"
+            )
+
         sha256_hash = hashlib.sha256(content_bytes).hexdigest()
         self.worker_staged_paths.record(rel_posix, sha256_hash)
-        self._run_git(["add", rel_posix])
 
     def get_staged_diff(self) -> str:
         if self.worker_staged_paths:
@@ -2171,9 +2198,78 @@ class Workspace:
         self.current_worktree_path = worktree_path
         self.current_worktree_branch = branch_name
         self.worker_staged_paths.clear()
+        self.worker_allowed_local_paths.clear()
         self.engine_touched_paths = []
         self.collision_paths = []
         return worktree_path
+
+    def seed_subgoal_worktree_inputs(self, scope_paths: Sequence[Union[str, Path]]) -> List[str]:
+        """Copy only declared local-evaluation inputs into the active worktree.
+
+        Git worktrees intentionally omit ignored/untracked files. For scoped
+        paths under evals/local, seed the exact scoped file (if present) and
+        its sibling TASK.md (if present). No directory-wide copying occurs.
+        """
+        source_root = self.repo_dir.resolve()
+        target_root = self.worktree_dir.resolve()
+        self.worker_allowed_local_paths.clear()
+        seeded: List[str] = []
+
+        for raw_path in scope_paths or []:
+            raw = str(raw_path).replace("\\", "/").strip()
+            if not raw or raw.startswith("/") or re.match(r"^[a-zA-Z]:", raw):
+                continue
+            normalized = posixpath.normpath(raw)
+            if normalized.startswith("./"):
+                normalized = normalized[2:]
+            if normalized == "." or normalized.startswith("../") or normalized == "..":
+                continue
+            if not normalized.startswith("evals/local/"):
+                continue
+            if is_secret_path(normalized) or is_protected_path(normalized):
+                raise PermissionError(f"Refusing to seed protected local input: '{normalized}'.")
+
+            self.worker_allowed_local_paths.add(normalized)
+            rel_candidates = [normalized, posixpath.join(posixpath.dirname(normalized), "TASK.md")]
+            for rel_path in dict.fromkeys(rel_candidates):
+                rel_parts = Path(rel_path).parts
+                source_path = source_root.joinpath(*rel_parts)
+                current = source_root
+                for part in rel_parts:
+                    current = current / part
+                    if self._is_junction_or_symlink(current):
+                        raise PermissionError(f"Refusing symlinked local input path: '{rel_path}'.")
+
+                try:
+                    source_resolved = source_path.resolve(strict=True)
+                    source_resolved.relative_to(source_root)
+                except FileNotFoundError:
+                    continue
+                except ValueError:
+                    raise PermissionError(f"Local input escapes repository root: '{rel_path}'.")
+                if not source_resolved.is_file():
+                    continue
+
+                target_path = target_root.joinpath(*rel_parts)
+                current_target = target_root
+                for part in rel_parts:
+                    current_target = current_target / part
+                    if self._is_junction_or_symlink(current_target):
+                        raise PermissionError(f"Refusing symlinked worktree input destination: '{rel_path}'.")
+                try:
+                    target_path.resolve().relative_to(target_root)
+                except ValueError:
+                    raise PermissionError(f"Worktree input destination escapes worktree: '{rel_path}'.")
+                if target_path.exists():
+                    if not target_path.is_file():
+                        raise PermissionError(f"Local input destination is not a regular file: '{rel_path}'.")
+                    continue
+
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source_resolved, target_path)
+                seeded.append(rel_path)
+
+        return seeded
 
     def merge_subgoal_worktree(
         self,
