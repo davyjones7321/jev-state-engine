@@ -13,6 +13,7 @@ import sys
 EVALPLUS_VERSION = "0.3.1"
 MBPP_PLUS_VERSION = "v0.2.0"
 DEFAULT_ROOT = Path("evals/local/mbpp_plus")
+AGENTS = ("jev", "opencode", "antigravity")
 
 
 def read_jsonl(path: Path) -> list[dict]:
@@ -90,6 +91,33 @@ def prepare(args) -> int:
 
     write_jsonl(prompts_path, prompt_rows)
     write_jsonl(private_path, private_rows)
+
+    # Give each agent an independent workspace containing only public prompts.
+    # Refuse to overwrite existing work so a repeated prepare cannot erase edits.
+    for agent in AGENTS:
+        agent_root = root / "workspaces" / agent
+        if agent_root.exists():
+            raise ValueError(f"Workspace already exists for {agent}: {agent_root}; remove it explicitly before preparing again")
+        for task_id in selected:
+            task = tasks[task_id]
+            task_dir = agent_root / task_id.replace("/", "_")
+            task_dir.mkdir(parents=True, exist_ok=True)
+            task_doc = (
+                f"# MBPP+ task {task_id}\\n\\n"
+                f"**Entry point:** `{task['entry_point']}`\\n\\n"
+                "## Official task prompt\\n\\n"
+                f"{task['prompt']}\\n\\n"
+                "## Instructions\\n\\n"
+                "Implement the requested Python function in `solution.py`. "
+                "Return a complete implementation with the required entry point. "
+                "Do not look for or attempt to infer hidden tests or reference solutions. "
+                "Do not access files outside this task workspace.\\n"
+            )
+            (task_dir / "TASK.md").write_text(task_doc, encoding="utf-8")
+            (task_dir / "solution.py").write_text(
+                f"# Implement the {task['entry_point']} function described in TASK.md.\\n",
+                encoding="utf-8",
+            )
     manifest = {
         "schema_version": "1.0",
         "benchmark": "mbpp_plus",
@@ -107,6 +135,28 @@ def prepare(args) -> int:
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({"status": "prepared", "task_ids": selected, "manifest": str(manifest_path),
                       "agent_visible_prompts": str(prompts_path), "evaluator_private_dataset": str(private_path)}, indent=2))
+    return 0
+
+
+def collect(args) -> int:
+    root = Path(args.local_root).resolve()
+    manifest_path = Path(args.manifest).resolve()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if args.agent not in AGENTS:
+        raise ValueError(f"Unknown agent: {args.agent}")
+    rows = []
+    for task_id in manifest["selected_task_ids"]:
+        solution_path = root / "workspaces" / args.agent / task_id.replace("/", "_") / "solution.py"
+        if not solution_path.is_file():
+            raise ValueError(f"Missing solution file for {args.agent} {task_id}: {solution_path}")
+        rows.append({"task_id": task_id, "solution": solution_path.read_text(encoding="utf-8")})
+    validate_samples(manifest["selected_task_ids"], rows)
+    output_path = Path(args.output).resolve()
+    if output_path.exists():
+        raise ValueError(f"Samples file already exists; choose a new --output path: {output_path}")
+    write_jsonl(output_path, rows)
+    print(json.dumps({"status": "collected", "agent": args.agent, "task_count": len(rows),
+                      "task_ids": manifest["selected_task_ids"], "samples": str(output_path)}, indent=2))
     return 0
 
 
@@ -176,6 +226,12 @@ def build_parser():
     p.add_argument("--task-ids")
     p.add_argument("--output-dir", default=str(DEFAULT_ROOT))
     p.set_defaults(func=prepare)
+    collect_parser = commands.add_parser("collect")
+    collect_parser.add_argument("--agent", choices=AGENTS, required=True)
+    collect_parser.add_argument("--manifest", default=str(DEFAULT_ROOT / "task-manifest.json"))
+    collect_parser.add_argument("--local-root", default=str(DEFAULT_ROOT))
+    collect_parser.add_argument("--output", required=True)
+    collect_parser.set_defaults(func=collect)
     e = commands.add_parser("evaluate")
     e.add_argument("--manifest", default=str(DEFAULT_ROOT / "task-manifest.json"))
     e.add_argument("--samples", required=True)
