@@ -59,7 +59,7 @@ def load_dataset():
 
 
 def select_ids(tasks: dict, explicit: list[str] | None, limit: int) -> list[str]:
-    selected = explicit if explicit else sorted(tasks, key=int)[:limit]
+    selected = explicit if explicit else sorted(tasks, key=lambda value: int(value.split("/")[-1]))[:limit]
     unknown = sorted(set(selected) - set(tasks))
     if unknown:
         raise ValueError(f"Unknown MBPP+ task IDs: {', '.join(unknown)}")
