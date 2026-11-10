@@ -77,6 +77,12 @@ evals/
   contains no selected task IDs or benchmark data.
 - `schemas/run.schema.json` defines the versioned run record. It requires a
   verified credential boundary for any run marked completed.
+- `benchmarks/mbpp_plus/` contains the first coding benchmark adapter, pinned
+  to EvalPlus 0.3.1 and MBPP+ v0.2.0, plus focused unit tests.
+- `local/.gitignore` prevents generated datasets, private evaluator inputs,
+  samples, and result JSON from being committed.
 
-No benchmark packages have been installed, no benchmark tasks have been run,
-and no cloud resources have been provisioned.
+EvalPlus has been pinned in the project requirements, but no benchmark package
+has been installed in a runner and no benchmark tasks have been run. The
+adapter's unit tests have been added to a dedicated GitHub Actions workflow;
+its result is pending. No cloud resources have been provisioned.
