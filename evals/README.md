@@ -47,11 +47,13 @@ ineligible runs.
 
 ```text
 evals/
-  benchmarks/   # Benchmark definitions, task manifests, and adapters
-  agents/       # JEV, OpenCode, and Antigravity integration boundaries
-  runner/       # Execution orchestration and run isolation
-  scoring/      # Official evaluator adapters and normalized metrics
-  results/      # Local/generated run outputs; sensitive data excluded
+  benchmarks/   # Benchmark definitions and pinned evaluator adapters (not populated yet)
+  agents/       # JEV, OpenCode, and Antigravity integration boundaries (not populated yet)
+  runner/       # Execution orchestration and run isolation (not populated yet)
+  scoring/      # Official evaluator adapters and normalized metrics (not populated yet)
+  schemas/      # Versioned run-record schema
+  manifests/    # Candidate task/run manifest; no task IDs selected yet
+  results/      # Sanitized summaries only; raw outputs remain local
   reports/      # Reproducible summaries and comparison reports
   README.md
 ```
