@@ -80,6 +80,10 @@ def prepare(args) -> int:
     private_path = root / "evaluator-private" / "mbpp-plus-subset.jsonl"
     manifest_path = root / "task-manifest.json"
 
+    existing_workspaces = [str(root / "workspaces" / agent) for agent in AGENTS if (root / "workspaces" / agent).exists()]
+    if existing_workspaces:
+        raise ValueError(f"Agent workspaces already exist; remove them explicitly before preparing again: {', '.join(existing_workspaces)}")
+
     prompt_rows, private_rows = [], []
     for task_id in selected:
         task = tasks[task_id]
@@ -96,8 +100,6 @@ def prepare(args) -> int:
     # Refuse to overwrite existing work so a repeated prepare cannot erase edits.
     for agent in AGENTS:
         agent_root = root / "workspaces" / agent
-        if agent_root.exists():
-            raise ValueError(f"Workspace already exists for {agent}: {agent_root}; remove it explicitly before preparing again")
         for task_id in selected:
             task = tasks[task_id]
             task_dir = agent_root / task_id.replace("/", "_")
