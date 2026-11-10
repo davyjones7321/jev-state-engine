@@ -1,0 +1,42 @@
+{
+  "manifest_version": "1.0",
+  "status": "candidate_scope_only",
+  "branch": "agent-evaluation-poc",
+  "target_distinct_tasks": 32,
+  "maximum_runs_if_all_agents_eligible": 96,
+  "agents": [
+    "jev",
+    "opencode",
+    "antigravity"
+  ],
+  "candidates": [
+    {
+      "benchmark": "mbpp_plus",
+      "category": "coding",
+      "planned_max_tasks": 12,
+      "status": "candidate",
+      "notes": "Python function generation; not repository-level issue resolution. Pin EvalPlus release and use its official evaluator."
+    },
+    {
+      "benchmark": "gaia",
+      "category": "reasoning_research",
+      "planned_max_tasks": 10,
+      "status": "conditional",
+      "notes": "Only authorized public development/validation tasks. Accept dataset terms; never commit dataset contents or answers."
+    },
+    {
+      "benchmark": "assistantbench",
+      "category": "browser",
+      "planned_max_tasks": 10,
+      "status": "conditional",
+      "notes": "Pin Inspect Evals release and AssistantBench v6-B browser implementation; document its Playwright MCP browser differences."
+    }
+  ],
+  "deferred": [
+    "swe_bench_verified",
+    "webarena"
+  ],
+  "task_ids_selected": [],
+  "selection_policy": "Select exact task IDs before any scored agent run. Record source revision, split, license/access basis, evaluator version, and eligibility for each agent. Do not commit gated task content.",
+  "execution_gate": "No scored run until benchmark access, evaluator, zero-additional-cost/authorized subscription coverage, and credential isolation are verified."
+}
