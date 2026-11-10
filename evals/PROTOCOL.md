@@ -26,7 +26,7 @@ A task or execution environment is excluded unless all of the following are true
 5. The task can run in an isolated workspace with a bounded timeout and resource limits.
 6. The official evaluator (or a documented benchmark-author-approved evaluator) is available and its version can be recorded.
 
-A free trial is not treated as a zero-cost guarantee if it can silently convert to paid usage. Do not add a payment method or enable billing for this PoC. Stop rather than silently substituting a paid service.
+A free trial is not treated as a zero-cost guarantee if it can silently convert to paid usage. The user has authorized use of an existing paid Jev subscription for JEV semantic-gate calls only, subject to confirming the API entitlement and any usage/overage terms. Do not add a new payment method, enable additional billing, or incur costs outside that authorization.
 
 ## 3. Benchmark selection: conditional shortlist
 
@@ -148,7 +148,7 @@ Current recommendation:
 The revised 12/10/10 candidate allocation is not approved or executable until the user confirms benchmark scope, account quotas, and a safe credential-isolation design.
 
 
-## 10. User-approved proof-of-concept scope update
+## 11. User-approved proof-of-concept scope update
 
 The user approved prioritizing a practical proof of concept over repository-level coding coverage. SWE-bench Verified and WebArena are deferred from this pilot. The revised candidate set is:
 
