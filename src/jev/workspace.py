@@ -2216,7 +2216,7 @@ class Workspace:
         seeded: List[str] = []
 
         for raw_path in scope_paths or []:
-            raw = str(raw_path).replace("\\\\", "/").strip()
+            raw = str(raw_path).replace("\\", "/").strip()
             if not raw or raw.startswith("/") or re.match(r"^[a-zA-Z]:", raw):
                 continue
             normalized = posixpath.normpath(raw)
