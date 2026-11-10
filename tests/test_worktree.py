@@ -517,6 +517,8 @@ def test_seed_subgoal_worktree_inputs_copies_only_scoped_file_and_task_doc(git_r
     task_dir = local_dir / "mbpp_plus" / "workspaces" / "jev" / "Mbpp_2"
     task_dir.mkdir(parents=True)
     (local_dir / ".gitignore").write_text("*\\n!.gitignore\\n", encoding="utf-8")
+    subprocess.run(["git", "add", "evals/local/.gitignore"], cwd=git_repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "Add local fixture ignore rule"], cwd=git_repo, check=True, capture_output=True)
     (task_dir / "TASK.md").write_text("Implement similar_elements.\\n", encoding="utf-8")
     (task_dir / "solution.py").write_text("def similar_elements(a, b):\\n    pass\\n", encoding="utf-8")
     (task_dir / "private-note.txt").write_text("must not be copied\\n", encoding="utf-8")
