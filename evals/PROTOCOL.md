@@ -11,7 +11,7 @@ Compare three complete agentic systems:
 - OpenCode (including its configured agent workflow and tools)
 - Antigravity (including its configured agent workflow and tools)
 
-The target is a proof of concept with **30 new, distinct benchmark task instances total**: 10 MBPP+ coding tasks, 10 authorized GAIA reasoning/research tasks, and 10 AssistantBench browser tasks. This is 30 tasks total, not 30 per agent. If all three systems are eligible for every task, the evaluation produces up to 90 agent-task runs. Report both task count and run count. The earlier MBPP+ smoke tasks Mbpp/2, Mbpp/3, and Mbpp/4 are excluded from scored results.
+The first scored run is **MBPP+ only (10 new, distinct benchmark task instances total)**: 10 MBPP+ coding tasks. GAIA reasoning/research and AssistantBench browser tasks are marked `not_built` and deferred for subsequent phases; no tasks or adapters are invented for them. This is 10 tasks total, not 10 per agent. With all three systems eligible for every task, the evaluation produces up to 30 agent-task runs (10 tasks across 3 agents). Report both task count and run count. The earlier MBPP+ smoke tasks Mbpp/2, Mbpp/3, and Mbpp/4 are excluded from scored results.
 
 This is a feasibility and comparative pilot, not a statistically conclusive ranking or a claim of general agent capability.
 
@@ -32,13 +32,13 @@ A free trial is not treated as a zero-cost guarantee if it can silently convert 
 
 The 10/10/10 allocation is approved as the proof-of-concept target. Benchmark execution and individual task selection remain conditional on the access, licensing, evaluator, resource, and safety gates below:
 
-| Category | Candidate | Proposed pilot size | Gate / concern |
-|---|---|---:|---|
-| Coding | MBPP+ / EvalPlus | 10 | Python function generation; not repository-level issue resolution. Pin EvalPlus and use its official evaluator. |
-| Reasoning / research / tool use | GAIA public development/validation material | 10 | Dataset access is gated; accept terms and use only authorized public material with available answer keys. |
-| Browser / web interaction | AssistantBench public validation tasks | 10 | Pin the Inspect Evals release and browser implementation; document Playwright MCP browser differences. |
+| Category | Candidate | Proposed pilot size | Gate / concern | Status |
+|---|---|---:|---|---|
+| Coding | MBPP+ / EvalPlus | 10 | Python function generation; not repository-level issue resolution. Pin EvalPlus and use its official evaluator. | Ready (frozen 10 tasks) |
+| Reasoning / research / tool use | GAIA public development/validation material | 10 | Dataset access is gated; accept terms and use only authorized public material with available answer keys. | `not_built` (deferred) |
+| Browser / web interaction | AssistantBench public validation tasks | 10 | Pin the Inspect Evals release and browser implementation; document Playwright MCP browser differences. | `not_built` (deferred) |
 
-The 10/10/10 allocation is the approved target scope, subject to access, licensing, reproducibility, evaluator, and zero-additional-cost gates. If any category fails its gates, stop and report the shortfall rather than substituting invented or home-grown tasks and labeling them benchmark tasks.
+The first scored run is MBPP+ only (10 tasks, up to 30 runs across 3 agents). GAIA and AssistantBench are marked `not_built` in the manifest; no tasks or adapters are invented for them. If any category fails its gates, stop and report the shortfall rather than substituting invented or home-grown tasks and labeling them benchmark tasks.
 
 For every selected task, record the canonical benchmark name, dataset/split, immutable task identifier, source revision or dataset version, license/terms reference, and evaluator version. Keep gated/private task data out of Git.
 
@@ -128,7 +128,7 @@ Do not commit benchmark datasets, generated patches, full transcripts, credentia
 4. Confirm benchmark terms and evaluator access.
 5. Create a versioned task manifest and run-record schema.
 6. Implement one minimal end-to-end task adapter and validate the evaluator using an official known-good/reference example where allowed.
-7. Freeze the exact 30-task manifest (10 tasks per approved category) before scored runs.
+7. Freeze the 10 MBPP+ task manifest before scored runs (GAIA and AssistantBench deferred as `not_built`).
 
 **No benchmark environment installation, model execution, paid resource provisioning, or scored run is authorized by this protocol alone.**
 
@@ -148,19 +148,19 @@ Current recommendation:
 The approved 10/10/10 target allocation remains conditional on benchmark access, account quotas, evaluator availability, zero-additional-cost coverage, and credential isolation.
 
 
-## 11. Final proof-of-concept task allocation (2026-11-10)
+## 11. Scored run task allocation (2026-11-10)
 
-The approved proof-of-concept target is exactly 30 new, distinct benchmark tasks:
+The first scored run is **MBPP+ only (10 new, distinct benchmark tasks)**:
 
-- Coding: 10 MBPP+ / EvalPlus tasks (Python function generation; not repository issue resolution).
-- Reasoning/research: 10 authorized GAIA validation/development tasks.
-- Browser/research: 10 AssistantBench public validation tasks, using a pinned evaluator/browser implementation.
+- Coding: 10 MBPP+ / EvalPlus tasks (Python function generation; not repository issue resolution). Task IDs are frozen in `evals/manifests/pilot.json` using fixed seed 42 over canonical sorted IDs, excluding Mbpp/2, Mbpp/3, and Mbpp/4.
+- Reasoning/research: GAIA is marked `not_built`. No tasks or adapters are invented.
+- Browser/research: AssistantBench is marked `not_built`. No tasks or adapters are invented.
 
-The target is 30 tasks total, not 30 tasks per agent. With three eligible agents per task, the maximum is 90 agent-task runs. Actual run count depends on each agent's documented eligibility.
+The target is 10 tasks total for the first scored run. With three eligible agents per task, the maximum is 30 agent-task runs. Actual run count depends on each agent's documented eligibility.
 
-The earlier MBPP+ development smoke tasks Mbpp/2, Mbpp/3, and Mbpp/4 are explicitly excluded from this proof of concept's scored dataset, comparative results, and final evaluation findings. They may be described only as adapter/workflow development checks. Do not combine their results with the 30-task evaluation.
+The earlier MBPP+ development smoke tasks Mbpp/2, Mbpp/3, and Mbpp/4 are explicitly excluded from this proof of concept's scored dataset, comparative results, and final evaluation findings. They are exercised exclusively via offline dry-run checks and adapter development smoke tests. Do not combine their results with the 10-task evaluation.
 
-Freeze and record the exact 30 task IDs, dataset versions, source revisions, splits, precise license/terms references, evaluator versions, and per-agent eligibility before any scored run. If a category fails its gates, stop and report the shortfall; do not silently substitute tasks.
+Freeze and record the exact 10 MBPP+ task IDs, dataset version (v0.2.0), EvalPlus version (0.3.1), evaluator version (jev-mbpp-evaluator:0.3.1), selection seed (42), and per-agent eligibility before any scored run.
 
 The user also stated that an existing paid Jev subscription is intended to cover JEV semantic-gate calls and authorized its use for evaluation. Before making any call, confirm that the subscription includes the required API entitlement and check whether there are separate usage charges or overages. No additional billing or unapproved spend is authorized.
 

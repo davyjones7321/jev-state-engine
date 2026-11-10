@@ -396,7 +396,36 @@ def build_parser():
     e.add_argument("--output", default=str(DEFAULT_ROOT / "results" / "evalplus-results.json"))
     e.add_argument("--parallel", type=int, default=1)
     e.set_defaults(func=evaluate)
+    dry_parser = commands.add_parser("dry-run")
+    dry_parser.add_argument("--output-dir", default=str(DEFAULT_ROOT / "dry_run"))
+    dry_parser.set_defaults(func=lambda a: run_dry_run(a))
+    check_parser = commands.add_parser("check-boundary")
+    check_parser.set_defaults(func=lambda a: run_check_boundary(a))
     return parser
+
+
+def run_dry_run(args) -> int:
+    evals_root = Path(__file__).resolve().parents[2]
+    if str(evals_root.parent) not in sys.path:
+        sys.path.insert(0, str(evals_root.parent))
+    from evals.runner import execute_dry_run
+    out_dir = Path(args.output_dir) if args.output_dir else None
+    result = execute_dry_run(output_dir=out_dir)
+    print(json.dumps(result, indent=2))
+    return 0 if result.get("status") == "success" else 1
+
+
+def run_check_boundary(args) -> int:
+    evals_root = Path(__file__).resolve().parents[2]
+    if str(evals_root.parent) not in sys.path:
+        sys.path.insert(0, str(evals_root.parent))
+    from evals.runner import check_credential_boundary
+    ok, leaked = check_credential_boundary()
+    if not ok:
+        print(f"FAILED: Visible credential variables: {leaked}", file=sys.stderr)
+        return 1
+    print("PASSED: Credential boundary verified. No API key variables visible.")
+    return 0
 
 
 def main():

@@ -6,7 +6,7 @@ tests.
 
 ## Goal
 
-Run a proof of concept with **30 new, distinct benchmark task instances total**: 10 MBPP+ coding, 10 GAIA reasoning/research, and 10 AssistantBench browser tasks. This is a feasibility demonstration, not a statistically conclusive ranking. With all three agents eligible for every task, the maximum is 90 agent-task runs. The earlier MBPP+ development smoke tasks Mbpp/2, Mbpp/3, and Mbpp/4 are excluded from scored results.
+Run a proof of concept with **10 new, distinct benchmark task instances total**: 10 MBPP+ coding tasks. GAIA reasoning/research and AssistantBench browser tasks are marked `not_built` and deferred from the first scored run. This is a feasibility demonstration, not a statistically conclusive ranking. With all three agents eligible for every task, the maximum is 30 agent-task runs (10 tasks across 3 agents). The earlier MBPP+ development smoke tasks Mbpp/2, Mbpp/3, and Mbpp/4 are excluded from scored results.
 
 ## Approved scope direction
 
@@ -15,14 +15,10 @@ a practical proof of concept:
 
 - **Coding:** MBPP+ / EvalPlus, 10 Python function-generation tasks.
   This is not repository-level issue resolution.
-- **Reasoning/research:** GAIA, 10 authorized public development or
-  validation tasks, subject to accepting the dataset terms.
-- **Browser/research:** AssistantBench, 10 public validation tasks, using
-  a pinned Inspect Evals release and browser implementation.
+- **Reasoning/research:** GAIA, status `not_built`. No tasks or adapters invented.
+- **Browser/research:** AssistantBench, status `not_built`. No tasks or adapters invented.
 
-SWE-bench Verified and WebArena are deferred. These allocations are candidates,
-not a guarantee that every agent is eligible for every category. Exact task IDs
-must be selected before scored runs.
+The first scored run is MBPP+ only (10 tasks, 30 runs maximum). SWE-bench Verified and WebArena are deferred. Exact MBPP+ task IDs are frozen in `evals/manifests/pilot.json` using a fixed seed (42) over canonical sorted IDs, excluding smoke tasks Mbpp/2, Mbpp/3, and Mbpp/4.
 
 ## Model and cost policy
 
@@ -79,4 +75,4 @@ evals/
 - `local/.gitignore` prevents generated datasets, private evaluator inputs,
   samples, and result JSON from being committed.
 
-EvalPlus has been pinned and installed by the dedicated GitHub Actions unit-test workflow. The initial workflow run passed; later revisions to the adapter and tests are queued for CI verification. Three MBPP+ development smoke tasks (Mbpp/2, Mbpp/3, and Mbpp/4) have been exercised and are excluded from scored results. No scored run of the new 30-task proof of concept has been executed, and no cloud development environment has been provisioned.
+EvalPlus has been pinned and installed by the dedicated GitHub Actions unit-test workflow. The initial workflow run passed; later revisions to the adapter and tests are queued for CI verification. Three MBPP+ development smoke tasks (Mbpp/2, Mbpp/3, and Mbpp/4) have been exercised and are excluded from scored results. A dry-run mode executes these 3 non-scored smoke tasks end-to-end with zero network calls and no Jev API calls. No scored run of the new 10-task proof of concept has been executed, and no cloud development environment has been provisioned.

@@ -1,43 +1,62 @@
 {
   "manifest_version": "1.0",
-  "status": "candidate_scope_only",
-  "branch": "agent-evaluation-poc",
-  "target_distinct_tasks": 30,
-  "maximum_runs_if_all_agents_eligible": 90,
+  "status": "ready_for_scored_mbpp_plus",
+  "branch": "evals-ready",
+  "target_distinct_tasks": 10,
+  "maximum_runs_if_all_agents_eligible": 30,
   "agents": [
     "jev",
     "opencode",
     "antigravity"
   ],
+  "dataset_version": "v0.2.0",
+  "evalplus_version": "0.3.1",
+  "evaluator_version": "jev-mbpp-evaluator:0.3.1",
+  "selection_seed": 42,
   "candidates": [
     {
       "benchmark": "mbpp_plus",
       "category": "coding",
       "planned_max_tasks": 10,
-      "status": "candidate",
-      "notes": "Python function generation; not repository-level issue resolution. Pin EvalPlus release and use its official evaluator."
+      "status": "ready",
+      "dataset_version": "v0.2.0",
+      "evalplus_version": "0.3.1",
+      "evaluator_version": "jev-mbpp-evaluator:0.3.1",
+      "selection_seed": 42,
+      "notes": "Python function generation; not repository-level issue resolution. Pinned to EvalPlus 0.3.1, dataset v0.2.0, evaluator jev-mbpp-evaluator:0.3.1."
     },
     {
       "benchmark": "gaia",
       "category": "reasoning_research",
       "planned_max_tasks": 10,
-      "status": "conditional",
-      "notes": "Only authorized public development/validation tasks. Accept dataset terms; never commit dataset contents or answers."
+      "status": "not_built",
+      "notes": "Not built for pilot scored run. Only authorized public development/validation tasks when implemented. Accept dataset terms; never commit dataset contents or answers."
     },
     {
       "benchmark": "assistantbench",
       "category": "browser",
       "planned_max_tasks": 10,
-      "status": "conditional",
-      "notes": "Pin Inspect Evals release and AssistantBench v6-B browser implementation; document its Playwright MCP browser differences."
+      "status": "not_built",
+      "notes": "Not built for pilot scored run. Pin Inspect Evals release and AssistantBench v6-B browser implementation when implemented; document Playwright MCP browser differences."
     }
   ],
   "deferred": [
     "swe_bench_verified",
     "webarena"
   ],
-  "task_ids_selected": [],
-  "selection_policy": "Select exactly 30 new, distinct task IDs before any scored agent run: 10 MBPP+ coding, 10 authorized GAIA reasoning/research, and 10 AssistantBench browser tasks. Record dataset version, source revision, split, precise license/terms reference, evaluator version, and eligibility for each agent. Do not commit gated or private dataset contents, answers, hidden evaluation data, credentials, or private task artifacts. Keep authorized dataset files outside the repository. Exclude MBPP/2, MBPP/3, and MBPP/4 from scored results; they are development smoke tests only.",
+  "task_ids_selected": [
+    "Mbpp/56",
+    "Mbpp/102",
+    "Mbpp/108",
+    "Mbpp/129",
+    "Mbpp/252",
+    "Mbpp/266",
+    "Mbpp/282",
+    "Mbpp/616",
+    "Mbpp/752",
+    "Mbpp/775"
+  ],
+  "selection_policy": "Select exactly 10 new, distinct MBPP+ task IDs for the first scored run using fixed seed 42 over canonical sorted IDs, excluding development smoke tasks Mbpp/2, Mbpp/3, and Mbpp/4. GAIA and AssistantBench are set to not_built. Record dataset version (v0.2.0), EvalPlus version (0.3.1), evaluator version (jev-mbpp-evaluator:0.3.1), and selection seed (42).",
   "execution_gate": "No scored run until benchmark access, evaluator, zero-additional-cost/authorized subscription coverage, and credential isolation are verified.",
   "excluded_prior_smoke_tasks": {
     "benchmark": "mbpp_plus",
@@ -46,6 +65,6 @@
       "Mbpp/3",
       "Mbpp/4"
     ],
-    "reason": "Adapter/workflow development smoke tests; excluded from the 30-task PoC and all scored findings."
+    "reason": "Adapter/workflow development smoke tests; excluded from the 10-task scored pilot and all scored findings."
   }
 }
