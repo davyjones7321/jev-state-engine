@@ -324,5 +324,33 @@
         }
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "completed"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "execution": {
+            "properties": {
+              "credential_boundary_verified": {
+                "const": true
+              }
+            },
+            "required": [
+              "credential_boundary_verified"
+            ]
+          }
+        }
+      }
+    }
+  ]
 }
