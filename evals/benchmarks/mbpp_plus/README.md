@@ -34,7 +34,7 @@ By default, this deterministically selects the first three task IDs in numeric
 order. You may provide explicit official IDs:
 
 ~~~powershell
-python evals/benchmarks/mbpp_plus/adapter.py prepare --task-ids 2,3,4
+python evals/benchmarks/mbpp_plus/adapter.py prepare --task-ids Mbpp/2,Mbpp/3,Mbpp/4
 ~~~
 
 The adapter writes to evals/local/mbpp_plus/:
@@ -57,7 +57,7 @@ Create a JSONL file with exactly one row per selected task:
 {"task_id":"4","solution":"def ...:\n    ..."}
 ~~~
 
-Use the exact IDs emitted by prepare. Each solution must contain the complete
+Use the exact canonical IDs emitted by prepare (for example, `Mbpp/2`). Each solution must contain the complete
 Python implementation expected by the task entry point.
 
 ## Score with official EvalPlus
