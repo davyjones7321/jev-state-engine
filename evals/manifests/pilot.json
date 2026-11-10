@@ -2,8 +2,8 @@
   "manifest_version": "1.0",
   "status": "candidate_scope_only",
   "branch": "agent-evaluation-poc",
-  "target_distinct_tasks": 32,
-  "maximum_runs_if_all_agents_eligible": 96,
+  "target_distinct_tasks": 30,
+  "maximum_runs_if_all_agents_eligible": 90,
   "agents": [
     "jev",
     "opencode",
@@ -13,7 +13,7 @@
     {
       "benchmark": "mbpp_plus",
       "category": "coding",
-      "planned_max_tasks": 12,
+      "planned_max_tasks": 10,
       "status": "candidate",
       "notes": "Python function generation; not repository-level issue resolution. Pin EvalPlus release and use its official evaluator."
     },
@@ -37,6 +37,15 @@
     "webarena"
   ],
   "task_ids_selected": [],
-  "selection_policy": "Select exact task IDs before any scored agent run. Record source revision, split, license/access basis, evaluator version, and eligibility for each agent. Do not commit gated task content.",
-  "execution_gate": "No scored run until benchmark access, evaluator, zero-additional-cost/authorized subscription coverage, and credential isolation are verified."
+  "selection_policy": "Select exactly 30 new, distinct task IDs before any scored agent run: 10 MBPP+ coding, 10 authorized GAIA reasoning/research, and 10 AssistantBench browser tasks. Record dataset version, source revision, split, precise license/terms reference, evaluator version, and eligibility for each agent. Do not commit gated or private dataset contents, answers, hidden evaluation data, credentials, or private task artifacts. Keep authorized dataset files outside the repository. Exclude MBPP/2, MBPP/3, and MBPP/4 from scored results; they are development smoke tests only.",
+  "execution_gate": "No scored run until benchmark access, evaluator, zero-additional-cost/authorized subscription coverage, and credential isolation are verified.",
+  "excluded_prior_smoke_tasks": {
+    "benchmark": "mbpp_plus",
+    "task_ids": [
+      "Mbpp/2",
+      "Mbpp/3",
+      "Mbpp/4"
+    ],
+    "reason": "Adapter/workflow development smoke tests; excluded from the 30-task PoC and all scored findings."
+  }
 }

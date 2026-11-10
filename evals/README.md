@@ -6,21 +6,18 @@ tests.
 
 ## Goal
 
-Run a small proof-of-concept with approximately 30–40 distinct benchmark task
-instances total. This is a feasibility demonstration, not a statistically
-conclusive ranking. If all three agents are eligible for all 32 candidate
-tasks, the pilot could produce up to 96 agent-task runs.
+Run a proof of concept with **30 new, distinct benchmark task instances total**: 10 MBPP+ coding, 10 GAIA reasoning/research, and 10 AssistantBench browser tasks. This is a feasibility demonstration, not a statistically conclusive ranking. With all three agents eligible for every task, the maximum is 90 agent-task runs. The earlier MBPP+ development smoke tasks Mbpp/2, Mbpp/3, and Mbpp/4 are excluded from scored results.
 
 ## Approved scope direction
 
 The user approved deferring repository-level coding benchmarks and prioritizing
 a practical proof of concept:
 
-- **Coding:** MBPP+ / EvalPlus, up to 12 Python function-generation tasks.
+- **Coding:** MBPP+ / EvalPlus, 10 Python function-generation tasks.
   This is not repository-level issue resolution.
-- **Reasoning/research:** GAIA, up to 10 authorized public development or
+- **Reasoning/research:** GAIA, 10 authorized public development or
   validation tasks, subject to accepting the dataset terms.
-- **Browser/research:** AssistantBench, up to 10 public validation tasks, using
+- **Browser/research:** AssistantBench, 10 public validation tasks, using
   a pinned Inspect Evals release and browser implementation.
 
 SWE-bench Verified and WebArena are deferred. These allocations are candidates,
@@ -82,8 +79,4 @@ evals/
 - `local/.gitignore` prevents generated datasets, private evaluator inputs,
   samples, and result JSON from being committed.
 
-EvalPlus has been pinned and installed by the dedicated GitHub Actions unit-test
-workflow. The initial workflow run passed; later revisions to the adapter and
-tests are queued for CI verification. No benchmark dataset has been prepared,
-no benchmark task has been executed, and no cloud development environment has
-been provisioned.
+EvalPlus has been pinned and installed by the dedicated GitHub Actions unit-test workflow. The initial workflow run passed; later revisions to the adapter and tests are queued for CI verification. Three MBPP+ development smoke tasks (Mbpp/2, Mbpp/3, and Mbpp/4) have been exercised and are excluded from scored results. No scored run of the new 30-task proof of concept has been executed, and no cloud development environment has been provisioned.
