@@ -2574,10 +2574,24 @@ def node_implement(
             elif hasattr(workspace, "base_commit"):
                 state["subgoal_base_commit"] = workspace.base_commit
             wt_path = workspace.create_subgoal_worktree(subgoal_id, base_ref=base_ref)
-            if hasattr(workspace, "seed_subgoal_worktree_inputs"):
-                workspace.seed_subgoal_worktree_inputs(subgoal.scope or [])
+            branch_name = f"jev-subgoal-{subgoal_id}"
+            try:
+                if hasattr(workspace, "seed_subgoal_worktree_inputs"):
+                    workspace.seed_subgoal_worktree_inputs(subgoal.scope or [])
+            except Exception as seed_error:
+                # Seeding happens before the worktree is published in state.
+                # Explicitly discard it here so a failed seed cannot leak a
+                # detached worktree or jev-subgoal branch.
+                try:
+                    workspace.discard_subgoal_worktree(wt_path, branch_name)
+                except Exception as cleanup_error:
+                    if hasattr(seed_error, "add_note"):
+                        seed_error.add_note(
+                            f"Worktree cleanup also failed: {cleanup_error}"
+                        )
+                raise
             state["current_worktree_path"] = str(wt_path)
-            state["current_worktree_branch"] = f"jev-subgoal-{subgoal_id}"
+            state["current_worktree_branch"] = branch_name
         elif hasattr(workspace, "worktree_dir") and state.get("current_worktree_path"):
             workspace.worktree_dir = Path(state["current_worktree_path"])
 
