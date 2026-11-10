@@ -22,9 +22,9 @@ These are candidates only. The user must approve any change from repository-leve
 
 This repository is public. GitHub's current documentation says standard GitHub-hosted runners are free and unlimited for public repositories. The standard Linux public runner has 4 CPUs, 16 GB RAM, and 14 GB SSD. That is suitable for lightweight Python evaluation, browser automation with Playwright, and small test suites, but not a substitute for SWE-bench's recommended 120 GB free disk.
 
-Source: [GitHub-hosted runners reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)
+Source: [GitHub-hosted runner selection and public-repository specifications](https://docs.github.com/en/actions/how-tos/write-workflows/choose-where-workflows-run/choose-the-runner-for-a-job)
 
-GitHub Actions is non-interactive CI rather than the user's requested SSH-accessible development environment. It is a useful runner for repeatable, bounded tasks, not the only environment.
+GitHub Actions is non-interactive CI rather than the user's requested SSH-accessible development environment. It is a useful runner for repeatable, bounded tasks, not the only environment. Its 14 GB SSD is a hard practical constraint for browser images and coding environments. Because this repository is public, workflows must also be designed so untrusted task code cannot access repository or provider secrets.
 
 ### GitHub Codespaces
 
@@ -35,7 +35,7 @@ The quota is measured in core-hours: a 2-core codespace uses 2 core-hours per ac
 Codespaces free quota is for personal accounts, not organization/enterprise accounts. Current account plan, remaining monthly quota, existing codespace storage, payment-method status, and spending safeguards are not visible to this review. If a payment method is attached, the user must ensure overage spending is stopped; otherwise exceeding included quota can incur charges. Do not create a codespace until the remaining quota and spending protection are checked.
 
 Sources:
-- [Codespaces machine types](https://docs.github.com/en/codespaces/about-codespaces/what-are-codespaces)
+- [Codespaces machine types](https://docs.github.com/en/enterprise-cloud@latest/codespaces/about-codespaces/what-are-codespaces)
 - [Codespaces billing and included quotas](https://docs.github.com/en/billing/concepts/product-billing/github-codespaces)
 - [Included usage by plan](https://docs.github.com/en/billing/reference/product-usage-included)
 
@@ -82,9 +82,9 @@ Sources:
 
 ### Better-fit candidate: AssistantBench
 
-[AssistantBench](https://assistantbench.github.io/) has 214 realistic web tasks and publishes a development/validation set with answers, URLs, and explanations; its test answers remain hidden. The [BrowserGym AssistantBench integration](https://pypi.org/project/browsergym-assistantbench/) says the benchmark uses open-ended tasks and requires only installing the package, rather than self-hosting the WebArena website stack. BrowserGym then uses Playwright/Chromium.
+[AssistantBench](https://assistantbench.github.io/) has 214 realistic web tasks and publishes a development/validation set with answers, URLs, and explanations; its test answers remain hidden. The The Inspect Evals AssistantBench implementation provides a browser-plus-search variant. Its 6-B release replaced the earlier browser with sandboxed Playwright MCP and pinned a Docker/Kubernetes image; this avoids hosting the full WebArena multi-site stack, but it is not infrastructure-free and its browser tools/observations differ from earlier versions.
 
-A public [Inspect Evals implementation](https://ukgovernmentbeis.github.io/inspect_evals/evals/assistant_bench/index.html) reports that the publicly accessible validation set has 33 samples. That is enough to select 10 tasks, but it is a small sample and depends on live websites remaining accessible and materially unchanged.
+A public [Inspect Evals implementation](https://ukgovernmentbeis.github.io/inspect_evals/evals/assistant_bench/index.html) reports that the publicly accessible validation set has 33 samples. That is enough to select 10 tasks, but it is a small sample and depends on live websites remaining accessible and materially unchanged. Its prompts and browser implementation differ from the paper's original setup; the evaluator release must be pinned, and these results must not be presented as directly comparable with the paper or leaderboard.
 
 **Status:** Conditional candidate for up to 10 validation tasks. Record the retrieval date, URLs, browser version, and task/evaluator versions. Mark tasks invalid or unavailable if the target page has materially changed; do not replace them silently.
 
@@ -115,6 +115,9 @@ The checked-in JEV README requires `JEV_API_URL` and `JEV_API_KEY` for the produ
 Sources:
 - [JEV README](https://github.com/davyjones7321/jev-state-engine/blob/master/README.md)
 - [JEV gatekeeper implementation](https://github.com/davyjones7321/jev-state-engine/blob/master/src/jev/gatekeeper.py)
+- [JEV main process environment setup](https://github.com/davyjones7321/jev-state-engine/blob/master/src/main.py)
+- [JEV workspace command invocation](https://github.com/davyjones7321/jev-state-engine/blob/master/src/jev/workspace.py)
+- [JEV process runner](https://github.com/davyjones7321/jev-state-engine/blob/master/src/jev/process_runner.py)
 - [TypeSafe: How much does Jev cost?](https://help.typesafe.ai/articles/5187202169-how-much-does-jev-cost)
 
 **Status:** Full production JEV is blocked under a strict zero-additional-cost policy unless the user already has prepaid credit that they explicitly authorize using. Do not make a paid request to test whether the key works.
@@ -126,6 +129,7 @@ A Tier-0-only or alternate-judge JEV variant could be studied as a separate abla
 The JEV README warns that target build/test commands execute directly on the host and that Git worktrees are not an OS sandbox. Source inspection confirms:
 
 - `src/main.py` places `GOOGLE_API_KEY` in the process environment when initializing the Gemini worker.
+- `src/jev/workspace.py` invokes target commands through `run_command(...)` without supplying a restricted environment.
 - `src/jev/process_runner.py` passes `env=None` to `subprocess.Popen` by default, which means child commands inherit the parent environment.
 
 Therefore, running untrusted benchmark repository code or generated code as JEV target commands while provider credentials are present can expose those credentials to the executed code. Process-group cleanup and worktree isolation do not prevent credential access.
@@ -165,3 +169,17 @@ Do not install benchmark packages, create a Codespace, start an Action workflow,
 2. The user confirms the TypeSafe credit situation or approves a clearly labelled JEV ablation.
 3. The user verifies actual free-tier quota and overage protection.
 4. The execution design protects provider credentials from benchmark/task code.
+
+
+## 11. Model-name clarification
+
+The repository's configured worker model is exactly `gemini-3.5-flash-lite`. Google's current model documentation identifies this as a stable model ID, and the current pricing table lists free-tier input and output tokens. Search grounding is not available for this model on the free tier; do not assume that free model inference includes free search grounding.
+
+The current Antigravity model selector identifies **Gemini 3.8 Flash**, not Gemini 3.8 Flash-Lite. It lists Gemini 3.8 Flash as available on Free and Google AI Plus plans, with five-hour and weekly usage limits. For records, use the exact product label `Gemini 3.8 Flash`; do not append `-Lite`.
+
+Sources:
+- [Gemini 3.5 Flash-Lite model ID and capabilities](https://ai.google.dev/gemini-api/docs/models/gemini-3.5-flash-lite)
+- [Gemini API pricing and free-tier conditions](https://ai.google.dev/gemini-api/docs/pricing)
+- [Antigravity model selector](https://antigravity.google/docs/models)
+
+The published free-tier terms are not proof that this user's project has remaining quota. Account-specific access, quotas, and billing safeguards remain unverified.
