@@ -103,19 +103,19 @@ def prepare(args) -> int:
             task_dir = agent_root / task_id.replace("/", "_")
             task_dir.mkdir(parents=True, exist_ok=True)
             task_doc = (
-                f"# MBPP+ task {task_id}\\n\\n"
-                f"**Entry point:** `{task['entry_point']}`\\n\\n"
-                "## Official task prompt\\n\\n"
-                f"{task['prompt']}\\n\\n"
-                "## Instructions\\n\\n"
+                f"# MBPP+ task {task_id}\n\n"
+                f"**Entry point:** `{task['entry_point']}`\n\n"
+                "## Official task prompt\n\n"
+                f"{task['prompt']}\n\n"
+                "## Instructions\n\n"
                 "Implement the requested Python function in `solution.py`. "
                 "Return a complete implementation with the required entry point. "
                 "Do not look for or attempt to infer hidden tests or reference solutions. "
-                "Do not access files outside this task workspace.\\n"
+                "Do not access files outside this task workspace.\n"
             )
             (task_dir / "TASK.md").write_text(task_doc, encoding="utf-8")
             (task_dir / "solution.py").write_text(
-                f"# Implement the {task['entry_point']} function described in TASK.md.\\n",
+                f"# Implement the {task['entry_point']} function described in TASK.md.\n",
                 encoding="utf-8",
             )
     manifest = {
