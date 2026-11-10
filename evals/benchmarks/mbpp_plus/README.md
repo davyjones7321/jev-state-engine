@@ -52,9 +52,9 @@ workspaces.
 Create a JSONL file with exactly one row per selected task:
 
 ~~~json
-{"task_id":"2","solution":"def ...:\n    ..."}
-{"task_id":"3","solution":"def ...:\n    ..."}
-{"task_id":"4","solution":"def ...:\n    ..."}
+{"task_id":"Mbpp/2","solution":"def ...:\n    ..."}
+{"task_id":"Mbpp/3","solution":"def ...:\n    ..."}
+{"task_id":"Mbpp/4","solution":"def ...:\n    ..."}
 ~~~
 
 Use the exact canonical IDs emitted by prepare (for example, `Mbpp/2`). Each solution must contain the complete
