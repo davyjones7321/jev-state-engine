@@ -149,6 +149,8 @@ def evaluate(args) -> int:
     validate_samples(manifest["selected_task_ids"], read_jsonl(samples_path))
 
     output_path = Path(args.output).resolve()
+    if output_path.exists():
+        raise ValueError(f"Result file already exists; choose a new --output path: {output_path}")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     command = [sys.executable, "-m", "evalplus.evaluate", "--dataset", "mbpp",
                "--samples", str(samples_path), "--parallel", str(args.parallel),
