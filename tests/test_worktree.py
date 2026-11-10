@@ -509,3 +509,65 @@ def test_engine_execute_worktree_escalation_cleans_up(tmp_path):
     assert br_list.strip() == ""
 
 
+
+
+# 14. Local ignored evaluation inputs are seeded narrowly into subgoal worktrees.
+def test_seed_subgoal_worktree_inputs_copies_only_scoped_file_and_task_doc(git_repo):
+    local_dir = git_repo / "evals" / "local"
+    task_dir = local_dir / "mbpp_plus" / "workspaces" / "jev" / "Mbpp_2"
+    task_dir.mkdir(parents=True)
+    (local_dir / ".gitignore").write_text("*\\n!.gitignore\\n", encoding="utf-8")
+    (task_dir / "TASK.md").write_text("Implement similar_elements.\\n", encoding="utf-8")
+    (task_dir / "solution.py").write_text("def similar_elements(a, b):\\n    pass\\n", encoding="utf-8")
+    (task_dir / "private-note.txt").write_text("must not be copied\\n", encoding="utf-8")
+
+    ws = Workspace(repo_dir=git_repo)
+    wt_path = ws.create_subgoal_worktree("localseed")
+    seeded = ws.seed_subgoal_worktree_inputs([
+        "evals/local/mbpp_plus/workspaces/jev/Mbpp_2/solution.py"
+    ])
+
+    assert set(seeded) == {
+        "evals/local/mbpp_plus/workspaces/jev/Mbpp_2/TASK.md",
+        "evals/local/mbpp_plus/workspaces/jev/Mbpp_2/solution.py",
+    }
+    assert (wt_path / "evals/local/mbpp_plus/workspaces/jev/Mbpp_2/TASK.md").read_text(encoding="utf-8") == "Implement similar_elements.\\n"
+    assert (wt_path / "evals/local/mbpp_plus/workspaces/jev/Mbpp_2/solution.py").exists()
+    assert not (wt_path / "evals/local/mbpp_plus/workspaces/jev/Mbpp_2/private-note.txt").exists()
+
+    ws.stage_file_mutation(
+        "evals/local/mbpp_plus/workspaces/jev/Mbpp_2/solution.py",
+        "def similar_elements(a, b):\\n    return list(set(a) & set(b))\\n",
+    )
+    diff = ws.get_staged_diff()
+    assert "similar_elements" in diff
+    assert "return list(set(a) & set(b))" in diff
+    assert (task_dir / "solution.py").read_text(encoding="utf-8") == "def similar_elements(a, b):\\n    pass\\n"
+
+
+def test_stage_file_mutation_rejects_unapproved_ignored_local_path(git_repo):
+    local_dir = git_repo / "evals" / "local"
+    local_dir.mkdir(parents=True)
+    (local_dir / ".gitignore").write_text("*\\n!.gitignore\\n", encoding="utf-8")
+    ws = Workspace(repo_dir=git_repo)
+    ws.create_subgoal_worktree("localdeny")
+
+    with pytest.raises(PermissionError, match="outside the active local-input allowlist"):
+        ws.stage_file_mutation("evals/local/not-authorized.py", "x = 1\\n")
+    assert not (ws.worktree_dir / "evals/local/not-authorized.py").exists()
+    assert "evals/local/not-authorized.py" not in ws.worker_staged_paths
+
+
+def test_stage_file_mutation_reports_git_add_failure_without_recording_path(git_repo, monkeypatch):
+    ws = Workspace(repo_dir=git_repo)
+    original_run_git = ws._run_git
+
+    def fail_add(args, check=False):
+        if args and args[0] == "add":
+            return subprocess.CompletedProcess(args=args, returncode=1, stdout="", stderr="simulated git add failure")
+        return original_run_git(args, check=check)
+
+    monkeypatch.setattr(ws, "_run_git", fail_add)
+    with pytest.raises(RuntimeError, match="simulated git add failure"):
+        ws.stage_file_mutation("cannot-stage.py", "x = 1\\n")
+    assert "cannot-stage.py" not in ws.worker_staged_paths
