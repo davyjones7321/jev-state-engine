@@ -196,3 +196,14 @@ The user approved deferring repository-level coding coverage and prioritizing a 
 SWE-bench Verified and WebArena are deferred. The 12/10/10 allocation is still conditional on evaluator, license, access, and resource validation.
 
 The user has also stated that an existing paid Jev subscription is intended to cover semantic-gate calls and has authorized its use. This is not independently verified as API entitlement. Confirm subscription coverage and any usage/overage terms before the first request; do not enable extra billing or make a paid probe call.
+
+
+## 13. Clarification on the Jev paid account
+
+The official TypeSafe support page describes Jev API billing as a standard plan funded by **prepaid credits**, with usage deducted from the balance. It does not describe a conventional unlimited monthly subscription. Auto-recharge is optional and can create additional purchases.
+
+The user's statement that they have a paid Jev subscription is accepted as authorization to use their existing paid entitlement for the evaluation, but the exact account route and remaining balance are not visible here. Before the first call, verify in the account console that the key configured in JEV is for the same API endpoint used by the repository (`https://api.typesafe.ai/v1/systemone`), that there are sufficient existing credits, and that auto-recharge/overage will not make unapproved purchases. Do not paste the key or billing screenshots containing sensitive details into chat.
+
+Official references:
+- [TypeSafe: How much does Jev cost?](https://help.typesafe.ai/articles/5187202169-how-much-does-jev-cost)
+- [TypeSafe: How do I add credits?](https://help.typesafe.ai/articles/7771619341-how-do-i-add-credits)
