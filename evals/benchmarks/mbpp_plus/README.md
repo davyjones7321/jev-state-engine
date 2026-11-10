@@ -43,13 +43,36 @@ The adapter writes to evals/local/mbpp_plus/:
 - evaluator-private/mbpp-plus-subset.jsonl: official evaluator data, including
   canonical solutions and test inputs. Never expose this directory to agents.
 - task-manifest.json: selected IDs, versions, and hashes.
+- workspaces/jev/, workspaces/opencode/, and workspaces/antigravity/: three
+  independent task workspaces, each containing TASK.md and an empty solution.py.
 
 The local directory is git-ignored. Keep evaluator-private data outside agent
-workspaces.
+workspaces. Each agent receives only its own workspace copy; do not share
+solutions or logs between agents.
+
+## Agent workspaces and collection
+
+Open the appropriate workspace root in each agent:
+
+- JEV: `evals/local/mbpp_plus/workspaces/jev/`
+- OpenCode: `evals/local/mbpp_plus/workspaces/opencode/`
+- Antigravity: `evals/local/mbpp_plus/workspaces/antigravity/`
+
+For every task, read TASK.md and write the complete implementation to that
+folder's solution.py. Do not expose the evaluator-private directory. Keep the
+three agents' workspaces independent.
+
+After an agent finishes, collect its files into the official sample format:
+
+~~~powershell
+python evals/benchmarks/mbpp_plus/adapter.py collect --agent jev --output evals/local/mbpp_plus/samples/jev.jsonl
+python evals/benchmarks/mbpp_plus/adapter.py collect --agent opencode --output evals/local/mbpp_plus/samples/opencode.jsonl
+python evals/benchmarks/mbpp_plus/adapter.py collect --agent antigravity --output evals/local/mbpp_plus/samples/antigravity.jsonl
+~~~
 
 ## Agent solution format
 
-Create a JSONL file with exactly one row per selected task:
+The collected JSONL contains exactly one row per selected task:
 
 ~~~json
 {"task_id":"Mbpp/2","solution":"def ...:\n    ..."}
@@ -74,8 +97,9 @@ environment. API keys are not propagated to evaluator subprocesses.
 
 - This is a three-task smoke slice, not the complete 12-task coding category.
 - MBPP+ tests Python function generation, not repository-level issue resolution.
-- This adapter does not yet invoke JEV, OpenCode, or Antigravity. Agent
-  integration is a separate next step after validating the evaluator path.
+- The adapter prepares independent workspaces and collects outputs, but it
+  does not launch JEV, OpenCode, or Antigravity itself. Each agent must be run
+  through its own supported interface.
 - EvalPlus recommends Docker for safer execution. This adapter's restricted
   environment is not an OS/container security boundary. Do not execute
   untrusted generated code on a host holding secrets; use container isolation
