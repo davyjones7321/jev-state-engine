@@ -2574,6 +2574,8 @@ def node_implement(
             elif hasattr(workspace, "base_commit"):
                 state["subgoal_base_commit"] = workspace.base_commit
             wt_path = workspace.create_subgoal_worktree(subgoal_id, base_ref=base_ref)
+            if hasattr(workspace, "seed_subgoal_worktree_inputs"):
+                workspace.seed_subgoal_worktree_inputs(subgoal.scope or [])
             state["current_worktree_path"] = str(wt_path)
             state["current_worktree_branch"] = f"jev-subgoal-{subgoal_id}"
         elif hasattr(workspace, "worktree_dir") and state.get("current_worktree_path"):
