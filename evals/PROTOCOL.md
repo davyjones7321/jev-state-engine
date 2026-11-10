@@ -53,7 +53,7 @@ Before selecting the final task subset, run a capability check for each agent:
 
 Mark an agent-task pair as `not_eligible` with a reason when any answer is no. Do not force a coding-only system to perform browser tasks, or a browser-only system to produce repository patches.
 
-JEV must be treated as the complete configured JEV system, not merely as a Gemini prompt. Record whether its worker, state machine, deterministic checks, and semantic gate were enabled. If a production semantic-gate credential or paid service is required and no zero-cost authorized route exists, mark that configuration unavailable; do not silently bypass a required JEV component and still call it the same system.
+JEV must be treated as the complete configured JEV system, not merely as a Gemini prompt. Record whether its worker, state machine, deterministic checks, and semantic gate were enabled. The user has stated that their existing paid Jev subscription is intended to cover evaluation calls and has authorized its use for the tests. Before the first request, verify that the subscription actually includes the required API entitlement/usage and determine whether any overage or separate metering applies. Use only the covered entitlement the user has authorized; do not enable additional billing or incur unapproved charges. If the production semantic-gate service is unavailable under that entitlement, stop and report the blocker; do not silently bypass a required JEV component and still call it the same system.
 
 ### Model controls
 
@@ -72,11 +72,12 @@ No model is assumed to be free merely because a free tier or trial is advertised
 3. Use a small pilot sample across difficulty levels and task types where the benchmark supports those labels.
 4. Use the same task prompt, starting repository/environment state, allowed tool classes, timeout, and evaluator for all eligible agents.
 5. Reset the task environment between agents. No agent may see another agent's patch, transcript, or answer.
-6. Do not give one agent benchmark-specific hints or hidden expected outputs unavailable to the others.
-7. Run each eligible agent-task pair once for the initial pilot. Any repeat must be predeclared or clearly marked as a repeat; do not silently keep the best attempt.
-8. Preserve raw outputs and logs locally with secrets redacted. Commit only sanitized aggregate results and reproducibility metadata.
-9. Score using the official evaluator wherever possible. A separate reviewer may audit the process but must not replace the evaluator's result with a subjective pass.
-10. Record infrastructure or provider failures separately from agent task failures. Do not score an interrupted run as a normal task failure.
+6. Keep provider credentials in the trusted agent/orchestrator process only. Do not expose them to benchmark repositories, generated code, shell commands, browser pages, or task-controlled subprocesses. If the current JEV process model cannot enforce this boundary, do not run untrusted benchmark code through JEV until a narrow isolation wrapper or separate execution boundary is available.
+7. Do not give one agent benchmark-specific hints or hidden expected outputs unavailable to the others.
+8. Run each eligible agent-task pair once for the initial pilot. Any repeat must be predeclared or clearly marked as a repeat; do not silently keep the best attempt.
+9. Preserve raw outputs and logs locally with secrets redacted. Commit only sanitized aggregate results and reproducibility metadata.
+10. Score using the official evaluator wherever possible. A separate reviewer may audit the process but must not replace the evaluator's result with a subjective pass.
+11. Record infrastructure or provider failures separately from agent task failures. Do not score an interrupted run as a normal task failure.
 
 ## 6. Required run record
 
@@ -145,3 +146,18 @@ Current recommendation:
 - Do not run JEV target commands against untrusted benchmark code while provider credentials are present. Current process execution inherits the parent environment; see FEASIBILITY.md.
 
 The revised 12/10/10 candidate allocation is not approved or executable until the user confirms benchmark scope, account quotas, and a safe credential-isolation design.
+
+
+## 10. User-approved proof-of-concept scope update
+
+The user approved prioritizing a practical proof of concept over repository-level coding coverage. SWE-bench Verified and WebArena are deferred from this pilot. The revised candidate set is:
+
+- Coding: MBPP+ / EvalPlus, up to 12 tasks (Python function generation; not repository issue resolution).
+- Reasoning/research: up to 10 authorized GAIA validation/development tasks.
+- Browser/research: up to 10 AssistantBench public validation tasks, using a pinned evaluator/browser implementation.
+
+This remains a candidate allocation, not a promise that every agent is eligible for every category. Verify evaluator installation, access terms, task licenses, and resource use before selecting exact task IDs.
+
+The user also stated that an existing paid Jev subscription is intended to cover JEV semantic-gate calls and authorized its use for evaluation. Before making any call, confirm that the subscription includes the required API entitlement and check whether there are separate usage charges or overages. No additional billing or unapproved spend is authorized.
+
+The user is willing to defer broader JEV security hardening. That does not authorize exposing API credentials to untrusted benchmark code. Provider credentials must remain outside task-controlled child processes and benchmark workspaces; otherwise JEV runs remain blocked until a narrow isolation boundary is in place.
