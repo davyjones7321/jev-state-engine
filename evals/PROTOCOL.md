@@ -130,3 +130,18 @@ Do not commit benchmark datasets, generated patches, full transcripts, credentia
 7. Only then expand toward the 30–40-task pilot.
 
 **No benchmark environment installation, model execution, paid resource provisioning, or scored run is authorized by this protocol alone.**
+
+
+## 10. Feasibility review update (2026-11-10)
+
+See [FEASIBILITY.md](FEASIBILITY.md) for the source-backed review.
+
+Current recommendation:
+- Do not assume SWE-bench Verified's 120 GB / 16 GB RAM / 8 CPU recommended environment fits the available free compute.
+- Do not use the full self-hosted WebArena stack under the zero-cost constraint; assess AssistantBench validation tasks as the browser candidate instead.
+- GAIA remains conditional on the operator accepting its gated dataset terms and using only authorized public development/validation material.
+- MBPP+ or LiveCodeBench may replace SWE-bench only if the user explicitly accepts that these measure function/code generation or code repair, not repository-level issue resolution.
+- Full production JEV is blocked unless existing prepaid TypeSafe Jev credit is explicitly authorized; TypeSafe publishes no free/trial credits.
+- Do not run JEV target commands against untrusted benchmark code while provider credentials are present. Current process execution inherits the parent environment; see FEASIBILITY.md.
+
+The revised 12/10/10 candidate allocation is not approved or executable until the user confirms benchmark scope, account quotas, and a safe credential-isolation design.
