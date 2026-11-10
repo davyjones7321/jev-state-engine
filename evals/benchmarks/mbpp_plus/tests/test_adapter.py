@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from adapter import read_jsonl, select_ids, validate_samples, write_jsonl
+from adapter import (DOCKER_IMAGE, build_docker_command, read_jsonl, select_ids, validate_samples, write_jsonl)
 
 
 class SampleValidationTests(unittest.TestCase):
@@ -45,6 +45,52 @@ class SampleValidationTests(unittest.TestCase):
             rows = [{"task_id": "2", "prompt": "first line\nsecond line"}]
             write_jsonl(path, rows)
             self.assertEqual(read_jsonl(path), rows)
+
+
+class DockerCommandTests(unittest.TestCase):
+    def test_uses_pinned_evaluator_image(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            command = build_docker_command(
+                root / "input", root / "output", "result.json", 1
+            )
+            self.assertIn(DOCKER_IMAGE, command)
+
+    def test_disables_network_and_applies_resource_limits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            command = build_docker_command(
+                root / "input", root / "output", "result.json", 1
+            )
+            for option in (
+                "--network", "none", "--read-only",
+                "--memory=1g", "--cpus=2", "--pids-limit=128",
+                "--cap-drop=ALL", "--security-opt=no-new-privileges",
+                "--user=65534:65534",
+            ):
+                self.assertIn(option, command)
+
+    def test_mounts_inputs_read_only_and_results_writable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            command = build_docker_command(
+                root / "input", root / "output", "result.json", 1
+            )
+            mounts = [
+                command[index + 1]
+                for index, value in enumerate(command[:-1])
+                if value == "--mount"
+            ]
+            self.assertEqual(len(mounts), 2)
+            self.assertIn("target=/input,readonly", mounts[0])
+            self.assertIn("target=/output", mounts[1])
+            self.assertNotIn("readonly", mounts[1])
+            self.assertIn(
+                "MBPP_OVERRIDE_PATH=/input/mbpp-plus-subset.jsonl",
+                command,
+            )
+            self.assertIn("/output/.result.samples.jsonl", command)
+            self.assertNotIn("--output_file", command)
 
 
 if __name__ == "__main__":

@@ -5,13 +5,15 @@ import argparse
 import hashlib
 import importlib.metadata
 import json
-import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
+import tempfile
 
 EVALPLUS_VERSION = "0.3.1"
 MBPP_PLUS_VERSION = "v0.2.0"
+DOCKER_IMAGE = "jev-mbpp-evaluator:0.3.1"
 DEFAULT_ROOT = Path("evals/local/mbpp_plus")
 AGENTS = ("jev", "opencode", "antigravity")
 
@@ -176,47 +178,201 @@ def validate_samples(task_ids: list[str], sample_rows: list[dict]) -> None:
         raise ValueError(f"Sample/task mismatch; missing={sorted(set(task_ids)-set(seen))}, extra={sorted(set(seen)-set(task_ids))}")
 
 
-def clean_evaluator_environment(dataset_path: Path) -> dict[str, str]:
-    allowed = ("PATH", "HOME", "USERPROFILE", "TEMP", "TMP", "TMPDIR", "SYSTEMROOT", "WINDIR")
-    env = {key: os.environ[key] for key in allowed if key in os.environ}
-    env.update({"MBPP_OVERRIDE_PATH": str(dataset_path), "PYTHONIOENCODING": "utf-8",
-                "PYTHONHASHSEED": "0", "TOKENIZERS_PARALLELISM": "false"})
-    return env
+def build_docker_command(
+    input_dir: Path,
+    output_dir: Path,
+    output_name: str,
+    parallel: int,
+) -> list[str]:
+    input_mount = (
+        f"type=bind,source={input_dir.resolve().as_posix()},"
+        "target=/input,readonly"
+    )
+    output_mount = (
+        f"type=bind,source={output_dir.resolve().as_posix()},"
+        "target=/output"
+    )
+
+    return [
+        "docker", "run", "--rm",
+        "--network", "none",
+        "--read-only",
+        "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
+        "--memory=1g",
+        "--cpus=2",
+        "--pids-limit=128",
+        "--cap-drop=ALL",
+        "--security-opt=no-new-privileges",
+        "--user=65534:65534",
+        "--env", "HOME=/tmp",
+        "--env", "PYTHONIOENCODING=utf-8",
+        "--env", "PYTHONHASHSEED=0",
+        "--env", "TOKENIZERS_PARALLELISM=false",
+        "--env", "MBPP_OVERRIDE_PATH=/input/mbpp-plus-subset.jsonl",
+        "--mount", input_mount,
+        "--mount", output_mount,
+        DOCKER_IMAGE,
+        "python", "-m", "evalplus.evaluate",
+        "--dataset", "mbpp",
+        "--samples", f"/output/.{Path(output_name).stem}.samples.jsonl",
+        "--parallel", str(parallel),
+    ]
 
 
 def evaluate(args) -> int:
-    require_evalplus()
     manifest_path = Path(args.manifest).resolve()
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
     if manifest.get("benchmark") != "mbpp_plus":
         raise ValueError("Not an MBPP+ manifest")
-    if manifest.get("evalplus_version") != EVALPLUS_VERSION or manifest.get("mbpp_plus_dataset_version") != MBPP_PLUS_VERSION:
+
+    if (
+        manifest.get("evalplus_version") != EVALPLUS_VERSION
+        or manifest.get("mbpp_plus_dataset_version") != MBPP_PLUS_VERSION
+    ):
         raise ValueError("Manifest version does not match the pinned evaluator")
+
     private_path = Path(manifest["evaluator_private_dataset"]).resolve()
     expected = manifest["evaluator_private_dataset_sha256"]
     actual = hashlib.sha256(private_path.read_bytes()).hexdigest()
+
     if actual != expected:
         raise ValueError("Evaluator-private dataset hash mismatch")
+
     samples_path = Path(args.samples).resolve()
-    validate_samples(manifest["selected_task_ids"], read_jsonl(samples_path))
+    validate_samples(
+        manifest["selected_task_ids"],
+        read_jsonl(samples_path),
+    )
 
     output_path = Path(args.output).resolve()
+
     if output_path.exists():
-        raise ValueError(f"Result file already exists; choose a new --output path: {output_path}")
+        raise ValueError(
+            f"Result file already exists; choose a new --output path: {output_path}"
+        )
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    command = [sys.executable, "-m", "evalplus.evaluate", "--dataset", "mbpp",
-               "--samples", str(samples_path), "--parallel", str(args.parallel),
-               "--output_file", str(output_path)]
-    completed = subprocess.run(command, env=clean_evaluator_environment(private_path), check=False)
+
+    try:
+        image_check = subprocess.run(
+            ["docker", "image", "inspect", DOCKER_IMAGE],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("Docker CLI was not found") from exc
+
+    if image_check.returncode != 0:
+        raise RuntimeError(
+            f"Docker image {DOCKER_IMAGE} is unavailable. "
+            "Build the pinned evaluator image before scoring."
+        )
+
+    staged_samples_path = (
+        output_path.parent / f".{output_path.stem}.samples.jsonl"
+    )
+    evalplus_result_path = (
+        output_path.parent
+        / f".{output_path.stem}.samples_eval_results.json"
+    )
+
+    if staged_samples_path.exists() or evalplus_result_path.exists():
+        raise ValueError(
+            "Temporary EvalPlus files already exist; inspect them before retrying"
+        )
+
+    shutil.copyfile(samples_path, staged_samples_path)
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="jev-mbpp-eval-") as temporary:
+            input_dir = Path(temporary)
+
+            shutil.copyfile(
+                private_path,
+                input_dir / "mbpp-plus-subset.jsonl",
+            )
+
+            command = build_docker_command(
+                input_dir,
+                output_path.parent,
+                output_path.name,
+                args.parallel,
+            )
+
+            completed = subprocess.run(command, check=False)
+    finally:
+        staged_samples_path.unlink(missing_ok=True)
+
     if completed.returncode:
-        print(f"EvalPlus exited with status {completed.returncode}", file=sys.stderr)
+        print(
+            f"Docker EvalPlus exited with status {completed.returncode}",
+            file=sys.stderr,
+        )
         return completed.returncode
-    if not output_path.is_file():
-        raise RuntimeError("EvalPlus returned success without creating its result file")
-    result = json.loads(output_path.read_text(encoding="utf-8"))
-    print(json.dumps({"status": "scored", "benchmark": "mbpp_plus", "task_ids": manifest["selected_task_ids"],
-                      "evalplus_version": EVALPLUS_VERSION, "dataset_version": MBPP_PLUS_VERSION,
-                      "result_file": str(output_path), "pass_at_k": result.get("pass_at_k", {})}, indent=2))
+
+    if not evalplus_result_path.is_file():
+        raise RuntimeError(
+            "EvalPlus returned success without creating its result file"
+        )
+
+    result = json.loads(evalplus_result_path.read_text(encoding="utf-8"))
+    if not isinstance(result, dict):
+        raise RuntimeError("EvalPlus result must be a JSON object")
+
+    eval_results = result.get("eval")
+    if not isinstance(eval_results, dict):
+        raise RuntimeError("EvalPlus result is missing its task-level eval data")
+
+    expected_task_ids = set(manifest["selected_task_ids"])
+    if set(eval_results) != expected_task_ids:
+        raise RuntimeError("EvalPlus result task IDs do not match the manifest")
+
+    task_results = []
+    for task_id in manifest["selected_task_ids"]:
+        candidates = eval_results.get(task_id)
+        if not isinstance(candidates, list) or len(candidates) != 1:
+            raise RuntimeError(
+                f"Expected exactly one candidate result for {task_id}"
+            )
+
+        candidate = candidates[0]
+        if not isinstance(candidate, dict):
+            raise RuntimeError(f"Invalid candidate result for {task_id}")
+        if candidate.get("base_status") not in ("pass", "fail"):
+            raise RuntimeError(f"Invalid base status for {task_id}")
+        if candidate.get("plus_status") not in ("pass", "fail"):
+            raise RuntimeError(f"Invalid Plus status for {task_id}")
+
+        task_results.append(candidate)
+
+    shutil.move(str(evalplus_result_path), str(output_path))
+
+    total = len(task_results)
+    base_passed = sum(
+        item["base_status"] == "pass" for item in task_results
+    )
+    plus_passed = sum(
+        item["plus_status"] == "pass" for item in task_results
+    )
+
+    print(json.dumps({
+        "status": "scored",
+        "benchmark": "mbpp_plus",
+        "task_ids": manifest["selected_task_ids"],
+        "evalplus_version": EVALPLUS_VERSION,
+        "dataset_version": MBPP_PLUS_VERSION,
+        "result_file": str(output_path),
+        "pass_at_1": {
+            "base": base_passed / total,
+            "plus": plus_passed / total,
+            "base_passed": base_passed,
+            "plus_passed": plus_passed,
+            "total": total,
+        },
+    }, indent=2))
+
     return 0
 
 
