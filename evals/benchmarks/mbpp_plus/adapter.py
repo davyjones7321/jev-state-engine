@@ -50,7 +50,12 @@ def require_evalplus() -> None:
 def load_dataset():
     require_evalplus()
     from evalplus.data import get_mbpp_plus, get_mbpp_plus_hash
-    return get_mbpp_plus(version="default"), get_mbpp_plus_hash(version="default")
+    from evalplus.data.mbpp import _ready_mbpp_plus_path
+    from evalplus.data.utils import stream_jsonl
+    tasks = get_mbpp_plus(version="default")
+    raw_path = _ready_mbpp_plus_path(version="default")
+    raw_tasks = {row["task_id"]: row for row in stream_jsonl(raw_path)}
+    return tasks, raw_tasks, get_mbpp_plus_hash(version="default")
 
 
 def select_ids(tasks: dict, explicit: list[str] | None, limit: int) -> list[str]:
@@ -66,7 +71,7 @@ def select_ids(tasks: dict, explicit: list[str] | None, limit: int) -> list[str]
 
 
 def prepare(args) -> int:
-    tasks, dataset_hash = load_dataset()
+    tasks, raw_tasks, dataset_hash = load_dataset()
     explicit = [x.strip() for x in args.task_ids.split(",") if x.strip()] if args.task_ids else None
     selected = select_ids(tasks, explicit, args.limit)
     root = Path(args.output_dir).resolve()
@@ -78,7 +83,10 @@ def prepare(args) -> int:
     for task_id in selected:
         task = tasks[task_id]
         prompt_rows.append({"task_id": task_id, "entry_point": task["entry_point"], "prompt": task["prompt"]})
-        private_rows.append(task)
+        # Preserve the raw serialized dataset record. EvalPlus deserializes
+        # base_input/plus_input when it loads MBPP_OVERRIDE_PATH; writing the
+        # already-deserialized task here would convert tuple/set values twice.
+        private_rows.append(raw_tasks[task_id])
 
     write_jsonl(prompts_path, prompt_rows)
     write_jsonl(private_path, private_rows)
