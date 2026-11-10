@@ -120,9 +120,9 @@ Sources:
 - [JEV process runner](https://github.com/davyjones7321/jev-state-engine/blob/master/src/jev/process_runner.py)
 - [TypeSafe: How much does Jev cost?](https://help.typesafe.ai/articles/5187202169-how-much-does-jev-cost)
 
-**Status:** Full production JEV is blocked under a strict zero-additional-cost policy unless the user already has prepaid credit that they explicitly authorize using. Do not make a paid request to test whether the key works.
+**Status:** The user has stated that an existing paid Jev subscription is intended to cover the evaluation and has authorized its use. This may resolve the cost blocker, but the actual subscription entitlement, API access, included usage, and overage rules are not visible from the repository or public documentation. Before the first semantic-gate request, verify through the user's Jev account/dashboard or current provider documentation that the subscription covers this API route and that no unapproved separate charge will occur. Do not send a test request merely to discover whether billing applies.
 
-A Tier-0-only or alternate-judge JEV variant could be studied as a separate ablation, but it is not the production JEV system and must be labelled separately. Do not silently bypass the semantic gate.
+A Tier-0-only or alternate-judge JEV variant could be studied as a separate ablation, but it is not the production JEV system and must be labelled separately. Do not silently bypass the semantic gate. The paid subscription statement should be treated as user-provided intent, not independent verification of API entitlement.
 
 ## 7. Additional JEV execution-isolation blocker
 
@@ -134,7 +134,7 @@ The JEV README warns that target build/test commands execute directly on the hos
 
 Therefore, running untrusted benchmark repository code or generated code as JEV target commands while provider credentials are present can expose those credentials to the executed code. Process-group cleanup and worktree isolation do not prevent credential access.
 
-**Status:** Do not run JEV against untrusted benchmark code until a separately reviewed isolation/credential-boundary solution is established. This review does not change JEV runtime code.
+**Status:** The user has accepted deferring broader security hardening, but this specific credential boundary remains a prerequisite for running untrusted benchmark code. A narrow evaluation-only execution boundary may be sufficient: keep the model/API credential in the trusted agent controller and execute task-controlled commands in a separate process/container with a deliberately constructed environment that contains no provider credentials. Verify that no credential-bearing files, sockets, environment variables, or host mounts are exposed. If this cannot be enforced without modifying JEV, keep JEV's untrusted-code runs blocked; do not treat later key deletion as remediation. This review does not change JEV runtime code.
 
 ## 8. Recommended revised pilot, subject to approval
 
@@ -183,3 +183,16 @@ Sources:
 - [Antigravity model selector](https://antigravity.google/docs/models)
 
 The published free-tier terms are not proof that this user's project has remaining quota. Account-specific access, quotas, and billing safeguards remain unverified.
+
+
+## 12. User-approved proof-of-concept scope
+
+The user approved deferring repository-level coding coverage and prioritizing a practical proof of concept. The revised candidates are:
+
+- MBPP+ / EvalPlus: up to 12 Python function-generation tasks; not repository issue resolution.
+- GAIA: up to 10 authorized public validation/development tasks, subject to accepting dataset terms.
+- AssistantBench: up to 10 public validation tasks, with a pinned Inspect Evals release and browser implementation.
+
+SWE-bench Verified and WebArena are deferred. The 12/10/10 allocation is still conditional on evaluator, license, access, and resource validation.
+
+The user has also stated that an existing paid Jev subscription is intended to cover semantic-gate calls and has authorized its use. This is not independently verified as API entitlement. Confirm subscription coverage and any usage/overage terms before the first request; do not enable extra billing or make a paid probe call.
