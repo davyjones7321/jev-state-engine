@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic.fields import FieldInfo
 
+from jev.process_runner import get_scrubbed_env
 from jev.mech_evidence import MechanicalEvidence
 
 if "lockfile_changed" not in MechanicalEvidence.model_fields:
@@ -396,6 +397,7 @@ def compute_repo_id(repo_dir: Union[str, Path]) -> str:
             capture_output=True,
             text=True,
             check=False,
+            env=get_scrubbed_env(),
         )
         if res.returncode == 0 and res.stdout.strip():
             return res.stdout.splitlines()[0].strip()

@@ -30,6 +30,7 @@ from jev.mech_evidence import (
 )
 from jev.runner_registry import RunnerProfile, load_registry, is_version_supported
 from jev.repo_config import load_repo_config, RepoConfig, validate_trust
+from jev.process_runner import get_scrubbed_env
 
 
 class PreflightStatus(str, Enum):
@@ -135,6 +136,7 @@ def check_git_and_disposable_worktree(
                 capture_output=True,
                 text=True,
                 timeout=5,
+                env=get_scrubbed_env(),
             )
             if res.returncode == 0 and "true" in res.stdout.strip().lower():
                 is_git_repo = True

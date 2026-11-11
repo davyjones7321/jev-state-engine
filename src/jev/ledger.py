@@ -23,6 +23,7 @@ from jev.mech_evidence import (
     TargetConfidence,
 )
 from jev.models import Subgoal
+from jev.process_runner import get_scrubbed_env
 
 MAX_EVIDENCE_CHARS = 64_000
 
@@ -230,6 +231,7 @@ def compute_repo_key(repo_dir: Union[str, Path]) -> str:
             capture_output=True,
             text=True,
             check=True,
+            env=get_scrubbed_env(),
         )
         lines = [line.strip() for line in res.stdout.strip().splitlines() if line.strip()]
         if not lines:

@@ -36,6 +36,7 @@ from jev.advisory import AdvisoryErrorCode, AdvisoryRequest, AdvisoryResult, Rep
 from jev.evidence import evidence_level
 from jev.ledger import NullRecorder, Recorder
 from jev.retrieval import AstWorkspaceRetriever, RetrievalLimits, is_secret_path
+from jev.process_runner import get_scrubbed_env
 from jev.proposals import redact_secrets_in_text, redact_data_structure
 from jev.replanning import replan_remaining_queue
 from jev.mech_evidence import (
@@ -244,6 +245,7 @@ def _get_engine_commit() -> Optional[str]:
             capture_output=True,
             text=True,
             check=True,
+            env=get_scrubbed_env(),
         )
         return res.stdout.strip()
     except Exception:
@@ -2721,6 +2723,7 @@ def node_implement(
                         errors="replace",
                         timeout=120,
                         check=False,
+                        env=get_scrubbed_env(),
                     )
                     if completed.returncode != 0:
                         commit_ref = state.get("subgoal_base_commit") or state.get("base_commit") or getattr(workspace, "base_commit", None)

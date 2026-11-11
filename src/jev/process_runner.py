@@ -88,6 +88,149 @@ class CommandResult:
     stderr: str = ""
 
 
+# Environment scrubbing allowlist and sensitive filters
+SAFE_ENV_NAMES = {
+    # System / OS essentials
+    "PATH",
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "TEMP",
+    "TMP",
+    "HOME",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "LANG",
+    "CI",
+    # Windows system essentials
+    "COMSPEC",
+    "PATHEXT",
+    "WINDIR",
+    "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
+    "PROGRAMDATA",
+    "COMMONPROGRAMFILES",
+    "COMMONPROGRAMFILES(X86)",
+    "PUBLIC",
+    "ALLUSERSPROFILE",
+    "NUMBER_OF_PROCESSORS",
+    "OS",
+    "PROCESSOR_ARCHITECTURE",
+    "PROCESSOR_IDENTIFIER",
+    "PROCESSOR_LEVEL",
+    "PROCESSOR_REVISION",
+    # POSIX system essentials
+    "TERM",
+    "SHELL",
+    "USER",
+    "LOGNAME",
+    "HOSTNAME",
+    "LD_LIBRARY_PATH",
+    "DYLD_LIBRARY_PATH",
+    # Python
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "PYTHONIOENCODING",
+    "PYTHONUTF8",
+    "PYTHONUNBUFFERED",
+    "PYTHONDONTWRITEBYTECODE",
+    "VIRTUAL_ENV",
+    "CONDA_PREFIX",
+    "CONDA_DEFAULT_ENV",
+    # Node / npm
+    "NODE_PATH",
+    "NODE_ENV",
+    "NVM_BIN",
+    "NVM_DIR",
+    "NODE_OPTIONS",
+    # Git
+    "GIT_EXEC_PATH",
+    "GIT_TEMPLATE_DIR",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_CONFIG_NOSYSTEM",
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    # Common build toolchains
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "GOPATH",
+    "GOROOT",
+    "JAVA_HOME",
+    "MAVEN_HOME",
+    "GRADLE_HOME",
+    "DOTNET_ROOT",
+    # Test harness runner configuration
+    "JEV_FAKE_RUNNER_CONFIG",
+    "FAKE_RUNNER_CONFIG",
+}
+
+SAFE_ENV_PREFIXES = (
+    "LC_",
+    "NPM_CONFIG_",
+)
+
+SENSITIVE_SUBSTRINGS = (
+    "KEY",
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "CREDENTIAL",
+    "AUTH",
+)
+
+
+def get_scrubbed_env(
+    declared_env: Optional[Dict[str, str]] = None,
+    opt_out: bool = False,
+    base_env: Optional[Dict[str, str]] = None,
+) -> Dict[str, str]:
+    """Build a scrubbed environment dictionary for child processes.
+
+    1. Layer 1 (Allowlist): Keep only explicitly allowed environment variables.
+    2. Layer 2 (Sensitive Substrings): Drop any variable whose name contains
+       KEY, TOKEN, SECRET, PASSWORD, CREDENTIAL, or AUTH.
+    3. Explicitly declared variables (from approved proposals/callers) are merged back.
+    4. If opt_out is True (or JEV_DISABLE_ENV_SCRUB=1), the full environment is preserved
+       with declared_env merged.
+    """
+    if opt_out or os.environ.get("JEV_DISABLE_ENV_SCRUB") == "1":
+        env_copy = dict(base_env if base_env is not None else os.environ)
+        if declared_env:
+            env_copy.update(declared_env)
+        return env_copy
+
+    source_env = base_env if base_env is not None else os.environ
+    clean_env: Dict[str, str] = {}
+
+    for k, v in source_env.items():
+        k_upper = k.upper()
+        # Layer 1: Allowlist check
+        is_allowed = (k_upper in SAFE_ENV_NAMES) or any(
+            k_upper.startswith(p) for p in SAFE_ENV_PREFIXES
+        )
+        if not is_allowed:
+            continue
+
+        # Layer 2: Drop sensitive substrings
+        if any(sub in k_upper for sub in SENSITIVE_SUBSTRINGS):
+            continue
+
+        clean_env[k] = v
+        if sys.platform == "win32" and k != k_upper:
+            clean_env[k_upper] = v
+
+    # Add back variables explicitly declared by the proposal / caller
+    if declared_env:
+        clean_env.update(declared_env)
+
+    return clean_env
+
+
 def _count_live_posix_descendants(pgid: int, proc_path: Optional[Path] = None) -> int:
     """Count non-zombie processes belonging to pgid.
 
@@ -152,6 +295,8 @@ def run_command(
     timeout: Optional[float] = None,
     env: Optional[Dict[str, str]] = None,
     shell: Optional[bool] = None,
+    scrub_env: bool = True,
+    opt_out: Optional[bool] = None,
 ) -> CommandResult:
     resolved_cwd = Path(cwd).resolve() if cwd else Path.cwd()
 
@@ -194,9 +339,12 @@ def run_command(
             job_created = False
             hJob = None
 
+    effective_opt_out = opt_out if opt_out is not None else not scrub_env
+    child_env = get_scrubbed_env(declared_env=env, opt_out=effective_opt_out)
+
     popen_kwargs: Dict[str, Any] = {
         "cwd": str(resolved_cwd),
-        "env": env,
+        "env": child_env,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
         "text": True,
@@ -277,6 +425,7 @@ def run_command(
                         ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
                         capture_output=True,
                         timeout=5,
+                        env=get_scrubbed_env(),
                     )
                 except Exception:
                     pass

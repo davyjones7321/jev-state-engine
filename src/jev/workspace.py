@@ -29,7 +29,7 @@ from jev.mech_evidence import (
     MechStatus,
     TargetConfidence,
 )
-from jev.process_runner import CommandResult, run_command
+from jev.process_runner import CommandResult, get_scrubbed_env, run_command
 
 from jev.repo_config import (
     PROTECTED_FILES,
@@ -846,6 +846,7 @@ class PythonCompileHandler(BaseCompileHandler):
                     ["git", "show", f"{commit}:{rel}"],
                     cwd=cwd,
                     capture_output=True,
+                    env=get_scrubbed_env(),
                 )
                 if res.returncode != 0:
                     continue
@@ -1352,6 +1353,7 @@ class Workspace:
             text=True,
             encoding="utf-8",
             errors="replace",
+            env=get_scrubbed_env(),
             check=check,
         )
 
@@ -1363,6 +1365,7 @@ class Workspace:
             text=True,
             encoding="utf-8",
             errors="replace",
+            env=get_scrubbed_env(),
             check=check,
         )
 
@@ -1529,11 +1532,12 @@ class Workspace:
                 safe_git_cmd.append("--no-textconv")
             safe_git_cmd.extend(args_list[1:])
 
-            git_env = dict(os.environ)
-            git_env["GIT_PAGER"] = "cat"
-            git_env["PAGER"] = "cat"
-            git_env["GIT_EXTERNAL_DIFF"] = ""
-            git_env["GIT_DIFF_EXTERNAL"] = ""
+            git_env = get_scrubbed_env({
+                "GIT_PAGER": "cat",
+                "PAGER": "cat",
+                "GIT_EXTERNAL_DIFF": "",
+                "GIT_DIFF_EXTERNAL": "",
+            })
 
             try:
                 res = subprocess.run(
@@ -1649,6 +1653,7 @@ class Workspace:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                env=get_scrubbed_env(),
             )
             out = res.stdout if res.returncode == 0 else res.stderr
             return _cap_read_text(out) if cmd == "cat" else out
@@ -2199,18 +2204,20 @@ class Workspace:
                     f"Collision detected: worker-staged file(s) modified or deleted by engine: {', '.join(self.collision_paths)}"
                 )
             if self.worker_staged_paths:
-                subprocess.run(["git", "add", "--"] + list(self.worker_staged_paths), cwd=wt_path, capture_output=True, text=True, encoding="utf-8", errors="replace")
-                diff_check = subprocess.run(["git", "diff", "--cached", "--"] + list(self.worker_staged_paths), cwd=wt_path, capture_output=True, text=True, encoding="utf-8", errors="replace")
+                scrubbed_env = get_scrubbed_env()
+                subprocess.run(["git", "add", "--"] + list(self.worker_staged_paths), cwd=wt_path, capture_output=True, text=True, encoding="utf-8", errors="replace", env=scrubbed_env)
+                diff_check = subprocess.run(["git", "diff", "--cached", "--"] + list(self.worker_staged_paths), cwd=wt_path, capture_output=True, text=True, encoding="utf-8", errors="replace", env=scrubbed_env)
                 if diff_check.stdout.strip():
                     commit_msg = f"Subgoal committed ({br_name})" if br_name else "Subgoal committed"
-                    subprocess.run(["git", "commit", "-m", commit_msg], cwd=wt_path, capture_output=True, text=True, encoding="utf-8", errors="replace")
+                    subprocess.run(["git", "commit", "-m", commit_msg], cwd=wt_path, capture_output=True, text=True, encoding="utf-8", errors="replace", env=scrubbed_env)
             else:
                 if not self.strict_provenance:
-                    subprocess.run(["git", "add", "-A"], cwd=wt_path, capture_output=True, text=True, encoding="utf-8", errors="replace")
-                    diff_check = subprocess.run(["git", "diff", "--cached"], cwd=wt_path, capture_output=True, text=True, encoding="utf-8", errors="replace")
+                    scrubbed_env = get_scrubbed_env()
+                    subprocess.run(["git", "add", "-A"], cwd=wt_path, capture_output=True, text=True, encoding="utf-8", errors="replace", env=scrubbed_env)
+                    diff_check = subprocess.run(["git", "diff", "--cached"], cwd=wt_path, capture_output=True, text=True, encoding="utf-8", errors="replace", env=scrubbed_env)
                     if diff_check.stdout.strip():
                         commit_msg = f"Subgoal committed ({br_name})" if br_name else "Subgoal committed"
-                        subprocess.run(["git", "commit", "-m", commit_msg], cwd=wt_path, capture_output=True, text=True, encoding="utf-8", errors="replace")
+                        subprocess.run(["git", "commit", "-m", commit_msg], cwd=wt_path, capture_output=True, text=True, encoding="utf-8", errors="replace", env=scrubbed_env)
 
         self.worktree_dir = self.repo_dir
 
