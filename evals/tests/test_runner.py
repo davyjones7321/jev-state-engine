@@ -1,5 +1,6 @@
 import http.client
 import json
+import os
 from pathlib import Path
 import socket
 import tempfile
@@ -11,12 +12,14 @@ import jsonschema
 
 from evals.runner import (
     DRY_RUN_SMOKE_TASKS,
+    CommandResult,
     check_credential_boundary,
     create_run_record,
     execute_dry_run,
     get_sanitized_environment,
     is_sensitive_env_var,
     load_run_schema,
+    run_command,
     validate_run_record,
 )
 
@@ -58,6 +61,70 @@ class CredentialBoundaryTests(unittest.TestCase):
         passed, leaked = check_credential_boundary(env=dirty_env)
         self.assertFalse(passed)
         self.assertEqual(set(leaked), {"JEV_API_KEY", "OPENAI_API_KEY"})
+
+    def test_probe_with_parent_secrets_reports_clean_via_run_command(self):
+        """Set JEV_API_KEY, GOOGLE_API_KEY, OPENAI_API_KEY and MY_SECRET_TOKEN in test process,
+        run probe, and assert it reports clean. Must fail if probe uses standalone subprocess."""
+        secrets = {
+            "JEV_API_KEY": "jev-test-secret-key-xyz",
+            "GOOGLE_API_KEY": "google-test-secret-key-123",
+            "OPENAI_API_KEY": "openai-test-secret-key-456",
+            "MY_SECRET_TOKEN": "my-secret-token-789",
+        }
+        with patch.dict(os.environ, secrets, clear=False):
+            passed, leaked = check_credential_boundary()
+            self.assertTrue(passed, f"Probe should report clean via run_command, but leaked: {leaked}")
+            self.assertEqual(leaked, [])
+
+    def test_probe_fails_closed_when_run_command_leaks_variable(self):
+        """Monkeypatch run_command to leak one of the sensitive variables and assert probe fails closed.
+        Must fail if probe uses standalone subprocess."""
+        from evals import runner
+
+        original_run_command = runner.run_command
+
+        def leaky_run_command(*args, **kwargs):
+            res = original_run_command(*args, **kwargs)
+            try:
+                env_map = json.loads(res.stdout)
+            except Exception:
+                env_map = {}
+            env_map["JEV_API_KEY"] = "leaked-secret-value-123"
+            return CommandResult(
+                argv=res.argv,
+                cwd=res.cwd,
+                exit_code=res.exit_code,
+                duration_ms=res.duration_ms,
+                timed_out=res.timed_out,
+                launch_failed=res.launch_failed,
+                termination_reason=res.termination_reason,
+                tool_path=res.tool_path,
+                stdout_tail=res.stdout_tail,
+                stderr_tail=res.stderr_tail,
+                stdout_sha256=res.stdout_sha256,
+                stderr_sha256=res.stderr_sha256,
+                cleanup_method=res.cleanup_method,
+                descendants_remaining=res.descendants_remaining,
+                stdout=json.dumps(env_map),
+                stderr=res.stderr,
+            )
+
+        with patch.object(runner, "run_command", side_effect=leaky_run_command):
+            passed, leaked = check_credential_boundary()
+            self.assertFalse(passed, "Probe must fail closed when run_command leaks variable")
+            self.assertIn("JEV_API_KEY", leaked)
+
+    def test_probe_fails_closed_when_jev_disable_env_scrub_is_set(self):
+        """Assert the probe fails closed if JEV_DISABLE_ENV_SCRUB=1 is set.
+        Must fail if probe uses standalone subprocess."""
+        secrets = {
+            "JEV_API_KEY": "secret-key-12345",
+            "JEV_DISABLE_ENV_SCRUB": "1",
+        }
+        with patch.dict(os.environ, secrets, clear=False):
+            passed, leaked = check_credential_boundary()
+            self.assertFalse(passed, "Probe must fail closed when JEV_DISABLE_ENV_SCRUB=1 is set")
+            self.assertIn("JEV_API_KEY", leaked)
 
     def test_get_sanitized_environment_strips_all_keys(self):
         base_env = {

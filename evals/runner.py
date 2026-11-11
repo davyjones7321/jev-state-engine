@@ -18,6 +18,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SCHEMA_PATH = REPO_ROOT / "evals" / "schemas" / "run.schema.json"
 DEFAULT_LOCAL_ROOT = REPO_ROOT / "evals" / "local"
 
+# Ensure src/ is importable for real Jev execution path
+SRC_DIR = REPO_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from jev.process_runner import CommandResult, run_command
+
 # Non-scored MBPP+ smoke tasks used for offline dry-run verification
 DRY_RUN_SMOKE_TASKS = [
     {
@@ -113,25 +120,23 @@ def probe_child_environment(
     cwd: Optional[Path] = None,
     probe_cmd: Optional[List[str]] = None,
 ) -> Dict[str, str]:
-    """Spawn a probe child process to observe the exact environment visible to child tasks."""
+    """Spawn a probe child process via Jev's process runner to observe the exact environment visible to child tasks."""
     cmd = probe_cmd or get_probe_command()
-    proc = subprocess.run(
+    res = run_command(
         cmd,
-        capture_output=True,
-        text=True,
+        cwd=cwd,
         env=env,
-        cwd=str(cwd) if cwd else None,
-        check=False,
+        timeout=10.0,
     )
-    if proc.returncode != 0:
+    if res.exit_code != 0:
         raise RuntimeError(
-            f"Credential probe child process failed (code {proc.returncode}): {proc.stderr or proc.stdout}"
+            f"Credential probe child process failed (code {res.exit_code}): {res.stderr or res.stdout}"
         )
     try:
-        return json.loads(proc.stdout)
+        return json.loads(res.stdout)
     except json.JSONDecodeError as exc:
         raise RuntimeError(
-            f"Credential probe output could not be parsed as JSON: {proc.stdout}"
+            f"Credential probe output could not be parsed as JSON: {res.stdout}"
         ) from exc
 
 
@@ -142,8 +147,8 @@ def check_credential_boundary(
 ) -> Tuple[bool, List[str]]:
     """Verify that no API key or credential variables are visible to a spawned child process.
 
-    Spawns a probe child process. If any API key variable is visible in the child's
-    environment, returns (False, [list of visible variable names]).
+    Spawns a probe child process through src/jev/process_runner.run_command (the real Jev spawn path).
+    If any API key variable is visible in the child's environment, returns (False, [list of visible variable names]).
     Otherwise returns (True, []).
     """
     child_env = probe_child_environment(env=env, cwd=cwd, probe_cmd=probe_cmd)
@@ -277,13 +282,11 @@ def execute_dry_run(
     runs_dir.mkdir(parents=True, exist_ok=True)
 
     target_env = injected_env
-    if target_env is None and enforce_clean_env:
-        target_env = get_sanitized_environment()
 
     # Step 1: Credential boundary check before any execution
     boundary_ok, leaked_vars = check_credential_boundary(env=target_env)
     if not boundary_ok:
-        # If API key variables are visible, fail the run immediately
+        # If API key variables are visible, fail the run immediately and refuse to start
         failure_records = []
         for task_info in DRY_RUN_SMOKE_TASKS:
             task_id = task_info["task_id"]
@@ -307,7 +310,7 @@ def execute_dry_run(
             "runs": failure_records,
         }
 
-    # Step 2: Boundary verified, proceed with 3 offline tasks end-to-end
+    # Step 2: Boundary verified, proceed with offline tasks, probing before every Jev run
     run_records = []
     for task_info in DRY_RUN_SMOKE_TASKS:
         task_id = task_info["task_id"]
@@ -316,6 +319,24 @@ def execute_dry_run(
         solution_code = task_info["solution"]
 
         task_slug = task_id.replace("/", "_")
+
+        # Call the probe before every Jev run and refuse to start if it fails
+        task_boundary_ok, task_leaked_vars = check_credential_boundary(env=target_env)
+        if not task_boundary_ok:
+            record = create_run_record(
+                task_id=task_id,
+                agent_name="jev",
+                status="agent_failure",
+                credential_boundary_verified=False,
+                evaluator_status="failed",
+                failure_class="credential_boundary_violation",
+                notes=f"Credential boundary check failed before Jev run: visible API key variables: {task_leaked_vars}",
+            )
+            run_file = runs_dir / f"{task_slug}-run.json"
+            run_file.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+            run_records.append(record)
+            continue
+
         task_dir = workspaces_dir / task_slug
         task_dir.mkdir(parents=True, exist_ok=True)
 
