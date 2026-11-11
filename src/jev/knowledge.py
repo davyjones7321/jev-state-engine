@@ -16,6 +16,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Seque
 from jev.dependency_delta import LOCKFILES, MANIFEST_BASENAMES
 from jev.ledger import compute_repo_key, get_jev_home
 from jev.memory_extract import CompileTrap
+from jev.process_runner import get_scrubbed_env
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +75,7 @@ def capture_evidence(
             cwd=str(repo_dir),
             capture_output=True,
             text=True,
+            env=get_scrubbed_env(),
         )
         if res.returncode != 0:
             return ({}, "unverifiable")
@@ -123,6 +125,7 @@ def capture_evidence(
                 ["git", "show", f"{base_commit}:{p}"],
                 cwd=str(repo_dir),
                 capture_output=True,
+                env=get_scrubbed_env(),
             )
             if show_res.returncode != 0:
                 return ({}, "unverifiable")
@@ -412,6 +415,7 @@ class KnowledgeStore:
                 cwd=str(repo_dir),
                 capture_output=True,
                 text=True,
+                env=get_scrubbed_env(),
             )
             if res.returncode != 0:
                 return (True, "unverifiable")
@@ -435,6 +439,7 @@ class KnowledgeStore:
                     ["git", "show", f"HEAD:{p}"],
                     cwd=str(repo_dir),
                     capture_output=True,
+                    env=get_scrubbed_env(),
                 )
                 if show_res.returncode != 0:
                     return (True, f"env_changed:{p}")
