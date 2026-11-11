@@ -1,6 +1,6 @@
 {
   "manifest_version": "1.0",
-  "status": "ready_for_scored_mbpp_plus",
+  "status": "pending_credential_boundary",
   "branch": "evals-ready",
   "target_distinct_tasks": 10,
   "maximum_runs_if_all_agents_eligible": 30,
