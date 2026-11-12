@@ -8,10 +8,10 @@ from jev.models import Subgoal, ValidationVerdict
 
 
 class ShadowGatekeeper:
-    """Shadow testing wrapper for dual Jev + Laya evaluation.
+    """Shadow testing wrapper for dual Jev + Alternative Decision Model evaluation.
 
     - Primary Authority: Jev Gatekeeper (governs engine transitions)
-    - Shadow Evaluator: Laya Model (runs in background on CPU)
+    - Shadow Evaluator: Alternative Decision Model (runs in background on CPU)
     - Telemetry: Records comparative metrics to a JSONL log
     """
 
@@ -116,9 +116,9 @@ class ShadowGatekeeper:
         prob_str = f"{laya_prob:.4f}" if laya_prob is not None else "N/A"
         print(
             f"\n[SHADOW JUDGE] >>> Subgoal: '{subgoal.description[:40]}...'\n"
-            f"  • Jev  (Authority): valid={jev_verdict.valid} (p={getattr(jev_verdict, 'probability', 1.0):.2f}) [{jev_duration_ms}ms]\n"
-            f"  • Laya (Shadow)   : valid={laya_valid} (p={prob_str}) [{laya_duration_ms}ms]\n"
-            f"  • Agreement       : {agreement}\n"
+            f"  • Jev                        (Authority): valid={jev_verdict.valid} (p={getattr(jev_verdict, 'probability', 1.0):.2f}) [{jev_duration_ms}ms]\n"
+            f"  • Alternative Decision Model (Shadow)   : valid={laya_valid} (p={prob_str}) [{laya_duration_ms}ms]\n"
+            f"  • Agreement                             : {agreement}\n"
         )
 
         # 5. ALWAYS return Jev's verdict to preserve engine control loop
@@ -202,9 +202,9 @@ class ShadowGatekeeper:
         prob_str = f"{laya_prob:.4f}" if laya_prob is not None else "N/A"
         print(
             f"\n[SHADOW JUDGE] >>> Final Verification:\n"
-            f"  • Jev  (Authority): valid={jev_verdict.valid} (p={getattr(jev_verdict, 'probability', 1.0):.2f}) [{jev_duration_ms}ms]\n"
-            f"  • Laya (Shadow)   : valid={laya_valid} (p={prob_str}) [{laya_duration_ms}ms]\n"
-            f"  • Agreement       : {agreement}\n"
+            f"  • Jev                        (Authority): valid={jev_verdict.valid} (p={getattr(jev_verdict, 'probability', 1.0):.2f}) [{jev_duration_ms}ms]\n"
+            f"  • Alternative Decision Model (Shadow)   : valid={laya_valid} (p={prob_str}) [{laya_duration_ms}ms]\n"
+            f"  • Agreement                             : {agreement}\n"
         )
 
         return jev_verdict

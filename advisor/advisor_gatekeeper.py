@@ -9,15 +9,15 @@ from pydantic import Field
 from jev.models import Subgoal, ValidationVerdict
 
 
-class DeepSeekVerdict(ValidationVerdict):
+class AdvisorVerdict(ValidationVerdict):
     """Extends standard ValidationVerdict with CoT and violation diagnostics."""
     cot: str = Field(default="")
     violations: List[str] = Field(default_factory=list)
     duration_ms: float = Field(default=0.0)
 
 
-class DeepSeekGatekeeper:
-    """Client for Remote DeepSeek-R1 Gatekeeper running on Kaggle GPU."""
+class AdvisorGatekeeper:
+    """Client for Remote Advisor Model running on Kaggle GPU."""
 
     def __init__(
         self,
@@ -27,12 +27,13 @@ class DeepSeekGatekeeper:
     ):
         self.endpoint_url = (
             endpoint_url
+            or os.environ.get("ADVISOR_ENDPOINT_URL")
             or os.environ.get("DEEPSEEK_ENDPOINT_URL")
             or "https://letter-consensus-bottle-hammer.trycloudflare.com"
         ).rstrip("/")
         self.validate_url = f"{self.endpoint_url}/validate"
         self.timeout = timeout
-        self.log_path = Path(log_path) if log_path else Path("deepseek/reasoning_log.jsonl")
+        self.log_path = Path(log_path) if log_path else Path("advisor/reasoning_log.jsonl")
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self.client = httpx.Client(timeout=self.timeout)
 
@@ -42,8 +43,8 @@ class DeepSeekGatekeeper:
         diff: str,
         mechanical_detail: str = "",
         investigation_notes: Optional[str] = None,
-    ) -> DeepSeekVerdict:
-        """Evaluates a subgoal using DeepSeek-R1 with step-by-step reasoning."""
+    ) -> AdvisorVerdict:
+        """Evaluates a subgoal using the Advisor Model with step-by-step reasoning."""
         scope_str = ", ".join(subgoal.scope) if isinstance(subgoal.scope, list) else str(subgoal.scope or "")
         payload = {
             "subgoal": subgoal.description,
@@ -61,8 +62,8 @@ class DeepSeekGatekeeper:
         final_diff: str,
         test_output: str = "",
         investigation_notes: Optional[str] = None,
-    ) -> DeepSeekVerdict:
-        """Evaluates final ticket verification using DeepSeek-R1."""
+    ) -> AdvisorVerdict:
+        """Evaluates final ticket verification using the Advisor Model."""
         payload = {
             "ticket": ticket,
             "diff": final_diff,
@@ -72,7 +73,7 @@ class DeepSeekGatekeeper:
         }
         return self._send_request(payload, context=f"Ticket Verification: {ticket[:60]}")
 
-    def _send_request(self, payload: Dict[str, Any], context: str = "") -> DeepSeekVerdict:
+    def _send_request(self, payload: Dict[str, Any], context: str = "") -> AdvisorVerdict:
         t0 = time.time()
         try:
             resp = self.client.post(self.validate_url, json=payload)
@@ -80,8 +81,8 @@ class DeepSeekGatekeeper:
             data = resp.json()
         except Exception as e:
             duration_ms = (time.time() - t0) * 1000
-            fallback_reason = f"DeepSeek-R1 request failed: {e}"
-            return DeepSeekVerdict(
+            fallback_reason = f"Advisor Model request failed: {e}"
+            return AdvisorVerdict(
                 valid=False,
                 probability=0.0,
                 reason=fallback_reason,
@@ -113,7 +114,7 @@ class DeepSeekGatekeeper:
         except Exception:
             pass
 
-        return DeepSeekVerdict(
+        return AdvisorVerdict(
             valid=valid,
             probability=prob,
             reason=reason,

@@ -1,5 +1,5 @@
 # ==============================================================================
-# All-In-One Kaggle Setup: DeepSeek-R1-Distill-Qwen-7B + FastAPI + Cloudflare
+# All-In-One Kaggle Setup: Advisor Model + FastAPI + Cloudflare
 # ==============================================================================
 import json
 import os
@@ -24,7 +24,7 @@ if not os.path.exists("cloudflared"):
     )
     subprocess.run(["chmod", "+x", "cloudflared"], check=True)
 
-print(">>> [2/5] Loading DeepSeek-R1-Distill-Qwen-7B (4-bit NF4 on Tesla T4)...")
+print(">>> [2/5] Loading Advisor Model (4-bit NF4 on Tesla T4)...")
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
@@ -49,7 +49,7 @@ print(">>> [3/5] Setting up FastAPI Server...")
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="DeepSeek-R1 OpenAI-Compatible Advisory Server")
+app = FastAPI(title="Advisor Model OpenAI-Compatible Advisory Server")
 
 
 class ChatMessage(BaseModel):
@@ -189,7 +189,7 @@ while time.time() - start_time < 30:
 
 print("\n" + "=" * 70)
 if public_url:
-    print(f"🚀 YOUR LIVE DEEPSEEK-R1 ENDPOINT IS:\n\n   {public_url}\n")
+    print(f"🚀 YOUR LIVE ADVISOR MODEL ENDPOINT IS:\n\n   {public_url}\n")
     print("=" * 70)
 else:
     print("❌ Tunnel timed out. Check Kaggle internet connection.")

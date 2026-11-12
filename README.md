@@ -6,14 +6,41 @@ Jev State Engine is a deterministic finite-state-machine runtime for executing s
 
 ## How a run works
 
-```text
-investigate -> plan -> implement -> Tier 0 checks -> Jev Tier 1 gate
-                                      |                    |
-                                      +---- retry ---------+
-                                              |
-                         final verification -> fast-forward landing
-                                              |
-                                           escalate
+```mermaid
+flowchart TD
+    START(["Start (ticket + integration branch)"]) --> investigate["investigate (read-only repo tools)"]
+    investigate --> plan["plan (typed Subgoals + declared scope)"]
+
+    plan -->|"valid plan"| implement["implement (isolated subgoal worktree)"]
+    plan -->|"planning_failed"| escalate["escalate (cleanup worktree, preserve integration branch)"]
+
+    implement -->|"staged diff"| gate_guard{"gate: Timeout, Duplicate, Dead-End & Empty Guards"}
+
+    gate_guard -->|"timeout / retry_dead_end"| escalate
+    gate_guard -->|"replan (budget > 0)"| implement
+    gate_guard -->|"duplicate or empty diff (< 3 strikes)"| advisory["Advisor Model (non-authoritative repair brief)"]
+    gate_guard -->|"duplicate or empty diff (3 strikes)"| escalate
+    gate_guard -->|"diff ready"| tier0{"Tier 0: Deterministic Checks (build, compile, tests, scope)"}
+
+    tier0 -->|"env_not_ready / no_compile_command / verifier modified"| escalate
+    tier0 -->|"3 mechanical strikes or 3 unmeasured retries"| escalate
+    tier0 -->|"mechanical fail (< 3 strikes) or unmeasured (< 3 retries)"| advisory
+    tier0 -->|"Tier 0 passed"| tier1{"Tier 1: Jev Semantic Gate"}
+
+    tier1 -->|"3 semantic strikes"| escalate
+    tier1 -->|"rejected (< 3 semantic strikes)"| advisory
+    tier1 -->|"valid"| merge{"Fast-forward subgoal to integration branch"}
+
+    advisory -->|"repair guidance + feedback"| implement
+
+    merge -->|"merge_failed"| escalate
+    merge -->|"more subgoals in queue"| implement
+    merge -->|"queue empty"| verify{"verify (detached verify worktree: compile, tests, Jev verify_ticket)"}
+
+    verify -->|"verified (fast-forward target branch)"| DONE(["End: completed"])
+    verify -->|"failed / main_diverged / tracked_modifications"| escalate
+
+    escalate --> HALT(["End: escalated"])
 ```
 
 ### Roles and authority
@@ -22,7 +49,7 @@ investigate -> plan -> implement -> Tier 0 checks -> Jev Tier 1 gate
 - **Worker:** investigates, plans, and implements inside declared scope. It is not an authority.
 - **Tier 0:** deterministic local checks for syntax/build, compile, scope, dependencies, and tests. It is authoritative for mechanical facts.
 - **Jev:** the production semantic judge. It evaluates a staged diff after Tier 0 passes and performs final ticket verification.
-- **Optional advisory:** an OpenAI-compatible model, such as DeepSeek, may return bounded repair guidance. It cannot approve a diff, override Tier 0 or Jev, or write files.
+- **Optional Advisor Model:** an OpenAI-compatible model may return bounded repair guidance. It cannot approve a diff, override Tier 0 or Jev, or write files.
 
 ## Prerequisites
 
@@ -81,9 +108,9 @@ JEV_API_KEY=your_typesafe_api_key
 # Required for live worker generation; unit tests can run without it
 GOOGLE_API_KEY=your_google_ai_api_key
 
-# Optional non-authoritative repair advisor
-ADVISORY_BASE_URL=https://api.deepseek.com
-ADVISORY_MODEL=deepseek-flash
+# Optional non-authoritative repair advisor model
+ADVISORY_BASE_URL=https://your-openai-compatible-host/v1
+ADVISORY_MODEL=your-advisor-model
 ADVISORY_API_KEY=your_advisory_key
 ```
 
@@ -93,11 +120,11 @@ ADVISORY_API_KEY=your_advisory_key
 - `ADVISORY_BASE_URL` is an OpenAI-compatible **base URL**. The provider appends `/chat/completions`; configure `https://host/v1`, not the complete `/chat/completions` URL.
 - The advisory must return a chat-completions response whose first choice contains JSON with `summary`, `cause`, and a non-empty `actions` list. Provider failures are non-fatal and fall back to deterministic feedback.
 
-### DeepSeek advisory use
+### Advisor model use
 
-To use a DeepSeek-compatible endpoint as the optional advisor, set `ADVISORY_BASE_URL`, `ADVISORY_MODEL`, and, if required, `ADVISORY_API_KEY`. DeepSeek remains diagnostic only: it supplies a bounded repair brief and never decides whether a diff passes.
+To use an OpenAI-compatible endpoint as the optional advisor model, set `ADVISORY_BASE_URL`, `ADVISORY_MODEL`, and, if required, `ADVISORY_API_KEY`. The advisor model remains diagnostic only: it supplies a bounded repair brief and never decides whether a diff passes.
 
-The separate `deepseek/run_tri_test.py` script is an experimental Jev/DeepSeek/Laya comparison runner. It is not the default CLI path and should not be described as the production authority model.
+The separate `advisor/run_tri_test.py` script is an experimental Jev / Advisor Model / Alternative Decision Model comparison runner. It is not the default CLI path and should not be described as the production authority model.
 
 ## CLI usage
 
@@ -203,12 +230,6 @@ The implementation is organized around `src/jev/engine.py`, `workspace.py`, `gat
 
 SQLite checkpoints persist graph state by thread ID. The run ledger records attempts, evidence, diffs, gate outcomes, and role provenance unless `--no-ledger` is supplied. Escalations are written to `escalation.log` for compatibility and, when a thread ID is available, to `$JEV_HOME/runs/<thread-id>/escalation.json`.
 
-For the longer architectural and research rationale, see:
-
-- [ARCHITECTURE.md](ARCHITECTURE.md)
-- [plan.md](plan.md)
-- [docs/RESEARCH_INTEGRATION_PLAN.md](docs/RESEARCH_INTEGRATION_PLAN.md)
-
 ## Tests
 
 Run the repository's non-live tests:
@@ -268,10 +289,3 @@ The checked-out target branch changed after the run started, or it contains trac
 ### Advisory errors
 
 Advisory errors are non-fatal. Confirm that `ADVISORY_BASE_URL` is the provider root (the adapter appends `/chat/completions`), that `ADVISORY_MODEL` is valid, and that the endpoint returns the required JSON repair-brief shape. The engine continues with deterministic feedback when the advisor times out, rejects the request, or returns malformed JSON.
-
-## Related documentation
-
-- [docs/TEAM_TESTING.md](docs/TEAM_TESTING.md): Windows walkthrough and disposable demo target.
-- [docs/TEST_PLAN.md](docs/TEST_PLAN.md): test intent and quality gates.
-- [docs/BUILD_ORDER.md](docs/BUILD_ORDER.md): historical implementation sequencing.
-- [docs/RESEARCH_INTEGRATION_PLAN.md](docs/RESEARCH_INTEGRATION_PLAN.md): research and roadmap intent.

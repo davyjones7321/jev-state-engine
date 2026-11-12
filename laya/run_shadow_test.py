@@ -26,7 +26,7 @@ from shadow_gatekeeper import ShadowGatekeeper
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Shadow Testing Runner: Dual Jev + Laya Gatekeeper"
+        description="Shadow Testing Runner: Dual Jev + Alternative Decision Model Gatekeeper"
     )
     parser.add_argument(
         "ticket",
@@ -38,7 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--test-eval-only",
         action="store_true",
-        help="Quickly evaluate sample diffs through both Jev and Laya without running full LLM worker loop",
+        help="Quickly evaluate sample diffs through both Jev and Alternative Decision Model without running full LLM worker loop",
     )
     parser.add_argument(
         "--db-path",
@@ -110,7 +110,7 @@ def main() -> int:
     print("Initializing Primary Gatekeeper (Jev)...")
     primary_gatekeeper = Gatekeeper(env_file=env_file if env_file.exists() else None)
 
-    print("Initializing Shadow Evaluator (Laya on CPU)...")
+    print("Initializing Shadow Evaluator (Alternative Decision Model on CPU)...")
     laya_agent = laya.load("convaiinnovations/laya-typed-decisions")
 
     log_file = repo_dir / "laya" / "judge_comparison.jsonl"

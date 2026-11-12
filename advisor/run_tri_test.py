@@ -12,13 +12,13 @@ from dotenv import dotenv_values
 from jev.engine import JevEngine
 from jev.gatekeeper import Gatekeeper
 from jev.workspace import Workspace
-from deepseek.deepseek_gatekeeper import DeepSeekGatekeeper
-from deepseek.tri_shadow_gatekeeper import TriShadowGatekeeper
+from advisor.advisor_gatekeeper import AdvisorGatekeeper
+from advisor.tri_shadow_gatekeeper import TriShadowGatekeeper
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run Jev State Engine with Tri-Shadow Evaluation (Jev + DeepSeek-R1 + Laya)"
+        description="Run Jev State Engine with Tri-Shadow Evaluation (Jev + Advisor Model + Alternative Decision Model)"
     )
     parser.add_argument(
         "ticket",
@@ -51,15 +51,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Execution policy for repository test suites",
     )
     parser.add_argument(
+        "--advisor-url",
         "--deepseek-url",
+        dest="advisor_url",
         type=str,
         default="https://letter-consensus-bottle-hammer.trycloudflare.com",
-        help="Public Cloudflare Tunnel URL for Kaggle DeepSeek-R1 endpoint",
+        help="Public Cloudflare Tunnel URL for Kaggle Advisor Model endpoint",
     )
     parser.add_argument(
+        "--skip-alternative-model",
         "--skip-laya",
+        dest="skip_alternative",
         action="store_true",
-        help="Skip local Laya CPU evaluation for faster iteration (evaluates Jev + DeepSeek-R1)",
+        help="Skip local Alternative Decision Model CPU evaluation for faster iteration (evaluates Jev + Advisor Model)",
     )
     parser.add_argument(
         "--test-eval-only",
@@ -80,27 +84,27 @@ def main() -> int:
     print("Initializing Primary Gatekeeper (Jev)...")
     primary_gatekeeper = Gatekeeper(env_file=env_file)
 
-    print(f"Connecting to DeepSeek-R1 (Kaggle GPU) at {args.deepseek_url}...")
-    deepseek_gatekeeper = DeepSeekGatekeeper(endpoint_url=args.deepseek_url)
+    print(f"Connecting to Advisor Model (Kaggle GPU) at {args.advisor_url}...")
+    advisor_gatekeeper = AdvisorGatekeeper(endpoint_url=args.advisor_url)
 
-    laya_agent = None
-    if not args.skip_laya:
-        print("Initializing Laya (Local CPU)...")
+    alt_agent = None
+    if not args.skip_alternative:
+        print("Initializing Alternative Decision Model (Local CPU)...")
         try:
             import laya
-            laya_agent = laya.load("convaiinnovations/laya-typed-decisions")
+            alt_agent = laya.load("convaiinnovations/laya-typed-decisions")
         except Exception as e:
-            print(f"[WARNING] Could not load Laya: {e}. Proceeding with Jev and DeepSeek-R1 only.")
-            laya_agent = None
+            print(f"[WARNING] Could not load Alternative Decision Model: {e}. Proceeding with Jev and Advisor Model only.")
+            alt_agent = None
     else:
-        print("Laya (CPU) evaluation skipped via --skip-laya.")
+        print("Alternative Decision Model (CPU) evaluation skipped.")
 
     # Target comparison log
-    log_file = repo_dir / "deepseek" / "judge_tri_comparison.jsonl" if args.repo_dir else repo_root / "judge_tri_comparison.jsonl"
+    log_file = repo_dir / "advisor" / "judge_tri_comparison.jsonl" if args.repo_dir else repo_root / "judge_tri_comparison.jsonl"
     tri_gatekeeper = TriShadowGatekeeper(
         primary_gatekeeper=primary_gatekeeper,
-        deepseek_gatekeeper=deepseek_gatekeeper,
-        laya_agent=laya_agent,
+        advisor_gatekeeper=advisor_gatekeeper,
+        alternative_model_agent=alt_agent,
         log_path=log_file,
     )
 

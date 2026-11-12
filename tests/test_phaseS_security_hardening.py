@@ -563,12 +563,12 @@ def test_gatekeeper_never_loads_dot_env_by_default(tmp_path, monkeypatch):
 
 
 # ==============================================================================
-# 6. Isolation test: src/ must not import deepseek, laya, kaggle_server, tri_shadow
+# 6. Isolation test: src/ must not import advisor, deepseek, laya, kaggle_server, tri_shadow
 # ==============================================================================
 
 def test_src_isolation_from_prohibited_modules():
-    """Verify that no file under src/ imports deepseek, laya, kaggle_server, or tri_shadow."""
-    prohibited = {"deepseek", "laya", "kaggle_server", "tri_shadow"}
+    """Verify that no file under src/ imports advisor, deepseek, laya, kaggle_server, or tri_shadow."""
+    prohibited = {"advisor", "deepseek", "laya", "kaggle_server", "tri_shadow"}
     violations = []
 
     src_files = glob.glob("src/**/*.py", recursive=True)
@@ -603,8 +603,8 @@ def test_src_isolation_from_prohibited_modules():
 
 def test_kaggle_server_contract_elements():
     """Verify kaggle_server.py specifies /chat/completions route, max_new_tokens 800, and HTTP 502 on invalid JSON."""
-    server_path = Path("deepseek/kaggle_server.py")
-    assert server_path.exists(), "deepseek/kaggle_server.py must exist"
+    server_path = Path("advisor/kaggle_server.py")
+    assert server_path.exists(), "advisor/kaggle_server.py must exist"
 
     text = server_path.read_text(encoding="utf-8")
     assert "@app.post(\"/chat/completions\")" in text

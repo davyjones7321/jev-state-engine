@@ -56,3 +56,10 @@ Thumbs.db
 
 *.jsonl
 /session-1-v2.md
+
+# Documentation and planning notes
+docs/
+ARCHITECTURE.md
+implementation-plan.md
+importan.md
+plan.md
