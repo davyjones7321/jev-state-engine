@@ -13,6 +13,7 @@ from jev.gatekeeper import Gatekeeper
 from jev.ledger import NullRecorder, SqliteLedger
 from jev.advisory import AdvisoryService
 from jev.providers import OpenAICompatibleProvider, validate_advisory_timeout
+from jev.usage import UsageRecorder
 from jev.workspace import Workspace
 
 
@@ -271,6 +272,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not google_api_key and env_file and env_file.exists():
         google_api_key = parsed_env.get("GOOGLE_API_KEY")
 
+    usage_recorder = UsageRecorder()
+
     llm = None
     if google_api_key:
         os.environ["GOOGLE_API_KEY"] = google_api_key
@@ -280,6 +283,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             llm = ChatGoogleGenerativeAI(
                 model=model,
                 google_api_key=google_api_key,
+                callbacks=[usage_recorder],
             )
         except Exception as e:
             print(f"[WARNING] Could not initialize ChatGoogleGenerativeAI: {e}")
@@ -320,6 +324,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     gate_status = final_state.get("gate_status")
 
     target_run_id = final_state.get("run_id") or args.thread_id
+
+    if hasattr(recorder, "record_run_llm_usage"):
+        try:
+            recorder.record_run_llm_usage(
+                run_id=target_run_id,
+                llm_tokens_in=usage_recorder.llm_tokens_in,
+                llm_tokens_out=usage_recorder.llm_tokens_out,
+                llm_cache_read_tokens=usage_recorder.llm_cache_read_tokens,
+                llm_calls=usage_recorder.llm_calls,
+            )
+        except Exception as e:
+            print(f"[WARNING] Could not record LLM usage: {e}", file=sys.stderr)
 
     ev_level = None
     if hasattr(recorder, "get_run_evidence_level"):

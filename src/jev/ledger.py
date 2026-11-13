@@ -282,6 +282,15 @@ class Recorder(Protocol):
         dependency_delta: Optional[str] = None,
     ) -> None: ...
 
+    def record_run_llm_usage(
+        self,
+        run_id: str,
+        llm_tokens_in: Optional[int] = None,
+        llm_tokens_out: Optional[int] = None,
+        llm_cache_read_tokens: Optional[int] = None,
+        llm_calls: Optional[int] = None,
+    ) -> None: ...
+
     def record_subgoals(
         self,
         run_id: str,
@@ -407,6 +416,16 @@ class NullRecorder:
         notes_chars: Optional[int] = None,
         evidence_level: Optional[str] = None,
         dependency_delta: Optional[str] = None,
+    ) -> None:
+        pass
+
+    def record_run_llm_usage(
+        self,
+        run_id: str,
+        llm_tokens_in: Optional[int] = None,
+        llm_tokens_out: Optional[int] = None,
+        llm_cache_read_tokens: Optional[int] = None,
+        llm_calls: Optional[int] = None,
     ) -> None:
         pass
 
@@ -561,7 +580,11 @@ class SqliteLedger:
                    tool_evidence TEXT,
                    read_evidence TEXT,
                    self_check_evidence TEXT,
-                   hypothesis_change TEXT
+                   hypothesis_change TEXT,
+                   llm_tokens_in INTEGER DEFAULT NULL,
+                   llm_tokens_out INTEGER DEFAULT NULL,
+                   llm_cache_read_tokens INTEGER DEFAULT NULL,
+                   llm_calls INTEGER DEFAULT NULL
                 );
                 """
             )
@@ -584,6 +607,9 @@ class SqliteLedger:
             for name in ("provenance", "model_version", "failure_evidence", "retry_metadata", "tool_evidence", "read_evidence", "self_check_evidence", "hypothesis_change"):
                 if name not in cols:
                     conn.execute(f"ALTER TABLE runs ADD COLUMN {name} TEXT DEFAULT NULL")
+            for col_name in ("llm_tokens_in", "llm_tokens_out", "llm_cache_read_tokens", "llm_calls"):
+                if col_name not in cols:
+                    conn.execute(f"ALTER TABLE runs ADD COLUMN {col_name} INTEGER DEFAULT NULL")
 
             conn.execute(
                 """
@@ -901,6 +927,27 @@ class SqliteLedger:
                 WHERE run_id = ?
                 """,
                 (final_status, final_commit, end_time, notes_chars, evidence_level, dependency_delta, run_id),
+            )
+
+    def record_run_llm_usage(
+        self,
+        run_id: str,
+        llm_tokens_in: Optional[int] = None,
+        llm_tokens_out: Optional[int] = None,
+        llm_cache_read_tokens: Optional[int] = None,
+        llm_calls: Optional[int] = None,
+    ) -> None:
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE runs SET
+                  llm_tokens_in = ?,
+                  llm_tokens_out = ?,
+                  llm_cache_read_tokens = ?,
+                  llm_calls = ?
+                WHERE run_id = ?
+                """,
+                (llm_tokens_in, llm_tokens_out, llm_cache_read_tokens, llm_calls, run_id),
             )
 
     def record_subgoals(

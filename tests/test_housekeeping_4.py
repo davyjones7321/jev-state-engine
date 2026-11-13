@@ -4,7 +4,7 @@ import sqlite3
 import subprocess
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 from langchain_core.messages import AIMessage
@@ -265,6 +265,7 @@ def test_worker_model_reaches_chat_google_generative_ai_constructor(clean_repo):
             mock_chat_cls.assert_called_with(
                 model="model-from-env",
                 google_api_key="fake-key",
+                callbacks=ANY,
             )
 
             # 2. CLI model overrides env model
@@ -273,4 +274,5 @@ def test_worker_model_reaches_chat_google_generative_ai_constructor(clean_repo):
             mock_chat_cls.assert_called_with(
                 model="model-from-cli",
                 google_api_key="fake-key",
+                callbacks=ANY,
             )

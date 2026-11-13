@@ -239,6 +239,7 @@ def test_typescript_bun_error_diagnostics_and_evidence(clean_git_repo: Path):
 
     (wt / "bunfig.toml").write_text("# bun config\n", encoding="utf-8")
     (wt / "tsconfig.json").write_text("{}", encoding="utf-8")
+    (wt / "node_modules").mkdir(parents=True, exist_ok=True)
     (wt / "src").mkdir(parents=True, exist_ok=True)
     ws.stage_file_mutation("src/app.ts", "export const broken: number = 'string';\n")
 

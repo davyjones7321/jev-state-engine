@@ -111,6 +111,33 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"Started At:         {run['started_at']}")
     print(f"Ended At:           {run['ended_at']}")
     print(f"Notes Chars:        {run['notes_chars']}")
+
+    attempts = cursor.execute(
+        "SELECT * FROM attempts WHERE run_id = ? ORDER BY subgoal_id, attempt_no",
+        (run_id,),
+    ).fetchall()
+
+    run_keys = run.keys() if hasattr(run, "keys") else []
+    llm_tokens_in = run["llm_tokens_in"] if "llm_tokens_in" in run_keys else None
+    llm_tokens_out = run["llm_tokens_out"] if "llm_tokens_out" in run_keys else None
+    llm_cache_read = run["llm_cache_read_tokens"] if "llm_cache_read_tokens" in run_keys else None
+    llm_calls = run["llm_calls"] if "llm_calls" in run_keys else None
+
+    llm_total = (
+        ((llm_tokens_in or 0) + (llm_tokens_out or 0))
+        if (llm_tokens_in is not None or llm_tokens_out is not None)
+        else None
+    )
+    worker_tokens = sum((att["tokens_in"] or 0) + (att["tokens_out"] or 0) for att in attempts)
+    unattributed = (llm_total - worker_tokens) if llm_total is not None else None
+
+    print(f"LLM Tokens In:      {llm_tokens_in}")
+    print(f"LLM Tokens Out:     {llm_tokens_out}")
+    print(f"LLM Cache Read:     {llm_cache_read}")
+    print(f"LLM Calls:          {llm_calls}")
+    print(f"LLM Total:          {llm_total}")
+    print(f"Worker Tokens:      {worker_tokens}")
+    print(f"unattributed (planner, investigation, other) = llm total minus sum of per-attempt worker tokens: {unattributed}")
     print()
 
     print("-" * 70)
@@ -131,10 +158,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("-" * 70)
     print("ATTEMPTS")
     print("-" * 70)
-    attempts = cursor.execute(
-        "SELECT * FROM attempts WHERE run_id = ? ORDER BY subgoal_id, attempt_no",
-        (run_id,),
-    ).fetchall()
     if not attempts:
         print("  (No attempts recorded)")
     for att in attempts:
