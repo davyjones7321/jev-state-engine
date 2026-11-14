@@ -240,8 +240,8 @@ def test_main_attaches_recorder_to_chat_model(tmp_path, monkeypatch):
     from main import main
 
     monkeypatch.setenv("GOOGLE_API_KEY", "dummy-google-api-key")
-    monkeypatch.delenv("JEV_API_KEY", raising=False)
-    monkeypatch.delenv("JEV_API_URL", raising=False)
+    monkeypatch.setenv("JEV_API_URL", "https://api.typesafe.ai/v1/systemone")
+    monkeypatch.setenv("JEV_API_KEY", "fake-jev-api-key")
 
     fake_chat_instance = MagicMock()
     mock_engine_instance = MagicMock()
@@ -253,7 +253,7 @@ def test_main_attaches_recorder_to_chat_model(tmp_path, monkeypatch):
     with patch(
         "langchain_google_genai.ChatGoogleGenerativeAI",
         return_value=fake_chat_instance,
-    ) as mock_chat_cls, patch("main.JevEngine", return_value=mock_engine_instance):
+    ) as mock_chat_cls, patch("main.JevEngine", return_value=mock_engine_instance), patch("main.Gatekeeper"):
         exit_code = main(["Implement something", "--no-ledger"])
         assert exit_code == 0
 
